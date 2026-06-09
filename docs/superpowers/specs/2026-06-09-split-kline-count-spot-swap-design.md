@@ -136,6 +136,19 @@ logger.debug((f'spot {handle.resample_interval} 数量={handle.kline_count_1h_sp
 
 ---
 
-## 修改结果（实施后填写）
+## 修改结果
 
-> 待实施后记录实际性能数据
+实测数据（2026-06-10，多个 cycle 均值）：
+
+| 指标 | 修改前 | 修改后（实测） | 变化 |
+|---|---|---|---|
+| spot Market Dict 预处理 | ~22.6s | ~10.0s | -56% |
+| spot Pivot Table 预处理 | ~9.4s | ~1.8s | -81% |
+| spot 合计 | ~32.0s | ~11.8s | **-63%** |
+| swap Market Dict 预处理 | ~28.5s | ~24.0s | -16% |
+| swap Pivot Table 预处理 | — | ~9.5s | — |
+
+- spot 总预处理耗时从 ~32s 降至 ~11.8s，节省约 63%
+- spot Pivot 降幅最大（-81%），与数据量减少 79% 基本吻合
+- swap 轻微改善（-16%），可能受 CPU 竞争减少影响
+- 数据稳定，多 cycle 波动在 ±0.5s 以内
