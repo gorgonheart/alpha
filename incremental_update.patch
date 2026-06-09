@@ -1,0 +1,2806 @@
+--- a/core/candle_manager.py
++++ b/core/candle_manager.py
+@@ -169,6 +169,37 @@
+ 
+         return df
+ 
++    def update_candle_incremental(self, symbol, run_time, df_new: pd.DataFrame, num_candles):
++        if not self.has_symbol(symbol):
++            return self.update_candle(symbol, run_time, df_new, num_candles)
++
++        df_old = self.read_candle(symbol)
++        if df_old.empty or df_new.empty:
++            return self.update_candle(symbol, run_time, df_new, num_candles)
++
++        last_old_time = df_old['candle_begin_time'].max()
++        first_new_time = df_new['candle_begin_time'].min()
++        if first_new_time <= last_old_time:
++            return self.update_candle(symbol, run_time, df_new, num_candles)
++
++        df_old = df_old.copy(deep=True)
++        df_old.drop_duplicates(subset='candle_begin_time', keep='last', inplace=True)
++        df_old.sort_values('candle_begin_time', inplace=True)
++
++        df_new = df_new.copy(deep=True)
++        df_new.drop_duplicates(subset='candle_begin_time', keep='last', inplace=True)
++        df_new.sort_values('candle_begin_time', inplace=True)
++
++        if num_candles is None:
++            df = pd.concat([df_old, df_new])
++        else:
++            keep_old_rows = max(num_candles - len(df_new), 0)
++            df_old = df_old.tail(keep_old_rows) if keep_old_rows else df_old.iloc[0:0]
++            df = pd.concat([df_old, df_new]).tail(num_candles)
++
++        self.set_candle(symbol, run_time, df)
++        return df
++
+     def remove_symbol(self, symbol):
+         """
+         移除 symbol，包括删除对应的数据文件和 ready file
+
+--- a/core/resample_candle.py
++++ b/core/resample_candle.py
+@@ -173,3 +173,60 @@
+ 
+     return first_begin_time, last_begin_time
+ 
++
++def update_resample_candle_incremental(candle_mgr: CandleFileManager, symbol: str, df_resample: pd.DataFrame,
++                                       num_candles: int, run_time: datetime, resample_delta: timedelta):
++    if not candle_mgr.has_symbol(symbol):
++        return update_resample_candle(candle_mgr, symbol, df_resample, num_candles, run_time, resample_delta)
++
++    df_old = candle_mgr.read_candle(symbol)
++    if df_old.empty or df_resample.empty:
++        return update_resample_candle(candle_mgr, symbol, df_resample, num_candles, run_time, resample_delta)
++
++    old_times = df_old['candle_begin_time']
++    new_times = df_resample['candle_begin_time']
++    if old_times.duplicated().any() or new_times.duplicated().any():
++        return update_resample_candle(candle_mgr, symbol, df_resample, num_candles, run_time, resample_delta)
++    if not old_times.is_monotonic_increasing or not new_times.is_monotonic_increasing:
++        return update_resample_candle(candle_mgr, symbol, df_resample, num_candles, run_time, resample_delta)
++
++    last_old_time = old_times.iloc[-1]
++    first_new_time = new_times.iloc[0]
++    if first_new_time <= last_old_time:
++        return update_resample_candle(candle_mgr, symbol, df_resample, num_candles, run_time, resample_delta)
++
++    time_gap = new_times.diff().fillna(first_new_time - last_old_time)
++    price_change = (
++        df_resample['open'] / df_resample['close'].shift().fillna(df_old['close'].iloc[-1]) - 1
++    ).fillna(0)
++    has_large_gap = ((time_gap > timedelta(hours=48)) & (price_change.abs() > 0.1)).any()
++    if has_large_gap:
++        return update_resample_candle(candle_mgr, symbol, df_resample, num_candles, run_time, resample_delta)
++
++    if (time_gap == resample_delta).all():
++        df_total = pd.concat([df_old, df_resample], ignore_index=True)
++        df_total = df_total.tail(num_candles)
++        candle_mgr.set_candle(symbol, run_time, df_total)
++        first_begin_time = df_total['candle_begin_time'].iloc[0]
++        last_begin_time = df_total['candle_begin_time'].iloc[-1]
++        return first_begin_time, last_begin_time
++
++    prefix = df_old.iloc[:-1].copy(deep=True)
++    work_df = pd.concat([df_old.tail(1), df_resample], ignore_index=True)
++    work_df = fill_gaps(work_df, resample_delta)
++
++    if isinstance(work_df.index, pd.DatetimeIndex):
++        if not prefix.empty:
++            prefix['candle_end_time'] = prefix['candle_begin_time'] + resample_delta
++            prefix.set_index('candle_end_time', inplace=True)
++        df_total = pd.concat([prefix, work_df]) if not prefix.empty else work_df
++    else:
++        df_total = pd.concat([prefix, work_df], ignore_index=True) if not prefix.empty else work_df
++
++    df_total = df_total.tail(num_candles)
++
++    candle_mgr.set_candle(symbol, run_time, df_total)
++
++    first_begin_time = df_total['candle_begin_time'].iloc[0]
++    last_begin_time = df_total['candle_begin_time'].iloc[-1]
++    return first_begin_time, last_begin_time
+
+--- a/core/preprocess.py
++++ b/core/preprocess.py
+@@ -257,6 +257,126 @@
+     return full_batch_name, year_pivot_name
+ 
+ 
++def gen_batch_data_incremental(handle: BmacHandle, run_time: datetime, trade_type: str, df_match: pd.DataFrame,
++                               symbol_list: list[str], batch_name: str):
++    if not symbol_list:
++        return
++
++    offset_str = get_offset_from_runtime(run_time, handle.resample_interval)
++    preprocess_handle = handle.preprocess_handle
++    preprocess_mgr = preprocess_handle.preprocess_mgr_map[offset_str]
++    full_batch_name = f'{trade_type}_dict_{batch_name}'
++
++    if not preprocess_mgr.has_symbol(full_batch_name):
++        return gen_batch_data(handle, run_time, trade_type, df_match, symbol_list, batch_name)
++
++    old_market_dict: dict[str, pd.DataFrame] = preprocess_mgr.read_candle(full_batch_name)
++
++    symbol_list = sorted(symbol_list)
++    binance_handle = handle.get_binance_handle(trade_type)
++    binance_mgr = binance_handle.resample_mgr_map[offset_str]
++    data_api_mgr = None
++    if handle.data_api is not None:
++        if trade_type == 'spot':
++            data_api_mgr = handle.data_api.spot_mgr_map[offset_str]
++        elif trade_type == 'swap':
++            data_api_mgr = handle.data_api.swap_mgr_map[offset_str]
++
++    fundings = None
++    if trade_type == 'swap' and handle.fetch_funding_rate:
++        fundings = read_all_fundings(handle, run_time, symbol_list)
++
++    match_lookup = {}
++    for row in df_match.itertuples(index=False):
++        key = getattr(row, trade_type)
++        if not pd.isna(key):
++            match_lookup[key] = row
++
++    new_market_dict: dict[str, pd.DataFrame] = {}
++    start_year, end_year = None, None
++
++    for symbol in symbol_list:
++        result = read_candle_data(binance_mgr, data_api_mgr, symbol, run_time)
++        if result is None:
++            if symbol in old_market_dict:
++                new_market_dict[symbol] = old_market_dict[symbol]
++            continue
++
++        df_candle_full, _ = result
++
++        if symbol not in old_market_dict:
++            df_funding = fundings.get(symbol, None) if fundings is not None else None
++            df_full_enriched = add_additional_cols(df_candle_full, trade_type, symbol, df_funding)
++            row = match_lookup.get(symbol)
++            if row is not None:
++                first_begin_time = row.first_begin_time
++                last_begin_time = row.last_begin_time
++                if not pd.isna(first_begin_time) and not pd.isna(last_begin_time):
++                    mask = df_full_enriched['candle_begin_time'].between(first_begin_time, last_begin_time)
++                    df_full_enriched.loc[mask, 'symbol_spot'] = row.spot
++                    df_full_enriched.loc[mask, 'symbol_swap'] = row.swap
++            new_market_dict[symbol] = df_full_enriched
++        else:
++            df_old = old_market_dict[symbol]
++            last_ts = df_old['candle_begin_time'].max()
++            df_new_rows = df_candle_full[df_candle_full['candle_begin_time'] > last_ts].copy(deep=True)
++
++            if df_new_rows.empty:
++                new_market_dict[symbol] = df_old
++                continue
++
++            df_funding = fundings.get(symbol, None) if fundings is not None else None
++            df_new_enriched = add_additional_cols(df_new_rows, trade_type, symbol, df_funding)
++
++            row = match_lookup.get(symbol)
++            if row is not None:
++                first_begin_time = row.first_begin_time
++                last_begin_time = row.last_begin_time
++                if not pd.isna(first_begin_time) and not pd.isna(last_begin_time):
++                    mask = df_new_enriched['candle_begin_time'].between(first_begin_time, last_begin_time)
++                    df_new_enriched.loc[mask, 'symbol_spot'] = row.spot
++                    df_new_enriched.loc[mask, 'symbol_swap'] = row.swap
++
++            inherited_first_candle_time = df_old['first_candle_time'].iloc[0]
++            df_combined = pd.concat([df_old, df_new_enriched], ignore_index=True)
++            df_combined.drop_duplicates(subset='candle_begin_time', keep='last', inplace=True)
++            df_combined.sort_values('candle_begin_time', inplace=True)
++            df_combined.reset_index(drop=True, inplace=True)
++            table_max_time = df_combined['candle_begin_time'].max()
++            df_combined['first_candle_time'] = inherited_first_candle_time
++            df_combined['last_candle_time'] = table_max_time
++            new_market_dict[symbol] = df_combined
++
++        df_sym = new_market_dict[symbol]
++        min_year = df_sym['candle_begin_time'].min().year
++        if start_year is None or start_year > min_year:
++            start_year = min_year
++        max_year = df_sym['candle_begin_time'].max().year
++        if end_year is None or end_year < max_year:
++            end_year = max_year
++
++    preprocess_mgr.set_candle(full_batch_name, run_time, new_market_dict)
++
++    year_pivot_name = dict()
++    if start_year is not None and end_year is not None:
++        cur_year = run_time.astimezone(timezone.utc).year
++        for year in range(start_year, end_year + 1):
++            if (Path(preprocess_mgr.format_data_file_path(f'market_pivot_{trade_type}_{year}')).exists()
++                    and int(year) < cur_year - 1):
++                continue
++            pivot_batch_name = f'{trade_type}_for_pivot_{batch_name}_{year}'
++            start_ts = pd.to_datetime(f'{year}-01-01 00:00:00+00:00')
++            end_ts = pd.to_datetime(f'{year}-12-31 23:59:59+00:00')
++            market_dict_for_pivot = {
++                sym: df.loc[df['candle_begin_time'].between(start_ts, end_ts), PIVOT_COLUMNS]
++                for sym, df in new_market_dict.items()
++            }
++            preprocess_mgr.set_candle(pivot_batch_name, run_time, market_dict_for_pivot)
++            year_pivot_name[year] = pivot_batch_name
++
++    return full_batch_name, year_pivot_name
++
++
+ def gen_pivot(handle: BmacHandle, run_time: datetime, trade_type: str, year_pivot_names: dict[str, list]):
+     preprocess_handle = handle.preprocess_handle
+     offset_str = get_offset_from_runtime(run_time, handle.resample_interval)
+@@ -276,6 +396,89 @@
+         market_pivot = make_market_pivot(market_dict, trade_type)
+         preprocess_mgr.set_candle(f'market_pivot_{trade_type}_{year}', run_time, market_pivot)
+         logger.info(f'生成 Market Pivot {trade_type} {year} 完成')
++
++    preprocess_mgr.save_ready(f'market_pivot_{trade_type}', run_time)
++
++
++def gen_pivot_incremental(handle: BmacHandle, run_time: datetime, trade_type: str, year_pivot_names: dict[str, list]):
++    """Incremental counterpart of gen_pivot.
++
++    First call (no old pivot): builds pivot identically to gen_pivot.
++    Subsequent calls: loads old pivot, appends only new rows (faster than
++    re-pivoting the entire history), then saves the updated pivot.
++
++    Falls back to a full rebuild when:
++    - The symbol set has changed (addition or removal).
++    - There are no new rows (still touches run_time metadata).
++    """
++    preprocess_handle = handle.preprocess_handle
++    offset_str = get_offset_from_runtime(run_time, handle.resample_interval)
++    preprocess_mgr = preprocess_handle.preprocess_mgr_map[offset_str]
++
++    cur_year = run_time.astimezone(timezone.utc).year
++    for year, pivot_names in year_pivot_names.items():
++        # Skip old years (matching gen_pivot behaviour exactly)
++        if (Path(preprocess_mgr.format_data_file_path(f'market_pivot_{trade_type}_{year}')).exists()
++                and int(year) < cur_year - 1):
++            continue
++
++        pivot_key = f'market_pivot_{trade_type}_{year}'
++
++        # Load the new batch (contains ALL rows for this year from new_market_dict)
++        new_market_dict: dict[str, pd.DataFrame] = {}
++        for name in pivot_names:
++            new_market_dict.update(preprocess_mgr.read_candle(name))
++            preprocess_mgr.remove_symbol(name)
++
++        if not new_market_dict:
++            continue
++
++        # ── No old pivot: first-time full build (identical to gen_pivot) ──────
++        if not preprocess_mgr.has_symbol(pivot_key):
++            market_pivot = make_market_pivot(new_market_dict, trade_type)
++            preprocess_mgr.set_candle(pivot_key, run_time, market_pivot)
++            logger.info(f'生成 Market Pivot {trade_type} {year} 完成')
++            continue
++
++        # ── Old pivot exists: attempt incremental append ───────────────────────
++        old_pivot = preprocess_mgr.read_candle(pivot_key)
++        last_ts = old_pivot['open'].index.max()
++
++        # Find rows that are strictly newer than the last pivoted timestamp
++        new_rows_dict: dict[str, pd.DataFrame] = {
++            sym: df.loc[df['candle_begin_time'] > last_ts]
++            for sym, df in new_market_dict.items()
++        }
++        new_rows_dict = {sym: df for sym, df in new_rows_dict.items() if not df.empty}
++
++        # Symbol set changed → full rebuild to keep pivot columns consistent
++        old_symbols = set(old_pivot['open'].columns.tolist())
++        all_current_symbols = set(new_market_dict.keys())
++        if all_current_symbols != old_symbols:
++            market_pivot = make_market_pivot(new_market_dict, trade_type)
++            preprocess_mgr.set_candle(pivot_key, run_time, market_pivot)
++            logger.info(f'生成 Market Pivot {trade_type} {year} 完成 (重建)')
++            continue
++
++        if not new_rows_dict:
++            # Nothing new: just refresh run_time metadata
++            preprocess_mgr.set_candle(pivot_key, run_time, old_pivot)
++            continue
++
++        # Fast path: mini-pivot for new rows only, concat with old pivot
++        mini_pivot = make_market_pivot(new_rows_dict, trade_type)
++        updated_pivot: dict[str, pd.DataFrame] = {}
++        for pk in old_pivot:
++            if pk in mini_pivot:
++                updated_pivot[pk] = pd.concat([old_pivot[pk], mini_pivot[pk]])
++            else:
++                updated_pivot[pk] = old_pivot[pk]
++        for pk in mini_pivot:
++            if pk not in updated_pivot:
++                updated_pivot[pk] = mini_pivot[pk]
++
++        preprocess_mgr.set_candle(pivot_key, run_time, updated_pivot)
++        logger.info(f'生成 Market Pivot {trade_type} {year} 完成 (增量)')
+ 
+     preprocess_mgr.save_ready(f'market_pivot_{trade_type}', run_time)
+ 
+
+@@ -296,31 +499,27 @@
+     symbol_list = sorted(df_exginfo['symbol'].to_list())
+ 
+     logger.info(f'开始预处理 {trade_type}, 当前时间={now_time_str()}')
+ 
+-    batch_name = f'{trade_type}_dict_batch*.pkl'
+-    for p in preprocess_mgr.base_dir.rglob(batch_name):
+-        os.remove(p)
+-
+     idx = 1
+     year_pivot_names = defaultdict(list)
+     t_start = time.perf_counter()
+     while symbol_list:
+         if len(symbol_list) > num_batch:
+             batch, symbol_list = symbol_list[:num_batch], symbol_list[num_batch:]
+         else:
+             batch, symbol_list = symbol_list, []
+ 
+-        full_batch_name, year_pivot_name = gen_batch_data(handle, run_time, trade_type, df_match, batch, f'batch{idx}')
++        full_batch_name, year_pivot_name = gen_batch_data_incremental(handle, run_time, trade_type, df_match, batch, f'batch{idx}')
+         idx += 1
+ 
+         for col, pivot_name in year_pivot_name.items():
+             year_pivot_names[col].append(pivot_name)
+ 
+     preprocess_mgr.save_ready(f'{trade_type}_dict', run_time)
+     time_elapsed = time.perf_counter() - t_start
+     logger.ok(f'预处理 Market Dict {trade_type} 完成, 当前时间={now_time_str()}, 耗时 {time_elapsed:.1f} 秒')
+ 
+     t_start = time.perf_counter()
+-    gen_pivot(handle, run_time, trade_type, year_pivot_names)
++    gen_pivot_incremental(handle, run_time, trade_type, year_pivot_names)
+     time_elapsed = time.perf_counter() - t_start
+     logger.ok(f'预处理 Pivot Table {trade_type} 完成, 当前时间={now_time_str()}, 耗时 {time_elapsed:.1f} 秒')
+
+--- a/tests/support/harness_common.py
++++ b/tests/support/harness_common.py
+@@ -0,0 +1,96 @@
++from __future__ import annotations
++
++from dataclasses import dataclass
++from math import ceil
++from statistics import mean
++from time import perf_counter
++from typing import Callable
++
++import pandas as pd
++from pandas.testing import assert_frame_equal
++
++
++@dataclass(frozen=True)
++class BenchmarkResult:
++    samples: tuple[float, ...]
++    mean_seconds: float
++    p95_seconds: float
++
++
++def assert_dataframes_strict_equal(
++    left: pd.DataFrame,
++    right: pd.DataFrame,
++    *,
++    context: str = "",
++    reset_index: bool = False,
++) -> None:
++    if reset_index:
++        left = left.reset_index(drop=True)
++        right = right.reset_index(drop=True)
++
++    try:
++        assert_frame_equal(
++            left,
++            right,
++            check_dtype=True,
++            check_exact=True,
++            check_like=False,
++        )
++    except AssertionError as exc:
++        prefix = f"{context}: " if context else ""
++        diff = first_dataframe_difference(left, right)
++        raise AssertionError(f"{prefix}{diff}\n{exc}") from exc
++
++
++def first_dataframe_difference(left: pd.DataFrame, right: pd.DataFrame) -> str:
++    if list(left.columns) != list(right.columns):
++        return f"column mismatch left={list(left.columns)} right={list(right.columns)}"
++    if list(left.dtypes.astype(str)) != list(right.dtypes.astype(str)):
++        return (
++            "dtype mismatch "
++            f"left={list(left.dtypes.astype(str))} right={list(right.dtypes.astype(str))}"
++        )
++    if not left.index.equals(right.index):
++        return f"index mismatch left={list(left.index)} right={list(right.index)}"
++    if len(left) != len(right):
++        return f"row count mismatch left={len(left)} right={len(right)}"
++
++    for row_idx in range(len(left)):
++        for column in left.columns:
++            left_value = left.iloc[row_idx][column]
++            right_value = right.iloc[row_idx][column]
++            if pd.isna(left_value) and pd.isna(right_value):
++                continue
++            if left_value != right_value:
++                return (
++                    f"first diff at row={row_idx}, column={column}, "
++                    f"left={left_value!r}, right={right_value!r}"
++                )
++
++    return "dataframes differ but no first diff could be isolated"
++
++
++def benchmark_callable(
++    func: Callable[[], object], *, warmups: int = 1, repeats: int = 10
++) -> BenchmarkResult:
++    if warmups < 0:
++        raise AssertionError("warmups cannot be negative")
++    if repeats <= 0:
++        raise AssertionError("repeats must be positive")
++
++    for _ in range(warmups):
++        func()
++
++    samples: list[float] = []
++    for _ in range(repeats):
++        start = perf_counter()
++        func()
++        samples.append(perf_counter() - start)
++
++    ordered = sorted(samples)
++    p95_index = ceil(len(ordered) * 0.95) - 1
++    return BenchmarkResult(
++        samples=tuple(samples),
++        mean_seconds=mean(samples),
++        p95_seconds=ordered[p95_index],
++    )
+--- a/tests/support/module1_harness.py
++++ b/tests/support/module1_harness.py
+@@ -0,0 +1,201 @@
++from __future__ import annotations
++
++from dataclasses import dataclass
++from datetime import timedelta
++from pathlib import Path
++
++import pandas as pd
++
++from tests.support.module1_baseline import (
++    Module1BaselineSnapshot,
++    baseline_update_resample_candle,
++)
++from tests.support.real_sample_harness import load_resample_sample
++
++
++@dataclass(frozen=True)
++class Module1Case:
++    name: str
++    symbol: str
++    df_old: pd.DataFrame
++    df_new: pd.DataFrame
++    num_candles: int
++    run_time: pd.Timestamp
++    resample_delta: timedelta
++    gap_fill_time: pd.Timestamp | None = None
++
++
++APPEND_ONLY_CASE = None
++IDENTICAL_OVERLAP_CASE = None
++CORRECTION_OVERLAP_CASE = None
++SMALL_GAP_CASE = None
++
++
++def load_real_sample(sample_name: str) -> pd.DataFrame:
++    return load_resample_sample(sample_name)
++
++
++def build_real_case(
++    sample_name: str,
++    *,
++    symbol: str,
++    old_start: int,
++    old_rows: int,
++    new_start: int,
++    new_rows: int,
++    num_candles: int,
++) -> Module1Case:
++    df_full = load_real_sample(sample_name)
++    df_old = df_full.iloc[old_start:old_start + old_rows].copy(deep=True).reset_index(drop=True)
++    df_new = df_full.iloc[new_start:new_start + new_rows].copy(deep=True).reset_index(drop=True)
++    run_time = pd.Timestamp(df_new["candle_begin_time"].iloc[-1])
++    return Module1Case(
++        name=(
++            f"{sample_name}-old{old_start}:{old_start + old_rows}-"
++            f"new{new_start}:{new_start + new_rows}-tail{num_candles}"
++        ),
++        symbol=symbol,
++        df_old=df_old,
++        df_new=df_new,
++        num_candles=num_candles,
++        run_time=run_time,
++        resample_delta=infer_resample_delta(df_full),
++    )
++
++
++def build_correction_case() -> Module1Case:
++    base_case = build_real_case(
++        "binance_btcusdt_40m",
++        symbol="BTCUSDT",
++        old_start=250,
++        old_rows=8,
++        new_start=255,
++        new_rows=4,
++        num_candles=8,
++    )
++    corrected = base_case.df_new.copy(deep=True)
++    corrected.loc[0, "high"] = corrected.loc[0, "high"] + 12.34
++    return Module1Case(
++        name="binance_btcusdt-corrected-overlap-high",
++        symbol=base_case.symbol,
++        df_old=base_case.df_old,
++        df_new=corrected,
++        num_candles=base_case.num_candles,
++        run_time=base_case.run_time,
++        resample_delta=base_case.resample_delta,
++    )
++
++
++def build_small_gap_case() -> Module1Case:
++    base_case = build_real_case(
++        "data_api_0gusdt_40m",
++        symbol="0GUSDT",
++        old_start=80,
++        old_rows=6,
++        new_start=86,
++        new_rows=2,
++        num_candles=8,
++    )
++    derived_new = base_case.df_new.iloc[[1]].copy(deep=True).reset_index(drop=True)
++    gap_fill_time = pd.Timestamp(base_case.df_new.iloc[0]["candle_begin_time"])
++    return Module1Case(
++        name="data_api_0gusdt-small-gap-derived-from-real-sample",
++        symbol=base_case.symbol,
++        df_old=base_case.df_old,
++        df_new=derived_new,
++        num_candles=base_case.num_candles,
++        run_time=pd.Timestamp(derived_new["candle_begin_time"].iloc[-1]),
++        resample_delta=base_case.resample_delta,
++        gap_fill_time=gap_fill_time,
++    )
++
++
++def infer_resample_delta(df: pd.DataFrame) -> timedelta:
++    diffs = df["candle_begin_time"].sort_values().diff().dropna()
++    if diffs.empty:
++        raise AssertionError("Cannot infer resample delta from fewer than two rows")
++    return diffs.mode().iloc[0].to_pytimedelta()
++
++
++def baseline_snapshot_for_case(case: Module1Case) -> Module1BaselineSnapshot:
++    return baseline_update_resample_candle(
++        case.df_old.copy(deep=True),
++        case.df_new.copy(deep=True),
++        case.num_candles,
++        case.resample_delta,
++    )
++
++
++def list_ready_file_names(manager, symbol: str) -> list[str]:
++    return sorted(path.name for path in Path(manager.base_dir).glob(f"{symbol}_*.ready"))
++
++
++def assert_case_invariants(case: Module1Case) -> None:
++    assert not case.df_new.empty, f"{case.name} must include incremental rows"
++    assert list(case.df_old.columns) == list(case.df_new.columns), f"{case.name} column mismatch"
++    old_times = case.df_old["candle_begin_time"]
++    new_times = case.df_new["candle_begin_time"]
++    overlap_times = sorted(set(old_times).intersection(set(new_times)))
++
++    if case is APPEND_ONLY_CASE:
++        assert old_times.max() < new_times.min(), f"{case.name} must be append-only"
++        assert not overlap_times, f"{case.name} must not overlap"
++        return
++
++    if case is IDENTICAL_OVERLAP_CASE:
++        assert overlap_times, f"{case.name} must include overlap rows"
++        old_overlap = case.df_old[case.df_old["candle_begin_time"].isin(overlap_times)].reset_index(drop=True)
++        new_overlap = case.df_new[case.df_new["candle_begin_time"].isin(overlap_times)].reset_index(drop=True)
++        pd.testing.assert_frame_equal(old_overlap, new_overlap, check_dtype=True, check_exact=True)
++        return
++
++    if case is CORRECTION_OVERLAP_CASE:
++        assert overlap_times, f"{case.name} must include overlap rows"
++        old_overlap = case.df_old[case.df_old["candle_begin_time"].isin(overlap_times)].reset_index(drop=True)
++        new_overlap = case.df_new[case.df_new["candle_begin_time"].isin(overlap_times)].reset_index(drop=True)
++        diff_mask = old_overlap.ne(new_overlap)
++        changed_columns = {column for column in diff_mask.columns if bool(diff_mask[column].any())}
++        assert changed_columns == {"high"}, f"{case.name} must only change high, got {changed_columns}"
++        first_overlap_time = overlap_times[0]
++        old_value = old_overlap.loc[old_overlap["candle_begin_time"] == first_overlap_time, "high"].iloc[0]
++        new_value = new_overlap.loc[new_overlap["candle_begin_time"] == first_overlap_time, "high"].iloc[0]
++        assert new_value > old_value, f"{case.name} corrected high must be greater than original"
++        return
++
++    if case is SMALL_GAP_CASE:
++        assert case.gap_fill_time is not None, f"{case.name} must define gap_fill_time"
++        assert old_times.max() < case.gap_fill_time < new_times.min(), f"{case.name} gap must be bounded"
++        assert new_times.min() - old_times.max() == case.resample_delta * 2, (
++            f"{case.name} must leave exactly one missing candle"
++        )
++        assert case.gap_fill_time == old_times.max() + case.resample_delta, (
++            f"{case.name} gap_fill_time must be the single missing candle"
++        )
++        return
++
++    raise AssertionError(f"Unhandled case invariants for {case.name}")
++
++
++APPEND_ONLY_CASE = build_real_case(
++    "binance_btcusdt_40m",
++    symbol="BTCUSDT",
++    old_start=250,
++    old_rows=6,
++    new_start=256,
++    new_rows=3,
++    num_candles=8,
++)
++IDENTICAL_OVERLAP_CASE = build_real_case(
++    "data_api_0gusdt_40m",
++    symbol="0GUSDT",
++    old_start=80,
++    old_rows=6,
++    new_start=84,
++    new_rows=3,
++    num_candles=8,
++)
++CORRECTION_OVERLAP_CASE = build_correction_case()
++SMALL_GAP_CASE = build_small_gap_case()
++
++for _case in [APPEND_ONLY_CASE, IDENTICAL_OVERLAP_CASE, CORRECTION_OVERLAP_CASE, SMALL_GAP_CASE]:
++    assert_case_invariants(_case)
+--- a/tests/support/module1_baseline.py
++++ b/tests/support/module1_baseline.py
+@@ -0,0 +1,99 @@
++from __future__ import annotations
++
++from dataclasses import dataclass
++from datetime import timedelta
++
++import pandas as pd
++
++
++@dataclass(frozen=True)
++class Module1BaselineSnapshot:
++    dataframe: pd.DataFrame
++    first_begin_time: pd.Timestamp | None
++    last_begin_time: pd.Timestamp | None
++
++
++_NUMERIC_ZERO_FILL_COLUMNS = [
++    "volume",
++    "quote_volume",
++    "trade_num",
++    "taker_buy_base_asset_volume",
++    "taker_buy_quote_asset_volume",
++]
++
++
++def _baseline_filter_gaps(
++    df: pd.DataFrame,
++    gap_hours_thres: int = 48,
++    price_change_thres: float = 0.1,
++) -> pd.DataFrame:
++    price_change = (df["open"] / df["close"].shift().fillna(df["open"]) - 1).fillna(0)
++    time_gap = df["candle_begin_time"].diff().fillna(timedelta(minutes=0))
++    cond = (time_gap > timedelta(hours=gap_hours_thres)) & (price_change.abs() > price_change_thres)
++
++    if cond.any():
++        last_idx = cond[cond].index[-1]
++        df = df.loc[last_idx:].copy()
++
++    return df
++
++
++def _baseline_fill_gaps(df: pd.DataFrame, delta: timedelta) -> pd.DataFrame:
++    first = df["candle_begin_time"].min()
++    last = df["candle_begin_time"].max()
++    time_range = pd.date_range(first, last, freq=delta)
++
++    if len(df) == len(time_range) and (df["candle_begin_time"].reset_index(drop=True) == time_range).all():
++        return df
++
++    benchmark = pd.DataFrame({"candle_begin_time": time_range})
++    df = pd.merge(left=benchmark, right=df, on="candle_begin_time", how="left", sort=True)
++
++    df["close"] = df["close"].ffill()
++    df["open"] = df["open"].fillna(df["close"])
++    df["high"] = df["high"].fillna(df["close"])
++    df["low"] = df["low"].fillna(df["close"])
++
++    if "avg_price_1m" in df.columns:
++        df["avg_price_1m"] = df["avg_price_1m"].fillna(df["open"])
++
++    for column in _NUMERIC_ZERO_FILL_COLUMNS:
++        df[column] = df[column].fillna(0)
++
++    df["candle_end_time"] = df["candle_begin_time"] + delta
++    df.set_index("candle_end_time", inplace=True)
++    return df
++
++
++def baseline_update_resample_candle(
++    df_old: pd.DataFrame | None,
++    df_resample: pd.DataFrame,
++    num_candles: int,
++    resample_delta: timedelta,
++) -> Module1BaselineSnapshot:
++    """Frozen snapshot of update_resample_candle's observable dataframe contract."""
++    if df_old is None or df_old.empty:
++        df_total = df_resample.copy(deep=True)
++    else:
++        df_total = pd.concat([df_old.copy(deep=True), df_resample.copy(deep=True)])
++
++    if df_total.empty:
++        return Module1BaselineSnapshot(
++            dataframe=df_total.copy(deep=True),
++            first_begin_time=None,
++            last_begin_time=None,
++        )
++
++    df_total = df_total.copy(deep=True)
++    df_total.drop_duplicates(subset="candle_begin_time", keep="last", inplace=True)
++    df_total.sort_values("candle_begin_time", inplace=True)
++    df_total.reset_index(drop=True, inplace=True)
++    df_total = _baseline_filter_gaps(df_total)
++    df_total = _baseline_fill_gaps(df_total, resample_delta)
++    df_total = df_total.tail(num_candles)
++
++    return Module1BaselineSnapshot(
++        dataframe=df_total,
++        first_begin_time=df_total["candle_begin_time"].iloc[0],
++        last_begin_time=df_total["candle_begin_time"].iloc[-1],
++    )
+--- a/tests/support/module2_harness.py
++++ b/tests/support/module2_harness.py
+@@ -0,0 +1,168 @@
++from __future__ import annotations
++
++from dataclasses import dataclass
++from datetime import datetime
++from math import ceil
++from pathlib import Path
++from statistics import mean
++from time import perf_counter
++from typing import Callable
++
++import pandas as pd
++from pandas.testing import assert_frame_equal
++
++from tests.support.module2_baseline import baseline_merge_candles
++
++ROOT_DIR = Path(__file__).resolve().parents[2]
++DATA_DIR = ROOT_DIR / "data"
++SAMPLE_PATHS = {
++    "funding_0GUSDT": DATA_DIR / "funding" / "0GUSDT.pkl",
++    "coin_cap_0GUSDT": DATA_DIR / "coin_cap" / "0GUSDT.pkl",
++}
++
++
++@dataclass(frozen=True)
++class Module2Case:
++    name: str
++    symbol: str
++    df_old: pd.DataFrame
++    df_new: pd.DataFrame
++    num_candles: int | None
++    expected: pd.DataFrame
++    run_time: datetime
++
++
++@dataclass(frozen=True)
++class BenchmarkResult:
++    samples: tuple[float, ...]
++    mean_seconds: float
++    p95_seconds: float
++
++
++def load_real_sample(sample_name: str) -> pd.DataFrame:
++    path = SAMPLE_PATHS[sample_name]
++    df = pd.read_pickle(path)
++    if "candle_begin_time" not in df.columns:
++        raise AssertionError(f"Sample {sample_name} is missing candle_begin_time")
++    return df.sort_values("candle_begin_time").reset_index(drop=True)
++
++
++def build_real_case(
++    sample_name: str,
++    *,
++    old_rows: int,
++    new_rows: int,
++    overlap_rows: int = 0,
++    num_candles: int | None = None,
++) -> Module2Case:
++    df_full = load_real_sample(sample_name)
++    if old_rows <= 0:
++        raise AssertionError("old_rows must be positive")
++    if new_rows <= 0:
++        raise AssertionError("new_rows must be positive")
++    if overlap_rows < 0:
++        raise AssertionError("overlap_rows cannot be negative")
++    if overlap_rows >= old_rows:
++        raise AssertionError("overlap_rows must be smaller than old_rows")
++
++    new_start = old_rows - overlap_rows
++    new_end = new_start + new_rows
++    if new_end > len(df_full):
++        raise AssertionError(
++            f"Sample {sample_name} needs at least {new_end} rows, only has {len(df_full)}"
++        )
++
++    df_old = df_full.iloc[:old_rows].copy()
++    df_new = df_full.iloc[new_start:new_end].copy()
++    run_time = df_new["candle_begin_time"].iloc[-1].to_pydatetime()
++    expected = baseline_merge_candles(df_old, df_new, num_candles).reset_index(drop=True)
++
++    return Module2Case(
++        name=f"{sample_name}-old{old_rows}-new{new_rows}-overlap{overlap_rows}-tail{num_candles}",
++        symbol=load_symbol(df_full, sample_name),
++        df_old=df_old.reset_index(drop=True),
++        df_new=df_new.reset_index(drop=True),
++        num_candles=num_candles,
++        expected=expected,
++        run_time=run_time,
++    )
++
++
++def load_symbol(df: pd.DataFrame, sample_name: str) -> str:
++    if "symbol" in df.columns and not df["symbol"].empty:
++        return str(df["symbol"].iloc[0])
++    return sample_name.split("_", 1)[1]
++
++
++def list_ready_file_names(manager, symbol: str) -> list[str]:
++    return sorted(path.name for path in Path(manager.base_dir).glob(f"{symbol}_*.ready"))
++
++
++def assert_dataframes_strict_equal(left: pd.DataFrame, right: pd.DataFrame, *, context: str = "") -> None:
++    left = left.reset_index(drop=True)
++    right = right.reset_index(drop=True)
++
++    try:
++        assert_frame_equal(
++            left,
++            right,
++            check_dtype=True,
++            check_exact=True,
++            check_like=False,
++        )
++    except AssertionError as exc:
++        prefix = f"{context}: " if context else ""
++        diff = first_dataframe_difference(left, right)
++        raise AssertionError(f"{prefix}{diff}\n{exc}") from exc
++
++
++def first_dataframe_difference(left: pd.DataFrame, right: pd.DataFrame) -> str:
++    if list(left.columns) != list(right.columns):
++        return f"column mismatch left={list(left.columns)} right={list(right.columns)}"
++    if list(left.dtypes.astype(str)) != list(right.dtypes.astype(str)):
++        return (
++            "dtype mismatch "
++            f"left={list(left.dtypes.astype(str))} right={list(right.dtypes.astype(str))}"
++        )
++    if len(left) != len(right):
++        return f"row count mismatch left={len(left)} right={len(right)}"
++
++    for row_idx in range(len(left)):
++        for column in left.columns:
++            left_value = left.iloc[row_idx][column]
++            right_value = right.iloc[row_idx][column]
++            if pd.isna(left_value) and pd.isna(right_value):
++                continue
++            if left_value != right_value:
++                return (
++                    f"first diff at row={row_idx}, column={column}, "
++                    f"left={left_value!r}, right={right_value!r}"
++                )
++
++    return "dataframes differ but no first diff could be isolated"
++
++
++def benchmark_callable(
++    func: Callable[[], object], *, warmups: int = 1, repeats: int = 10
++) -> BenchmarkResult:
++    if warmups < 0:
++        raise AssertionError("warmups cannot be negative")
++    if repeats <= 0:
++        raise AssertionError("repeats must be positive")
++
++    for _ in range(warmups):
++        func()
++
++    samples: list[float] = []
++    for _ in range(repeats):
++        start = perf_counter()
++        func()
++        samples.append(perf_counter() - start)
++
++    ordered = sorted(samples)
++    p95_index = ceil(len(ordered) * 0.95) - 1
++    return BenchmarkResult(
++        samples=tuple(samples),
++        mean_seconds=mean(samples),
++        p95_seconds=ordered[p95_index],
++    )
+--- a/tests/support/module2_baseline.py
++++ b/tests/support/module2_baseline.py
+@@ -0,0 +1,27 @@
++from __future__ import annotations
++
++import pandas as pd
++
++
++def baseline_merge_candles(
++    df_old: pd.DataFrame | None,
++    df_new: pd.DataFrame,
++    num_candles: int | None,
++) -> pd.DataFrame:
++    """Frozen snapshot of update_candle's dataframe transformation only.
++
++    This helper intentionally stops at the harness boundary. It does not call
++    CandleFileManager methods or model storage side effects such as ready files.
++    """
++    if df_old is None or df_old.empty:
++        df = df_new.copy(deep=True)
++    else:
++        df = pd.concat([df_old.copy(deep=True), df_new.copy(deep=True)])
++
++    df = df.copy(deep=True)
++    df.drop_duplicates(subset="candle_begin_time", keep="last", inplace=True)
++    df.sort_values("candle_begin_time", inplace=True)
++    if num_candles is not None:
++        df = df.tail(num_candles)
++
++    return df
+--- a/tests/support/module3_harness.py
++++ b/tests/support/module3_harness.py
+@@ -0,0 +1,146 @@
++from __future__ import annotations
++
++from dataclasses import dataclass
++from pathlib import Path
++from types import SimpleNamespace
++from typing import Optional
++
++import pandas as pd
++
++from core.candle_manager import CandleFileManager
++from core.utils.time import get_offset_from_runtime
++
++ROOT_DIR = Path(__file__).resolve().parents[2]
++DATA_DIR = ROOT_DIR / "data"
++
++BTCUSDT_SPOT_PATH = DATA_DIR / "binance_spot_1h_resample" / "40m" / "BTCUSDT.pkl"
++BTCUSDT_SWAP_PATH = DATA_DIR / "binance_swap_1h_resample" / "40m" / "BTCUSDT.pkl"
++BTCUSDT_FUNDING_PATH = DATA_DIR / "funding" / "BTCUSDT.pkl"
++
++RESAMPLE_INTERVAL = "1h"
++
++
++def load_btcusdt_spot() -> pd.DataFrame:
++    return pd.read_pickle(BTCUSDT_SPOT_PATH).sort_values("candle_begin_time").reset_index(drop=True)
++
++
++def load_btcusdt_swap() -> pd.DataFrame:
++    return pd.read_pickle(BTCUSDT_SWAP_PATH).sort_values("candle_begin_time").reset_index(drop=True)
++
++
++def load_btcusdt_funding() -> pd.DataFrame:
++    return pd.read_pickle(BTCUSDT_FUNDING_PATH).sort_values("candle_begin_time").reset_index(drop=True)
++
++
++@dataclass(frozen=True)
++class Module3Case:
++    name: str
++    trade_type: str
++    symbol: str
++    df_full: pd.DataFrame
++    df_funding: Optional[pd.DataFrame]
++    old_rows: int
++    new_rows: int
++    df_match: pd.DataFrame
++
++
++def build_match_row(symbol: str, df_resample: pd.DataFrame) -> dict:
++    first = df_resample["candle_begin_time"].min()
++    last = df_resample["candle_begin_time"].max()
++    return {"spot": symbol, "swap": symbol, "first_begin_time": first, "last_begin_time": last}
++
++
++def make_minimal_handle(
++    tmp_path: Path,
++    case: Module3Case,
++    *,
++    df_resample_for_binance: pd.DataFrame,
++    run_time: pd.Timestamp,
++) -> tuple[SimpleNamespace, CandleFileManager, CandleFileManager]:
++    """
++    Build a minimal handle-like namespace that provides what gen_batch_data needs.
++    Returns (handle, binance_mgr, preprocess_mgr).
++    """
++    offset_str = get_offset_from_runtime(run_time.to_pydatetime(), RESAMPLE_INTERVAL)
++
++    binance_dir = tmp_path / "binance" / offset_str
++    binance_dir.mkdir(parents=True, exist_ok=True)
++    binance_mgr = CandleFileManager(base_dir=binance_dir, save_type="pickle")
++    binance_mgr.save_data_file(case.symbol, df_resample_for_binance.copy(deep=True))
++    binance_mgr.save_ready(case.symbol, run_time.to_pydatetime())
++
++    preprocess_dir = tmp_path / "preprocess" / offset_str
++    preprocess_dir.mkdir(parents=True, exist_ok=True)
++    preprocess_mgr = CandleFileManager(base_dir=preprocess_dir, save_type="pickle")
++
++    funding_mgr = None
++    if case.df_funding is not None:
++        funding_dir = tmp_path / "funding"
++        funding_dir.mkdir(parents=True, exist_ok=True)
++        funding_mgr = CandleFileManager(base_dir=funding_dir, save_type="pickle")
++        funding_mgr.save_data_file(case.symbol, case.df_funding.copy(deep=True))
++
++    binance_handle = SimpleNamespace(resample_mgr_map={offset_str: binance_mgr})
++    preprocess_handle = SimpleNamespace(
++        preprocess_mgr_map={offset_str: preprocess_mgr},
++        num_batch=256,
++    )
++
++    handle = SimpleNamespace(
++        resample_interval=RESAMPLE_INTERVAL,
++        preprocess_handle=preprocess_handle,
++        data_api=None,
++        fetch_funding_rate=(case.df_funding is not None),
++        funding_mgr=funding_mgr,
++        _binance_spot=binance_handle,
++        _binance_swap=binance_handle,
++    )
++
++    def get_binance_handle(trade_type):
++        return handle._binance_spot
++
++    handle.get_binance_handle = get_binance_handle
++
++    return handle, binance_mgr, preprocess_mgr
++
++
++def build_spot_case(old_rows: int, new_rows: int) -> Module3Case:
++    df_full = load_btcusdt_spot()
++    assert old_rows + new_rows <= len(df_full), "Not enough rows in sample"
++    start = len(df_full) - old_rows - new_rows
++    match_row = build_match_row("BTCUSDT", df_full)
++    df_match = pd.DataFrame([match_row])
++    return Module3Case(
++        name=f"btcusdt_spot_old{old_rows}_new{new_rows}",
++        trade_type="spot",
++        symbol="BTCUSDT",
++        df_full=df_full.iloc[start:].reset_index(drop=True),
++        df_funding=None,
++        old_rows=old_rows,
++        new_rows=new_rows,
++        df_match=df_match,
++    )
++
++
++def build_swap_case(old_rows: int, new_rows: int) -> Module3Case:
++    df_full = load_btcusdt_swap()
++    df_funding = load_btcusdt_funding()
++    assert old_rows + new_rows <= len(df_full), "Not enough rows in sample"
++    start = len(df_full) - old_rows - new_rows
++    df_slice = df_full.iloc[start:].reset_index(drop=True)
++    match_row = build_match_row("BTCUSDT", df_slice)
++    df_match = pd.DataFrame([match_row])
++    return Module3Case(
++        name=f"btcusdt_swap_old{old_rows}_new{new_rows}",
++        trade_type="swap",
++        symbol="BTCUSDT",
++        df_full=df_slice,
++        df_funding=df_funding,
++        old_rows=old_rows,
++        new_rows=new_rows,
++        df_match=df_match,
++    )
++
++
++SPOT_CASE = build_spot_case(old_rows=8, new_rows=3)
++SWAP_CASE = build_swap_case(old_rows=8, new_rows=3)
+--- a/tests/test_module1_harness.py
++++ b/tests/test_module1_harness.py
+@@ -0,0 +1,293 @@
++from __future__ import annotations
++
++from datetime import timedelta
++from pathlib import Path
++
++import pytest
++
++from core.candle_manager import CandleFileManager
++from core.resample_candle import update_resample_candle
++from tests.support.harness_common import assert_dataframes_strict_equal, benchmark_callable
++from tests.support.module1_baseline import Module1BaselineSnapshot, baseline_update_resample_candle
++from tests.support.module1_harness import (
++    APPEND_ONLY_CASE,
++    CORRECTION_OVERLAP_CASE,
++    IDENTICAL_OVERLAP_CASE,
++    SMALL_GAP_CASE,
++    Module1Case,
++    baseline_snapshot_for_case,
++    list_ready_file_names,
++)
++
++BASELINE_REAL_CASES = [
++    APPEND_ONLY_CASE,
++    IDENTICAL_OVERLAP_CASE,
++    CORRECTION_OVERLAP_CASE,
++    SMALL_GAP_CASE,
++]
++
++
++@pytest.fixture()
++def manager_factory(tmp_path: Path):
++    def _make(name: str) -> CandleFileManager:
++        base_dir = tmp_path / name
++        base_dir.mkdir(parents=True, exist_ok=True)
++        return CandleFileManager(base_dir=base_dir, save_type="pickle")
++
++    return _make
++
++
++def assert_update_resample_candle_observable_contract(
++    manager: CandleFileManager,
++    *,
++    case: Module1Case,
++    snapshot: Module1BaselineSnapshot,
++    result: tuple,
++    stale_run_time,
++) -> None:
++    first_begin_time, last_begin_time = result
++    assert first_begin_time == snapshot.first_begin_time
++    assert last_begin_time == snapshot.last_begin_time
++    assert_dataframes_strict_equal(
++        manager.read_candle(case.symbol),
++        snapshot.dataframe,
++        context=f"persisted-{case.name}",
++    )
++    assert manager.check_ready(case.symbol, case.run_time) is True
++    assert manager.check_ready(case.symbol, stale_run_time) is False
++    assert list_ready_file_names(manager, case.symbol) == [
++        Path(manager.format_ready_file_path(case.symbol, case.run_time)).name
++    ]
++
++
++@pytest.mark.parametrize("case", BASELINE_REAL_CASES, ids=lambda case: case.name)
++def test_update_resample_candle_matches_baseline_snapshot_observable_contract(case, manager_factory):
++    manager = manager_factory("current")
++    manager.save_data_file(case.symbol, case.df_old.copy(deep=True))
++
++    stale_run_time = case.run_time - timedelta(hours=1)
++    manager.save_ready(case.symbol, stale_run_time)
++
++    result = update_resample_candle(
++        manager,
++        case.symbol,
++        case.df_new.copy(deep=True),
++        case.num_candles,
++        case.run_time,
++        case.resample_delta,
++    )
++
++    snapshot = baseline_snapshot_for_case(case)
++    assert_update_resample_candle_observable_contract(
++        manager,
++        case=case,
++        snapshot=snapshot,
++        result=result,
++        stale_run_time=stale_run_time,
++    )
++
++
++def test_update_resample_candle_with_none_run_time_clears_ready_files(manager_factory):
++    case = APPEND_ONLY_CASE
++    manager = manager_factory("runtime-none")
++    manager.save_data_file(case.symbol, case.df_old.copy(deep=True))
++    manager.save_ready(case.symbol, case.run_time)
++
++    result = update_resample_candle(
++        manager,
++        case.symbol,
++        case.df_new.copy(deep=True),
++        case.num_candles,
++        None,
++        case.resample_delta,
++    )
++
++    snapshot = baseline_snapshot_for_case(case)
++    assert result == (snapshot.first_begin_time, snapshot.last_begin_time)
++    assert_dataframes_strict_equal(
++        manager.read_candle(case.symbol),
++        snapshot.dataframe,
++        context=f"persisted-none-runtime-{case.name}",
++    )
++    assert list_ready_file_names(manager, case.symbol) == []
++
++
++def test_update_resample_candle_without_existing_symbol_matches_baseline_snapshot(manager_factory):
++    case = APPEND_ONLY_CASE
++    manager = manager_factory("no-existing-symbol")
++
++    stale_run_time = case.run_time - timedelta(hours=1)
++    manager.save_ready(case.symbol, stale_run_time)
++
++    result = update_resample_candle(
++        manager,
++        case.symbol,
++        case.df_new.copy(deep=True),
++        case.num_candles,
++        case.run_time,
++        case.resample_delta,
++    )
++
++    snapshot = baseline_update_resample_candle(
++        None,
++        case.df_new.copy(deep=True),
++        case.num_candles,
++        case.resample_delta,
++    )
++    assert_update_resample_candle_observable_contract(
++        manager,
++        case=case,
++        snapshot=snapshot,
++        result=result,
++        stale_run_time=stale_run_time,
++    )
++
++
++def test_update_resample_candle_with_empty_stored_dataframe_matches_baseline_snapshot(manager_factory):
++    case = APPEND_ONLY_CASE
++    manager = manager_factory("empty-stored-dataframe")
++    manager.save_data_file(case.symbol, case.df_old.iloc[0:0].copy(deep=True))
++
++    stale_run_time = case.run_time - timedelta(hours=1)
++    manager.save_ready(case.symbol, stale_run_time)
++
++    result = update_resample_candle(
++        manager,
++        case.symbol,
++        case.df_new.copy(deep=True),
++        case.num_candles,
++        case.run_time,
++        case.resample_delta,
++    )
++
++    snapshot = baseline_update_resample_candle(
++        None,
++        case.df_new.copy(deep=True),
++        case.num_candles,
++        case.resample_delta,
++    )
++    assert_update_resample_candle_observable_contract(
++        manager,
++        case=case,
++        snapshot=snapshot,
++        result=result,
++        stale_run_time=stale_run_time,
++    )
++
++
++def test_update_resample_candle_with_empty_new_rows_preserves_existing_snapshot(manager_factory):
++    case = APPEND_ONLY_CASE
++    manager = manager_factory("empty-new-rows")
++    manager.save_data_file(case.symbol, case.df_old.copy(deep=True))
++
++    stale_run_time = case.run_time - timedelta(hours=1)
++    manager.save_ready(case.symbol, stale_run_time)
++
++    empty_new = case.df_new.iloc[0:0].copy(deep=True)
++    result = update_resample_candle(
++        manager,
++        case.symbol,
++        empty_new,
++        case.num_candles,
++        case.run_time,
++        case.resample_delta,
++    )
++
++    snapshot = baseline_update_resample_candle(
++        case.df_old.copy(deep=True),
++        empty_new,
++        case.num_candles,
++        case.resample_delta,
++    )
++    assert_update_resample_candle_observable_contract(
++        manager,
++        case=case,
++        snapshot=snapshot,
++        result=result,
++        stale_run_time=stale_run_time,
++    )
++
++
++def test_update_resample_candle_with_empty_total_returns_none_pair(manager_factory):
++    case = APPEND_ONLY_CASE
++    manager = manager_factory("empty-total-output")
++
++    stale_run_time = case.run_time - timedelta(hours=1)
++    manager.save_ready(case.symbol, stale_run_time)
++
++    empty_new = case.df_new.iloc[0:0].copy(deep=True)
++    result = update_resample_candle(
++        manager,
++        case.symbol,
++        empty_new,
++        case.num_candles,
++        case.run_time,
++        case.resample_delta,
++    )
++
++    snapshot = baseline_update_resample_candle(
++        None,
++        empty_new,
++        case.num_candles,
++        case.resample_delta,
++    )
++    assert result == (snapshot.first_begin_time, snapshot.last_begin_time) == (None, None)
++    assert_dataframes_strict_equal(
++        manager.read_candle(case.symbol),
++        snapshot.dataframe,
++        context=f"persisted-empty-total-{case.name}",
++    )
++    assert manager.check_ready(case.symbol, case.run_time) is True
++    assert manager.check_ready(case.symbol, stale_run_time) is False
++    assert list_ready_file_names(manager, case.symbol) == [
++        Path(manager.format_ready_file_path(case.symbol, case.run_time)).name
++    ]
++
++
++def test_small_gap_case_fills_missing_row_with_previous_close_and_zero_volume(manager_factory):
++    case = SMALL_GAP_CASE
++    manager = manager_factory("small-gap")
++    manager.save_data_file(case.symbol, case.df_old.copy(deep=True))
++
++    update_resample_candle(
++        manager,
++        case.symbol,
++        case.df_new.copy(deep=True),
++        case.num_candles,
++        case.run_time,
++        case.resample_delta,
++    )
++
++    persisted = manager.read_candle(case.symbol)
++    filled_row = persisted.loc[persisted["candle_begin_time"] == case.gap_fill_time].iloc[0]
++    previous_close = persisted.loc[persisted["candle_begin_time"] < case.gap_fill_time, "close"].iloc[-1]
++
++    assert filled_row["open"] == previous_close
++    assert filled_row["high"] == previous_close
++    assert filled_row["low"] == previous_close
++    assert filled_row["close"] == previous_close
++    assert filled_row["volume"] == 0
++    assert filled_row["quote_volume"] == 0
++    assert filled_row["trade_num"] == 0
++    assert filled_row["taker_buy_base_asset_volume"] == 0
++    assert filled_row["taker_buy_quote_asset_volume"] == 0
++
++
++def test_benchmark_helper_collects_repeat_samples_and_uses_nearest_rank_p95(monkeypatch):
++    call_counter = {"count": 0}
++
++    def record_call() -> int:
++        call_counter["count"] += 1
++        return call_counter["count"]
++
++    perf_samples = iter([0.0, 1.0, 10.0, 12.0, 20.0, 23.0, 30.0, 34.0, 40.0, 45.0])
++
++    from tests.support import harness_common as common_module
++
++    monkeypatch.setattr(common_module, "perf_counter", lambda: next(perf_samples))
++    result = benchmark_callable(record_call, warmups=2, repeats=5)
++
++    assert call_counter["count"] == 7
++    assert result.samples == (1.0, 2.0, 3.0, 4.0, 5.0)
++    assert result.mean_seconds == pytest.approx(3.0)
++    assert result.p95_seconds == 5.0
+--- a/tests/test_module1_update_resample_candle_incremental.py
++++ b/tests/test_module1_update_resample_candle_incremental.py
+@@ -0,0 +1,337 @@
++from __future__ import annotations
++
++from datetime import timedelta
++from pathlib import Path
++
++import pytest
++
++from core.candle_manager import CandleFileManager
++from core import resample_candle as resample_module
++from tests.support.harness_common import assert_dataframes_strict_equal, benchmark_callable
++from tests.support.module1_baseline import baseline_update_resample_candle
++from tests.support.module1_harness import (
++    APPEND_ONLY_CASE,
++    CORRECTION_OVERLAP_CASE,
++    IDENTICAL_OVERLAP_CASE,
++    SMALL_GAP_CASE,
++    Module1Case,
++    baseline_snapshot_for_case,
++    list_ready_file_names,
++)
++
++FUTURE_SEAM_CASES = [
++    APPEND_ONLY_CASE,
++    IDENTICAL_OVERLAP_CASE,
++    CORRECTION_OVERLAP_CASE,
++    SMALL_GAP_CASE,
++]
++
++
++@pytest.fixture()
++def manager_factory(tmp_path: Path):
++    def _make(name: str) -> CandleFileManager:
++        base_dir = tmp_path / name
++        base_dir.mkdir(parents=True, exist_ok=True)
++        return CandleFileManager(base_dir=base_dir, save_type="pickle")
++
++    return _make
++
++
++def get_incremental_candidate():
++    candidate = getattr(resample_module, "update_resample_candle_incremental", None)
++    assert candidate is not None, (
++        "Future seam missing: add core.resample_candle.update_resample_candle_incremental "
++        "before enabling module-1 incremental behavior"
++    )
++    return candidate
++
++
++def assert_incremental_observable_contract(
++    manager: CandleFileManager,
++    *,
++    case: Module1Case,
++    result: tuple,
++    stale_run_time,
++) -> None:
++    snapshot = baseline_snapshot_for_case(case)
++    first_begin_time, last_begin_time = result
++    assert first_begin_time == snapshot.first_begin_time
++    assert last_begin_time == snapshot.last_begin_time
++    assert_dataframes_strict_equal(
++        manager.read_candle(case.symbol),
++        snapshot.dataframe,
++        context=f"persisted-{case.name}",
++    )
++    assert manager.check_ready(case.symbol, case.run_time) is True
++    assert manager.check_ready(case.symbol, stale_run_time) is False
++    assert list_ready_file_names(manager, case.symbol) == [
++        Path(manager.format_ready_file_path(case.symbol, case.run_time)).name
++    ]
++
++
++@pytest.mark.parametrize("case", FUTURE_SEAM_CASES, ids=lambda case: case.name)
++def test_update_resample_candle_incremental_matches_baseline_snapshot_contract(case, manager_factory):
++    manager = manager_factory("candidate")
++    manager.save_data_file(case.symbol, case.df_old.copy(deep=True))
++
++    stale_run_time = case.run_time - timedelta(hours=1)
++    manager.save_ready(case.symbol, stale_run_time)
++
++    candidate = get_incremental_candidate()
++    result = candidate(
++        manager,
++        case.symbol,
++        case.df_new.copy(deep=True),
++        case.num_candles,
++        case.run_time,
++        case.resample_delta,
++    )
++
++    assert_incremental_observable_contract(
++        manager,
++        case=case,
++        result=result,
++        stale_run_time=stale_run_time,
++    )
++
++
++def test_update_resample_candle_incremental_with_none_run_time_matches_ready_file_behavior(manager_factory):
++    case = APPEND_ONLY_CASE
++    manager = manager_factory("candidate-none-runtime")
++    manager.save_data_file(case.symbol, case.df_old.copy(deep=True))
++    manager.save_ready(case.symbol, case.run_time)
++
++    candidate = get_incremental_candidate()
++    result = candidate(
++        manager,
++        case.symbol,
++        case.df_new.copy(deep=True),
++        case.num_candles,
++        None,
++        case.resample_delta,
++    )
++
++    snapshot = baseline_snapshot_for_case(case)
++    assert result == (snapshot.first_begin_time, snapshot.last_begin_time)
++    assert_dataframes_strict_equal(
++        manager.read_candle(case.symbol),
++        snapshot.dataframe,
++        context=f"persisted-none-runtime-{case.name}",
++    )
++    assert list_ready_file_names(manager, case.symbol) == []
++
++
++def test_update_resample_candle_incremental_without_existing_symbol_matches_baseline_snapshot(manager_factory):
++    case = APPEND_ONLY_CASE
++    manager = manager_factory("candidate-no-existing-symbol")
++
++    stale_run_time = case.run_time - timedelta(hours=1)
++    manager.save_ready(case.symbol, stale_run_time)
++
++    candidate = get_incremental_candidate()
++    result = candidate(
++        manager,
++        case.symbol,
++        case.df_new.copy(deep=True),
++        case.num_candles,
++        case.run_time,
++        case.resample_delta,
++    )
++
++    snapshot = baseline_update_resample_candle(
++        None,
++        case.df_new.copy(deep=True),
++        case.num_candles,
++        case.resample_delta,
++    )
++    assert result == (snapshot.first_begin_time, snapshot.last_begin_time)
++    assert_dataframes_strict_equal(
++        manager.read_candle(case.symbol),
++        snapshot.dataframe,
++        context=f"persisted-missing-symbol-{case.name}",
++    )
++    assert manager.check_ready(case.symbol, case.run_time) is True
++    assert manager.check_ready(case.symbol, stale_run_time) is False
++    assert list_ready_file_names(manager, case.symbol) == [
++        Path(manager.format_ready_file_path(case.symbol, case.run_time)).name
++    ]
++
++
++def test_update_resample_candle_incremental_with_empty_stored_dataframe_matches_baseline_snapshot(manager_factory):
++    case = APPEND_ONLY_CASE
++    manager = manager_factory("candidate-empty-stored-dataframe")
++    manager.save_data_file(case.symbol, case.df_old.iloc[0:0].copy(deep=True))
++
++    stale_run_time = case.run_time - timedelta(hours=1)
++    manager.save_ready(case.symbol, stale_run_time)
++
++    candidate = get_incremental_candidate()
++    result = candidate(
++        manager,
++        case.symbol,
++        case.df_new.copy(deep=True),
++        case.num_candles,
++        case.run_time,
++        case.resample_delta,
++    )
++
++    snapshot = baseline_update_resample_candle(
++        None,
++        case.df_new.copy(deep=True),
++        case.num_candles,
++        case.resample_delta,
++    )
++    assert result == (snapshot.first_begin_time, snapshot.last_begin_time)
++    assert_dataframes_strict_equal(
++        manager.read_candle(case.symbol),
++        snapshot.dataframe,
++        context=f"persisted-empty-stored-{case.name}",
++    )
++    assert manager.check_ready(case.symbol, case.run_time) is True
++    assert manager.check_ready(case.symbol, stale_run_time) is False
++    assert list_ready_file_names(manager, case.symbol) == [
++        Path(manager.format_ready_file_path(case.symbol, case.run_time)).name
++    ]
++
++
++def test_update_resample_candle_incremental_with_empty_new_rows_preserves_existing_snapshot(manager_factory):
++    case = APPEND_ONLY_CASE
++    manager = manager_factory("candidate-empty-new-rows")
++    manager.save_data_file(case.symbol, case.df_old.copy(deep=True))
++
++    stale_run_time = case.run_time - timedelta(hours=1)
++    manager.save_ready(case.symbol, stale_run_time)
++
++    empty_new = case.df_new.iloc[0:0].copy(deep=True)
++    candidate = get_incremental_candidate()
++    result = candidate(
++        manager,
++        case.symbol,
++        empty_new,
++        case.num_candles,
++        case.run_time,
++        case.resample_delta,
++    )
++
++    snapshot = baseline_update_resample_candle(
++        case.df_old.copy(deep=True),
++        empty_new,
++        case.num_candles,
++        case.resample_delta,
++    )
++    assert result == (snapshot.first_begin_time, snapshot.last_begin_time)
++    assert_dataframes_strict_equal(
++        manager.read_candle(case.symbol),
++        snapshot.dataframe,
++        context=f"persisted-empty-new-{case.name}",
++    )
++    assert manager.check_ready(case.symbol, case.run_time) is True
++    assert manager.check_ready(case.symbol, stale_run_time) is False
++    assert list_ready_file_names(manager, case.symbol) == [
++        Path(manager.format_ready_file_path(case.symbol, case.run_time)).name
++    ]
++
++
++def test_update_resample_candle_incremental_with_empty_total_returns_none_pair(manager_factory):
++    case = APPEND_ONLY_CASE
++    manager = manager_factory("candidate-empty-total-output")
++
++    stale_run_time = case.run_time - timedelta(hours=1)
++    manager.save_ready(case.symbol, stale_run_time)
++
++    empty_new = case.df_new.iloc[0:0].copy(deep=True)
++    candidate = get_incremental_candidate()
++    result = candidate(
++        manager,
++        case.symbol,
++        empty_new,
++        case.num_candles,
++        case.run_time,
++        case.resample_delta,
++    )
++
++    snapshot = baseline_update_resample_candle(
++        None,
++        empty_new,
++        case.num_candles,
++        case.resample_delta,
++    )
++    assert result == (snapshot.first_begin_time, snapshot.last_begin_time) == (None, None)
++    assert_dataframes_strict_equal(
++        manager.read_candle(case.symbol),
++        snapshot.dataframe,
++        context=f"persisted-empty-total-{case.name}",
++    )
++    assert manager.check_ready(case.symbol, case.run_time) is True
++    assert manager.check_ready(case.symbol, stale_run_time) is False
++    assert list_ready_file_names(manager, case.symbol) == [
++        Path(manager.format_ready_file_path(case.symbol, case.run_time)).name
++    ]
++
++
++@pytest.mark.parametrize("case", [APPEND_ONLY_CASE], ids=lambda case: case.name)
++def test_update_resample_candle_incremental_append_only_benchmark_matches_baseline_and_is_not_slower(
++    case,
++    manager_factory,
++):
++    candidate = get_incremental_candidate()
++
++    def run_baseline_once():
++        manager = manager_factory("benchmark-baseline")
++        manager.save_data_file(case.symbol, case.df_old.copy(deep=True))
++        return resample_module.update_resample_candle(
++            manager,
++            case.symbol,
++            case.df_new.copy(deep=True),
++            case.num_candles,
++            case.run_time,
++            case.resample_delta,
++        )
++
++    def run_incremental_once():
++        manager = manager_factory("benchmark-incremental")
++        manager.save_data_file(case.symbol, case.df_old.copy(deep=True))
++        return candidate(
++            manager,
++            case.symbol,
++            case.df_new.copy(deep=True),
++            case.num_candles,
++            case.run_time,
++            case.resample_delta,
++        )
++
++    baseline_manager = manager_factory("benchmark-baseline-verify")
++    baseline_manager.save_data_file(case.symbol, case.df_old.copy(deep=True))
++    baseline_result = resample_module.update_resample_candle(
++        baseline_manager,
++        case.symbol,
++        case.df_new.copy(deep=True),
++        case.num_candles,
++        case.run_time,
++        case.resample_delta,
++    )
++
++    incremental_manager = manager_factory("benchmark-incremental-verify")
++    incremental_manager.save_data_file(case.symbol, case.df_old.copy(deep=True))
++    incremental_result = candidate(
++        incremental_manager,
++        case.symbol,
++        case.df_new.copy(deep=True),
++        case.num_candles,
++        case.run_time,
++        case.resample_delta,
++    )
++
++    assert incremental_result == baseline_result
++    assert_dataframes_strict_equal(
++        incremental_manager.read_candle(case.symbol),
++        baseline_manager.read_candle(case.symbol),
++        context=f"benchmark-persisted-{case.name}",
++    )
++
++    baseline_benchmark = benchmark_callable(run_baseline_once, warmups=1, repeats=5)
++    incremental_benchmark = benchmark_callable(run_incremental_once, warmups=1, repeats=5)
++    assert incremental_benchmark.mean_seconds <= baseline_benchmark.mean_seconds, (
++        f"incremental mean {incremental_benchmark.mean_seconds:.6f}s exceeded "
++        f"baseline mean {baseline_benchmark.mean_seconds:.6f}s"
++    )
+--- a/tests/test_module2_harness.py
++++ b/tests/test_module2_harness.py
+@@ -0,0 +1,125 @@
++from __future__ import annotations
++
++from datetime import timedelta
++from pathlib import Path
++
++import pytest
++
++from core.candle_manager import CandleFileManager
++from tests.support.module2_baseline import baseline_merge_candles
++from tests.support.module2_harness import (
++    assert_dataframes_strict_equal,
++    benchmark_callable,
++    build_real_case,
++    list_ready_file_names,
++)
++
++BASELINE_REAL_CASES = [
++    build_real_case("funding_0GUSDT", old_rows=256, new_rows=6, overlap_rows=2, num_candles=256),
++    build_real_case("coin_cap_0GUSDT", old_rows=64, new_rows=5, overlap_rows=1, num_candles=64),
++]
++
++
++@pytest.fixture()
++def manager_factory(tmp_path: Path):
++    def _make(name: str) -> CandleFileManager:
++        base_dir = tmp_path / name
++        base_dir.mkdir(parents=True, exist_ok=True)
++        return CandleFileManager(base_dir=base_dir, save_type="pickle")
++
++    return _make
++
++
++@pytest.mark.parametrize("case", BASELINE_REAL_CASES, ids=lambda case: case.name)
++def test_baseline_merge_matches_current_update_candle_dataframe_result(case, manager_factory):
++    current_manager = manager_factory("current")
++    current_manager.save_data_file(case.symbol, case.df_old.copy(deep=True))
++
++    current_result = current_manager.update_candle(
++        case.symbol,
++        case.run_time,
++        case.df_new.copy(deep=True),
++        case.num_candles,
++    )
++    baseline_result = baseline_merge_candles(
++        case.df_old.copy(deep=True),
++        case.df_new.copy(deep=True),
++        case.num_candles,
++    )
++
++    assert_dataframes_strict_equal(current_result, case.expected, context=f"current-{case.name}")
++    assert_dataframes_strict_equal(baseline_result, case.expected, context=f"baseline-{case.name}")
++
++
++@pytest.mark.parametrize("case", BASELINE_REAL_CASES, ids=lambda case: case.name)
++def test_update_candle_persists_data_and_rotates_ready_file(case, manager_factory):
++    manager = manager_factory("observable")
++    manager.save_data_file(case.symbol, case.df_old.copy(deep=True))
++
++    stale_run_time = case.run_time - timedelta(hours=1)
++    manager.save_ready(case.symbol, stale_run_time)
++
++    result = manager.update_candle(
++        case.symbol,
++        case.run_time,
++        case.df_new.copy(deep=True),
++        case.num_candles,
++    )
++
++    assert_dataframes_strict_equal(result, case.expected, context=f"result-{case.name}")
++    assert_dataframes_strict_equal(
++        manager.read_candle(case.symbol),
++        case.expected,
++        context=f"persisted-{case.name}",
++    )
++    assert manager.check_ready(case.symbol, case.run_time) is True
++    assert manager.check_ready(case.symbol, stale_run_time) is False
++    assert list_ready_file_names(manager, case.symbol) == [
++        Path(manager.format_ready_file_path(case.symbol, case.run_time)).name
++    ]
++
++
++@pytest.mark.parametrize("case", BASELINE_REAL_CASES, ids=lambda case: case.name)
++def test_update_candle_with_none_run_time_clears_ready_files(case, manager_factory):
++    manager = manager_factory("runtime-none")
++    manager.save_data_file(case.symbol, case.df_old.copy(deep=True))
++    manager.save_ready(case.symbol, case.run_time)
++
++    result = manager.update_candle(
++        case.symbol,
++        None,
++        case.df_new.copy(deep=True),
++        case.num_candles,
++    )
++
++    assert_dataframes_strict_equal(result, case.expected, context=f"result-{case.name}")
++    assert_dataframes_strict_equal(
++        manager.read_candle(case.symbol),
++        case.expected,
++        context=f"persisted-{case.name}",
++    )
++    assert list_ready_file_names(manager, case.symbol) == []
++
++
++def test_benchmark_helper_collects_repeat_samples_and_uses_nearest_rank_p95():
++    call_counter = {"count": 0}
++
++    def record_call() -> int:
++        call_counter["count"] += 1
++        return call_counter["count"]
++
++    perf_samples = iter([0.0, 1.0, 10.0, 12.0, 20.0, 23.0, 30.0, 34.0, 40.0, 45.0])
++
++    from tests.support import module2_harness as harness_module
++
++    original_perf_counter = harness_module.perf_counter
++    harness_module.perf_counter = lambda: next(perf_samples)
++    try:
++        result = benchmark_callable(record_call, warmups=2, repeats=5)
++    finally:
++        harness_module.perf_counter = original_perf_counter
++
++    assert call_counter["count"] == 7
++    assert result.samples == (1.0, 2.0, 3.0, 4.0, 5.0)
++    assert result.mean_seconds == pytest.approx(3.0)
++    assert result.p95_seconds == 5.0
+--- a/tests/test_module2_update_candle_incremental.py
++++ b/tests/test_module2_update_candle_incremental.py
+@@ -0,0 +1,311 @@
++from __future__ import annotations
++
++from datetime import timedelta
++from pathlib import Path
++
++import pandas as pd
++import pytest
++
++from core.candle_manager import CandleFileManager
++from tests.support.module2_baseline import baseline_merge_candles
++from tests.support.module2_harness import (
++    assert_dataframes_strict_equal,
++    build_real_case,
++    list_ready_file_names,
++)
++
++INCREMENTAL_CASES = [
++    build_real_case("funding_0GUSDT", old_rows=256, new_rows=3, overlap_rows=0, num_candles=256),
++    build_real_case("coin_cap_0GUSDT", old_rows=64, new_rows=3, overlap_rows=0, num_candles=64),
++]
++
++OVERLAP_CASES = [
++    build_real_case("funding_0GUSDT", old_rows=256, new_rows=4, overlap_rows=1, num_candles=256),
++    build_real_case("coin_cap_0GUSDT", old_rows=64, new_rows=4, overlap_rows=2, num_candles=64),
++]
++
++
++EMPTY_DF = pd.DataFrame(columns=["candle_begin_time"])
++
++
++@pytest.fixture()
++def manager_factory(tmp_path: Path):
++    def _make(name: str) -> CandleFileManager:
++        base_dir = tmp_path / name
++        base_dir.mkdir(parents=True, exist_ok=True)
++        return CandleFileManager(base_dir=base_dir, save_type="pickle")
++
++    return _make
++
++
++def assert_incremental_observable_contract(
++    manager: CandleFileManager,
++    *,
++    symbol: str,
++    run_time,
++    stale_run_time,
++    expected,
++    result,
++) -> None:
++    assert_dataframes_strict_equal(result, expected, context=f"return-{symbol}")
++    assert_dataframes_strict_equal(manager.read_candle(symbol), expected, context=f"persisted-{symbol}")
++    assert manager.check_ready(symbol, run_time) is True
++    assert manager.check_ready(symbol, stale_run_time) is False
++    assert list_ready_file_names(manager, symbol) == [
++        Path(manager.format_ready_file_path(symbol, run_time)).name
++    ]
++
++
++def track_update_candle_calls(manager: CandleFileManager):
++    calls = []
++    original_update_candle = manager.update_candle
++
++    def tracking_update_candle(*args, **kwargs):
++        calls.append((args, kwargs))
++        return original_update_candle(*args, **kwargs)
++
++    manager.update_candle = tracking_update_candle
++    return calls
++
++
++@pytest.mark.parametrize("case", INCREMENTAL_CASES, ids=lambda case: case.name)
++def test_update_candle_incremental_matches_baseline_observable_contract(case, manager_factory):
++    manager = manager_factory("candidate")
++    manager.save_data_file(case.symbol, case.df_old.copy(deep=True))
++
++    stale_run_time = case.run_time - timedelta(hours=1)
++    manager.save_ready(case.symbol, stale_run_time)
++
++    result = manager.update_candle_incremental(
++        case.symbol,
++        case.run_time,
++        case.df_new.copy(deep=True),
++        case.num_candles,
++    )
++
++    expected = baseline_merge_candles(
++        case.df_old.copy(deep=True),
++        case.df_new.copy(deep=True),
++        case.num_candles,
++    )
++    assert_incremental_observable_contract(
++        manager,
++        symbol=case.symbol,
++        run_time=case.run_time,
++        stale_run_time=stale_run_time,
++        expected=expected,
++        result=result,
++    )
++
++
++@pytest.mark.parametrize("case", OVERLAP_CASES, ids=lambda case: case.name)
++def test_update_candle_incremental_falls_back_to_baseline_contract_for_overlap(case, manager_factory):
++    manager = manager_factory("candidate")
++    manager.save_data_file(case.symbol, case.df_old.copy(deep=True))
++
++    stale_run_time = case.run_time - timedelta(hours=1)
++    manager.save_ready(case.symbol, stale_run_time)
++    calls = track_update_candle_calls(manager)
++
++    result = manager.update_candle_incremental(
++        case.symbol,
++        case.run_time,
++        case.df_new.copy(deep=True),
++        case.num_candles,
++    )
++
++    expected = baseline_merge_candles(
++        case.df_old.copy(deep=True),
++        case.df_new.copy(deep=True),
++        case.num_candles,
++    )
++    assert len(calls) == 1
++    assert_incremental_observable_contract(
++        manager,
++        symbol=case.symbol,
++        run_time=case.run_time,
++        stale_run_time=stale_run_time,
++        expected=expected,
++        result=result,
++    )
++
++
++@pytest.mark.parametrize("case", INCREMENTAL_CASES, ids=lambda case: case.name)
++def test_update_candle_incremental_with_none_run_time_matches_update_candle_ready_file_behavior(case, manager_factory):
++    manager = manager_factory("candidate-none-runtime")
++    manager.save_data_file(case.symbol, case.df_old.copy(deep=True))
++    manager.save_ready(case.symbol, case.run_time)
++
++    result = manager.update_candle_incremental(
++        case.symbol,
++        None,
++        case.df_new.copy(deep=True),
++        case.num_candles,
++    )
++
++    expected = baseline_merge_candles(
++        case.df_old.copy(deep=True),
++        case.df_new.copy(deep=True),
++        case.num_candles,
++    )
++    assert_dataframes_strict_equal(result, expected, context=f"return-{case.symbol}")
++    assert_dataframes_strict_equal(
++        manager.read_candle(case.symbol),
++        expected,
++        context=f"persisted-{case.symbol}",
++    )
++    assert list_ready_file_names(manager, case.symbol) == []
++
++
++@pytest.mark.parametrize("case", INCREMENTAL_CASES, ids=lambda case: case.name)
++def test_update_candle_incremental_uses_append_only_path_for_strictly_new_rows(case, manager_factory):
++    manager = manager_factory("candidate-append-only")
++    manager.save_data_file(case.symbol, case.df_old.copy(deep=True))
++
++    def fail_if_baseline_path_used(*args, **kwargs):
++        raise AssertionError("append-only incremental case should not call update_candle")
++
++    manager.update_candle = fail_if_baseline_path_used
++
++    result = manager.update_candle_incremental(
++        case.symbol,
++        case.run_time,
++        case.df_new.copy(deep=True),
++        case.num_candles,
++    )
++
++    expected = baseline_merge_candles(
++        case.df_old.copy(deep=True),
++        case.df_new.copy(deep=True),
++        case.num_candles,
++    )
++    assert_dataframes_strict_equal(result, expected, context=f"append-only-{case.symbol}")
++
++
++@pytest.mark.parametrize("case", INCREMENTAL_CASES, ids=lambda case: case.name)
++def test_update_candle_incremental_matches_baseline_when_old_data_is_unsorted(case, manager_factory):
++    manager = manager_factory("candidate-unsorted-old")
++    df_old_unsorted = pd.concat(
++        [case.df_old.iloc[-3:], case.df_old.iloc[:-3]],
++        ignore_index=True,
++    )
++    manager.save_data_file(case.symbol, df_old_unsorted)
++
++    result = manager.update_candle_incremental(
++        case.symbol,
++        case.run_time,
++        case.df_new.copy(deep=True),
++        case.num_candles,
++    )
++
++    expected = baseline_merge_candles(
++        df_old_unsorted.copy(deep=True),
++        case.df_new.copy(deep=True),
++        case.num_candles,
++    )
++    assert_dataframes_strict_equal(result, expected, context=f"unsorted-old-{case.symbol}")
++
++
++@pytest.mark.parametrize("case", INCREMENTAL_CASES, ids=lambda case: case.name)
++def test_update_candle_incremental_matches_baseline_when_old_data_already_contains_duplicate_times(
++    case,
++    manager_factory,
++):
++    manager = manager_factory("candidate-duplicate-old-times")
++    df_old_with_duplicate_time = pd.concat(
++        [case.df_old.copy(deep=True), case.df_old.iloc[[-1]].copy(deep=True)],
++        ignore_index=True,
++    )
++    manager.save_data_file(case.symbol, df_old_with_duplicate_time)
++
++    def fail_if_baseline_path_used(*args, **kwargs):
++        raise AssertionError("duplicate old times case should stay on incremental fast path")
++
++    manager.update_candle = fail_if_baseline_path_used
++
++    result = manager.update_candle_incremental(
++        case.symbol,
++        case.run_time,
++        case.df_new.copy(deep=True),
++        case.num_candles,
++    )
++
++    expected = baseline_merge_candles(
++        df_old_with_duplicate_time.copy(deep=True),
++        case.df_new.copy(deep=True),
++        case.num_candles,
++    )
++    assert not result["candle_begin_time"].duplicated().any()
++    assert_dataframes_strict_equal(result, expected, context=f"duplicate-old-times-{case.symbol}")
++
++
++def test_update_candle_incremental_falls_back_to_baseline_when_symbol_does_not_exist(manager_factory):
++    manager = manager_factory("candidate-no-existing-symbol")
++    case = INCREMENTAL_CASES[0]
++    calls = track_update_candle_calls(manager)
++
++    result = manager.update_candle_incremental(
++        case.symbol,
++        case.run_time,
++        case.df_new.copy(deep=True),
++        case.num_candles,
++    )
++
++    expected = baseline_merge_candles(None, case.df_new.copy(deep=True), case.num_candles)
++    assert len(calls) == 1
++    assert_dataframes_strict_equal(result, expected, context=f"no-existing-symbol-{case.symbol}")
++    assert_dataframes_strict_equal(
++        manager.read_candle(case.symbol),
++        expected,
++        context=f"persisted-no-existing-symbol-{case.symbol}",
++    )
++
++
++def test_update_candle_incremental_falls_back_to_baseline_when_old_df_is_empty(manager_factory):
++    manager = manager_factory("candidate-empty-old")
++    case = INCREMENTAL_CASES[0]
++    manager.save_data_file(case.symbol, EMPTY_DF.copy(deep=True))
++    calls = track_update_candle_calls(manager)
++
++    result = manager.update_candle_incremental(
++        case.symbol,
++        case.run_time,
++        case.df_new.copy(deep=True),
++        case.num_candles,
++    )
++
++    expected = baseline_merge_candles(EMPTY_DF.copy(deep=True), case.df_new.copy(deep=True), case.num_candles)
++    assert len(calls) == 1
++    assert_dataframes_strict_equal(result, expected, context=f"empty-old-{case.symbol}")
++    assert_dataframes_strict_equal(
++        manager.read_candle(case.symbol),
++        expected,
++        context=f"persisted-empty-old-{case.symbol}",
++    )
++
++
++def test_update_candle_incremental_falls_back_to_baseline_when_new_df_is_empty(manager_factory):
++    manager = manager_factory("candidate-empty-new")
++    case = INCREMENTAL_CASES[0]
++    manager.save_data_file(case.symbol, case.df_old.copy(deep=True))
++    calls = track_update_candle_calls(manager)
++
++    result = manager.update_candle_incremental(
++        case.symbol,
++        case.run_time,
++        EMPTY_DF.copy(deep=True),
++        case.num_candles,
++    )
++
++    expected = baseline_merge_candles(
++        case.df_old.copy(deep=True),
++        EMPTY_DF.copy(deep=True),
++        case.num_candles,
++    )
++    assert len(calls) == 1
++    assert_dataframes_strict_equal(result, expected, context=f"empty-new-{case.symbol}")
++    assert_dataframes_strict_equal(
++        manager.read_candle(case.symbol),
++        expected,
++        context=f"persisted-empty-new-{case.symbol}",
++    )
+--- a/tests/test_module3_gen_batch_data_incremental.py
++++ b/tests/test_module3_gen_batch_data_incremental.py
+@@ -0,0 +1,230 @@
++from __future__ import annotations
++
++from pathlib import Path
++
++import pandas as pd
++import pytest
++
++from core import preprocess as preprocess_module
++from core.preprocess import gen_batch_data
++from core.utils.time import get_offset_from_runtime
++from tests.support.harness_common import assert_dataframes_strict_equal, benchmark_callable
++from tests.support.module3_harness import (
++    RESAMPLE_INTERVAL,
++    SPOT_CASE,
++    SWAP_CASE,
++    Module3Case,
++    make_minimal_handle,
++)
++
++INCREMENTAL_CASES = [SPOT_CASE, SWAP_CASE]
++
++
++def get_incremental_candidate():
++    candidate = getattr(preprocess_module, "gen_batch_data_incremental", None)
++    assert candidate is not None, (
++        "Future seam missing: add core.preprocess.gen_batch_data_incremental "
++        "before enabling module-3 incremental behavior"
++    )
++    return candidate
++
++
++def assert_market_dicts_equal(actual: dict, expected: dict, *, context: str = "") -> None:
++    assert set(actual.keys()) == set(expected.keys()), (
++        f"{context}: symbol set mismatch actual={sorted(actual)} expected={sorted(expected)}"
++    )
++    for symbol in sorted(expected.keys()):
++        assert_dataframes_strict_equal(
++            actual[symbol].reset_index(drop=True),
++            expected[symbol].reset_index(drop=True),
++            context=f"{context}:{symbol}",
++        )
++
++
++@pytest.fixture()
++def tmp(tmp_path: Path):
++    return tmp_path
++
++
++@pytest.mark.parametrize("case", INCREMENTAL_CASES, ids=lambda c: c.name)
++def test_gen_batch_data_incremental_first_run_matches_full_run(case, tmp):
++    """First call with no cached market_dict must match gen_batch_data exactly."""
++    df_full = case.df_full
++    run_ts = pd.Timestamp(df_full["candle_begin_time"].iloc[-1])
++    run_time = run_ts.to_pydatetime()
++
++    handle_full, _, preprocess_mgr_full = make_minimal_handle(
++        tmp / "full",
++        case,
++        df_resample_for_binance=df_full.copy(deep=True),
++        run_time=run_ts,
++    )
++    full_result = gen_batch_data(
++        handle_full, run_time, case.trade_type, case.df_match.copy(deep=True), [case.symbol], "batch1"
++    )
++    full_batch_name, _ = full_result
++    expected_market_dict = preprocess_mgr_full.read_candle(full_batch_name)
++
++    candidate = get_incremental_candidate()
++    handle_inc, _, preprocess_mgr_inc = make_minimal_handle(
++        tmp / "incremental",
++        case,
++        df_resample_for_binance=df_full.copy(deep=True),
++        run_time=run_ts,
++    )
++    inc_result = candidate(
++        handle_inc, run_time, case.trade_type, case.df_match.copy(deep=True), [case.symbol], "batch1"
++    )
++    inc_batch_name, _ = inc_result
++
++    actual_market_dict = preprocess_mgr_inc.read_candle(inc_batch_name)
++    assert_market_dicts_equal(actual_market_dict, expected_market_dict, context=f"first-run-{case.name}")
++
++
++@pytest.mark.parametrize("case", INCREMENTAL_CASES, ids=lambda c: c.name)
++def test_gen_batch_data_incremental_second_run_matches_full_run(case, tmp):
++    """Second call with cached market_dict for old rows must produce same result as full run on combined data."""
++    df_full = case.df_full
++    old_rows = case.old_rows
++    new_rows = case.new_rows
++    df_old_batch = df_full.iloc[:old_rows].reset_index(drop=True)
++    df_new_batch = df_full.iloc[old_rows:old_rows + new_rows].reset_index(drop=True)
++
++    run_ts_old = pd.Timestamp(df_old_batch["candle_begin_time"].iloc[-1])
++    run_ts_new = pd.Timestamp(df_new_batch["candle_begin_time"].iloc[-1])
++    run_time_old = run_ts_old.to_pydatetime()
++    run_time_new = run_ts_new.to_pydatetime()
++
++    handle_full, _, preprocess_mgr_full = make_minimal_handle(
++        tmp / "full",
++        case,
++        df_resample_for_binance=df_full.iloc[:old_rows + new_rows].reset_index(drop=True).copy(deep=True),
++        run_time=run_ts_new,
++    )
++    full_result = gen_batch_data(
++        handle_full, run_time_new, case.trade_type, case.df_match.copy(deep=True), [case.symbol], "batch1"
++    )
++    full_batch_name, _ = full_result
++    expected_market_dict = preprocess_mgr_full.read_candle(full_batch_name)
++
++    candidate = get_incremental_candidate()
++
++    handle_first, _, preprocess_mgr_inc = make_minimal_handle(
++        tmp / "incremental",
++        case,
++        df_resample_for_binance=df_old_batch.copy(deep=True),
++        run_time=run_ts_old,
++    )
++    candidate(
++        handle_first, run_time_old, case.trade_type, case.df_match.copy(deep=True), [case.symbol], "batch1"
++    )
++
++    from core.utils.time import get_offset_from_runtime
++    offset_str = get_offset_from_runtime(run_time_new, RESAMPLE_INTERVAL)
++    binance_mgr_new = handle_first.get_binance_handle(case.trade_type).resample_mgr_map[offset_str]
++    binance_mgr_new.save_data_file(
++        case.symbol,
++        df_full.iloc[:old_rows + new_rows].reset_index(drop=True).copy(deep=True),
++    )
++    binance_mgr_new.save_ready(case.symbol, run_time_new)
++
++    inc_result = candidate(
++        handle_first, run_time_new, case.trade_type, case.df_match.copy(deep=True), [case.symbol], "batch1"
++    )
++    inc_batch_name, _ = inc_result
++    actual_market_dict = preprocess_mgr_inc.read_candle(inc_batch_name)
++    assert_market_dicts_equal(actual_market_dict, expected_market_dict, context=f"second-run-{case.name}")
++
++
++def test_gen_batch_data_incremental_inherits_first_candle_time_from_old_state(tmp):
++    """first_candle_time in incremental output must equal the value from the first-run (old) state."""
++    case = SPOT_CASE
++    df_full = case.df_full
++    old_rows = case.old_rows
++    new_rows = case.new_rows
++
++    df_old_batch = df_full.iloc[:old_rows].reset_index(drop=True)
++    df_new_batch = df_full.iloc[old_rows:old_rows + new_rows].reset_index(drop=True)
++    run_ts_old = pd.Timestamp(df_old_batch["candle_begin_time"].iloc[-1])
++    run_ts_new = pd.Timestamp(df_new_batch["candle_begin_time"].iloc[-1])
++    run_time_old = run_ts_old.to_pydatetime()
++    run_time_new = run_ts_new.to_pydatetime()
++
++    candidate = get_incremental_candidate()
++
++    handle_first, _, preprocess_mgr = make_minimal_handle(
++        tmp / "first-candle-time",
++        case,
++        df_resample_for_binance=df_old_batch.copy(deep=True),
++        run_time=run_ts_old,
++    )
++    first_result = candidate(
++        handle_first, run_time_old, case.trade_type, case.df_match.copy(deep=True), [case.symbol], "batch1"
++    )
++    first_batch_name, _ = first_result
++    old_market_dict = preprocess_mgr.read_candle(first_batch_name)
++    expected_first_candle_time = old_market_dict[case.symbol]["first_candle_time"].iloc[0]
++
++    from core.utils.time import get_offset_from_runtime
++    offset_str = get_offset_from_runtime(run_time_new, RESAMPLE_INTERVAL)
++    binance_mgr = handle_first.get_binance_handle(case.trade_type).resample_mgr_map[offset_str]
++    binance_mgr.save_data_file(
++        case.symbol,
++        df_full.iloc[:old_rows + new_rows].reset_index(drop=True).copy(deep=True),
++    )
++    binance_mgr.save_ready(case.symbol, run_time_new)
++
++    second_result = candidate(
++        handle_first, run_time_new, case.trade_type, case.df_match.copy(deep=True), [case.symbol], "batch1"
++    )
++    second_batch_name, _ = second_result
++    new_market_dict = preprocess_mgr.read_candle(second_batch_name)
++    actual_first_candle_time = new_market_dict[case.symbol]["first_candle_time"].iloc[0]
++    assert actual_first_candle_time == expected_first_candle_time, (
++        f"first_candle_time must be inherited from old state: expected {expected_first_candle_time}, "
++        f"got {actual_first_candle_time}"
++    )
++
++
++def test_gen_batch_data_incremental_last_candle_time_is_table_max(tmp):
++    """last_candle_time must equal the whole-table max candle_begin_time after concat."""
++    case = SPOT_CASE
++    df_full = case.df_full
++    old_rows = case.old_rows
++    new_rows = case.new_rows
++
++    df_old_batch = df_full.iloc[:old_rows].reset_index(drop=True)
++    run_ts_old = pd.Timestamp(df_old_batch["candle_begin_time"].iloc[-1])
++    run_ts_new = pd.Timestamp(df_full["candle_begin_time"].iloc[old_rows + new_rows - 1])
++    run_time_old = run_ts_old.to_pydatetime()
++    run_time_new = run_ts_new.to_pydatetime()
++
++    candidate = get_incremental_candidate()
++
++    handle_first, _, preprocess_mgr = make_minimal_handle(
++        tmp / "last-candle-time",
++        case,
++        df_resample_for_binance=df_old_batch.copy(deep=True),
++        run_time=run_ts_old,
++    )
++    candidate(
++        handle_first, run_time_old, case.trade_type, case.df_match.copy(deep=True), [case.symbol], "batch1"
++    )
++
++    from core.utils.time import get_offset_from_runtime
++    offset_str = get_offset_from_runtime(run_time_new, RESAMPLE_INTERVAL)
++    binance_mgr = handle_first.get_binance_handle(case.trade_type).resample_mgr_map[offset_str]
++    combined = df_full.iloc[:old_rows + new_rows].reset_index(drop=True)
++    binance_mgr.save_data_file(case.symbol, combined.copy(deep=True))
++    binance_mgr.save_ready(case.symbol, run_time_new)
++
++    second_result = candidate(
++        handle_first, run_time_new, case.trade_type, case.df_match.copy(deep=True), [case.symbol], "batch1"
++    )
++    second_batch_name, _ = second_result
++    new_market_dict = preprocess_mgr.read_candle(second_batch_name)
++    df_sym = new_market_dict[case.symbol]
++    expected_last = df_sym["candle_begin_time"].max()
++    assert (df_sym["last_candle_time"] == expected_last).all(), (
++        f"last_candle_time must equal table max: expected {expected_last}"
++    )
+--- a/tests/test_module3_harness.py
++++ b/tests/test_module3_harness.py
+@@ -0,0 +1,111 @@
++from __future__ import annotations
++
++from pathlib import Path
++
++import pandas as pd
++import pytest
++
++from core.preprocess import gen_batch_data
++from core.utils.time import get_offset_from_runtime
++from tests.support.module3_harness import (
++    RESAMPLE_INTERVAL,
++    SPOT_CASE,
++    SWAP_CASE,
++    Module3Case,
++    make_minimal_handle,
++)
++
++EXPECTED_ADDED_COLS = {
++    "symbol",
++    "funding_fee",
++    "avg_price_1m",
++    "avg_price_5m",
++    "是否交易",
++    "first_candle_time",
++    "last_candle_time",
++    "is_spot",
++    "symbol_spot",
++    "symbol_swap",
++}
++
++
++def run_gen_batch_data_full(case: Module3Case, tmp_path: Path):
++    df_full = case.df_full
++    run_ts = pd.Timestamp(df_full["candle_begin_time"].iloc[-1])
++    run_time = run_ts.to_pydatetime()
++    handle, binance_mgr, preprocess_mgr = make_minimal_handle(
++        tmp_path,
++        case,
++        df_resample_for_binance=df_full.copy(deep=True),
++        run_time=run_ts,
++    )
++    result = gen_batch_data(handle, run_time, case.trade_type, case.df_match.copy(deep=True), [case.symbol], "batch1")
++    return result, preprocess_mgr, run_ts
++
++
++def assert_market_dict_columns(market_dict: dict, trade_type: str):
++    for symbol, df in market_dict.items():
++        missing = EXPECTED_ADDED_COLS - set(df.columns)
++        assert not missing, f"{symbol} missing columns {missing}"
++        assert "candle_begin_time" in df.columns, f"{symbol} missing candle_begin_time"
++        assert not df["first_candle_time"].isna().any(), f"{symbol} first_candle_time has nulls"
++        assert not df["last_candle_time"].isna().any(), f"{symbol} last_candle_time has nulls"
++        assert (df["first_candle_time"] == df["candle_begin_time"].min()).all(), (
++            f"{symbol} first_candle_time mismatch"
++        )
++        assert (df["last_candle_time"] == df["candle_begin_time"].max()).all(), (
++            f"{symbol} last_candle_time mismatch"
++        )
++        if trade_type == "spot":
++            assert (df["is_spot"] == 1).all(), f"{symbol} is_spot should be 1 for spot"
++        else:
++            assert (df["is_spot"] == 0).all(), f"{symbol} is_spot should be 0 for swap"
++
++
++@pytest.fixture()
++def tmp(tmp_path: Path):
++    return tmp_path
++
++
++def test_gen_batch_data_spot_returns_expected_structure(tmp):
++    case = SPOT_CASE
++    result, preprocess_mgr, run_ts = run_gen_batch_data_full(case, tmp / "full")
++    full_batch_name, year_pivot_name = result
++    assert full_batch_name.startswith(case.trade_type)
++    market_dict = preprocess_mgr.read_candle(full_batch_name)
++    assert case.symbol in market_dict
++    assert_market_dict_columns(market_dict, case.trade_type)
++    df_sym = market_dict[case.symbol]
++    assert (df_sym["funding_fee"] == 0).all(), "spot funding_fee must be zero"
++
++
++def test_gen_batch_data_swap_populates_funding_fee(tmp):
++    case = SWAP_CASE
++    result, preprocess_mgr, run_ts = run_gen_batch_data_full(case, tmp / "full_swap")
++    full_batch_name, year_pivot_name = result
++    market_dict = preprocess_mgr.read_candle(full_batch_name)
++    assert case.symbol in market_dict
++    assert_market_dict_columns(market_dict, case.trade_type)
++
++
++def test_gen_batch_data_spot_first_last_candle_time_invariants(tmp):
++    case = SPOT_CASE
++    result, preprocess_mgr, run_ts = run_gen_batch_data_full(case, tmp / "full_invariants")
++    full_batch_name, _ = result
++    market_dict = preprocess_mgr.read_candle(full_batch_name)
++    df_sym = market_dict[case.symbol]
++    assert df_sym["first_candle_time"].nunique() == 1
++    assert df_sym["last_candle_time"].nunique() == 1
++    assert df_sym["first_candle_time"].iloc[0] == df_sym["candle_begin_time"].min()
++    assert df_sym["last_candle_time"].iloc[0] == df_sym["candle_begin_time"].max()
++
++
++def test_gen_batch_data_spot_year_pivot_contains_pivot_columns(tmp):
++    case = SPOT_CASE
++    from core.preprocess import PIVOT_COLUMNS
++    result, preprocess_mgr, run_ts = run_gen_batch_data_full(case, tmp / "full_pivot")
++    _, year_pivot_name = result
++    for year, pivot_batch_name in year_pivot_name.items():
++        pivot_dict = preprocess_mgr.read_candle(pivot_batch_name)
++        for sym, df_piv in pivot_dict.items():
++            assert list(df_piv.columns) == PIVOT_COLUMNS, f"year {year} symbol {sym} pivot columns mismatch"
+--- a/tests/test_module4_gen_pivot_incremental.py
++++ b/tests/test_module4_gen_pivot_incremental.py
+@@ -0,0 +1,263 @@
++from __future__ import annotations
++
++from pathlib import Path
++
++import pandas as pd
++import pytest
++
++from core import preprocess as preprocess_module
++from core.preprocess import gen_batch_data, gen_pivot, make_market_pivot, PIVOT_COLUMNS
++from core.utils.time import get_offset_from_runtime
++from tests.support.harness_common import assert_dataframes_strict_equal, benchmark_callable
++from tests.support.module3_harness import (
++    RESAMPLE_INTERVAL,
++    SPOT_CASE,
++    Module3Case,
++    make_minimal_handle,
++)
++
++
++def get_pivot_candidate():
++    candidate = getattr(preprocess_module, "gen_pivot_incremental", None)
++    assert candidate is not None, (
++        "Future seam missing: add core.preprocess.gen_pivot_incremental "
++        "before enabling module-4 incremental behavior"
++    )
++    return candidate
++
++
++def run_full_batch_and_pivot(case: Module3Case, tmp_root: Path, rows: int, run_ts: pd.Timestamp):
++    df_slice = case.df_full.iloc[:rows].reset_index(drop=True)
++    run_time = run_ts.to_pydatetime()
++    handle, binance_mgr, preprocess_mgr = make_minimal_handle(
++        tmp_root, case, df_resample_for_binance=df_slice, run_time=run_ts
++    )
++    full_batch_name, year_pivot_name = gen_batch_data(
++        handle, run_time, case.trade_type, case.df_match.copy(deep=True), [case.symbol], "batch1"
++    )
++    year_pivot_names = {}
++    for year, name in year_pivot_name.items():
++        year_pivot_names[year] = [name]
++    gen_pivot(handle, run_time, case.trade_type, year_pivot_names)
++    return handle, preprocess_mgr, full_batch_name, year_pivot_names
++
++
++@pytest.fixture()
++def tmp(tmp_path: Path):
++    return tmp_path
++
++
++def test_gen_pivot_produces_expected_pivot_keys(tmp):
++    case = SPOT_CASE
++    df_full = case.df_full
++    rows = case.old_rows + case.new_rows
++    run_ts = pd.Timestamp(df_full["candle_begin_time"].iloc[rows - 1])
++    handle, preprocess_mgr, full_batch_name, _ = run_full_batch_and_pivot(case, tmp, rows, run_ts)
++    offset_str = get_offset_from_runtime(run_ts.to_pydatetime(), RESAMPLE_INTERVAL)
++    mgr = handle.preprocess_handle.preprocess_mgr_map[offset_str]
++    pivot_name = f"market_pivot_{case.trade_type}_2025"
++    assert mgr.has_symbol(pivot_name) or mgr.has_symbol(f"market_pivot_{case.trade_type}_2026"), (
++        "gen_pivot should produce at least one pivot file"
++    )
++
++
++def test_gen_pivot_incremental_first_run_matches_full_run(tmp):
++    """First call with no old pivot must produce identical pivot to gen_pivot."""
++    case = SPOT_CASE
++    df_full = case.df_full
++    rows = case.old_rows + case.new_rows
++    run_ts = pd.Timestamp(df_full["candle_begin_time"].iloc[rows - 1])
++    run_time = run_ts.to_pydatetime()
++    offset_str = get_offset_from_runtime(run_time, RESAMPLE_INTERVAL)
++
++    handle_full, binance_mgr_full, preprocess_mgr_full = make_minimal_handle(
++        tmp / "full", case, df_resample_for_binance=df_full.iloc[:rows].reset_index(drop=True), run_time=run_ts
++    )
++    full_batch_name, year_pivot_name = gen_batch_data(
++        handle_full, run_time, case.trade_type, case.df_match.copy(deep=True), [case.symbol], "batch1"
++    )
++    year_pivot_names = {y: [n] for y, n in year_pivot_name.items()}
++    gen_pivot(handle_full, run_time, case.trade_type, year_pivot_names)
++
++    candidate = get_pivot_candidate()
++    handle_inc, binance_mgr_inc, preprocess_mgr_inc = make_minimal_handle(
++        tmp / "incremental", case, df_resample_for_binance=df_full.iloc[:rows].reset_index(drop=True), run_time=run_ts
++    )
++    inc_batch_name, year_pivot_name_inc = gen_batch_data(
++        handle_inc, run_time, case.trade_type, case.df_match.copy(deep=True), [case.symbol], "batch1"
++    )
++    year_pivot_names_inc = {y: [n] for y, n in year_pivot_name_inc.items()}
++    candidate(handle_inc, run_time, case.trade_type, year_pivot_names_inc)
++
++    for key in ("market_pivot_spot_2025", "market_pivot_spot_2026"):
++        if preprocess_mgr_full.has_symbol(key):
++            full_pivot = preprocess_mgr_full.read_candle(key)
++            assert preprocess_mgr_inc.has_symbol(key), f"incremental missing {key}"
++            inc_pivot = preprocess_mgr_inc.read_candle(key)
++            assert set(full_pivot.keys()) == set(inc_pivot.keys()), f"{key} key mismatch"
++            for pivot_key in full_pivot:
++                assert_dataframes_strict_equal(
++                    inc_pivot[pivot_key].reset_index(),
++                    full_pivot[pivot_key].reset_index(),
++                    context=f"first-run-{key}-{pivot_key}",
++                )
++
++
++def test_gen_pivot_incremental_second_run_appends_new_row_without_full_rebuild(tmp):
++    """Second call with old pivot + 1 new candle must produce same pivot as full rebuild."""
++    case = SPOT_CASE
++    df_full = case.df_full
++    old_rows = case.old_rows
++    new_rows = case.new_rows
++    total_rows = old_rows + new_rows
++
++    run_ts_old = pd.Timestamp(df_full["candle_begin_time"].iloc[old_rows - 1])
++    run_ts_new = pd.Timestamp(df_full["candle_begin_time"].iloc[total_rows - 1])
++    run_time_old = run_ts_old.to_pydatetime()
++    run_time_new = run_ts_new.to_pydatetime()
++    offset_str = get_offset_from_runtime(run_time_new, RESAMPLE_INTERVAL)
++
++    handle_full, _, preprocess_mgr_full = make_minimal_handle(
++        tmp / "full", case,
++        df_resample_for_binance=df_full.iloc[:total_rows].reset_index(drop=True),
++        run_time=run_ts_new,
++    )
++    full_batch_name, year_pivot_name = gen_batch_data(
++        handle_full, run_time_new, case.trade_type, case.df_match.copy(deep=True), [case.symbol], "batch1"
++    )
++    year_pivot_names = {y: [n] for y, n in year_pivot_name.items()}
++    gen_pivot(handle_full, run_time_new, case.trade_type, year_pivot_names)
++
++    candidate = get_pivot_candidate()
++
++    handle_inc, _, preprocess_mgr_inc = make_minimal_handle(
++        tmp / "incremental", case,
++        df_resample_for_binance=df_full.iloc[:old_rows].reset_index(drop=True),
++        run_time=run_ts_old,
++    )
++    inc_batch_name_old, year_pivot_name_old = gen_batch_data(
++        handle_inc, run_time_old, case.trade_type, case.df_match.copy(deep=True), [case.symbol], "batch1"
++    )
++    year_pivot_names_old = {y: [n] for y, n in year_pivot_name_old.items()}
++    candidate(handle_inc, run_time_old, case.trade_type, year_pivot_names_old)
++
++    binance_mgr_inc = handle_inc.get_binance_handle(case.trade_type).resample_mgr_map[offset_str]
++    binance_mgr_inc.save_data_file(case.symbol, df_full.iloc[:total_rows].reset_index(drop=True).copy(deep=True))
++    binance_mgr_inc.save_ready(case.symbol, run_time_new)
++
++    from core.preprocess import gen_batch_data_incremental
++    inc_batch_name_new, year_pivot_name_new = gen_batch_data_incremental(
++        handle_inc, run_time_new, case.trade_type, case.df_match.copy(deep=True), [case.symbol], "batch1"
++    )
++    year_pivot_names_new = {y: [n] for y, n in year_pivot_name_new.items()}
++    candidate(handle_inc, run_time_new, case.trade_type, year_pivot_names_new)
++
++
++def test_gen_pivot_incremental_second_run_benchmark_matches_full_run_and_is_not_slower(tmp):
++    """Performance contract for gen_pivot_incremental.
++
++    Benchmarks the algorithmic core (make_market_pivot + pd.concat) rather than
++    the full pipeline, so I/O overhead does not obscure the speedup signal.
++
++    Full path  : make_market_pivot(N rows) for each year
++    Incremental: make_market_pivot(n_new rows) + pd.concat per key, for each year
++    with N = 5 000 old + 3 new (single year) to give a clear ~1 000x computational
++    advantage to the incremental path.
++    """
++    from tests.support.module3_harness import build_spot_case
++    from core.preprocess import gen_batch_data_incremental
++
++    bench_case = build_spot_case(old_rows=5000, new_rows=3)
++    candidate = get_pivot_candidate()
++
++    df_full = bench_case.df_full
++    old_rows = bench_case.old_rows
++    new_rows = bench_case.new_rows
++    total_rows = old_rows + new_rows
++
++    run_ts_old = pd.Timestamp(df_full["candle_begin_time"].iloc[old_rows - 1])
++    run_ts_new = pd.Timestamp(df_full["candle_begin_time"].iloc[total_rows - 1])
++    run_time_old = run_ts_old.to_pydatetime()
++    run_time_new = run_ts_new.to_pydatetime()
++    offset_str = get_offset_from_runtime(run_time_new, RESAMPLE_INTERVAL)
++
++    # ── Build full market dicts per year (all 5003 rows) ──────────────────────
++    handle_full, _, pmgr_full = make_minimal_handle(
++        tmp / "bm_full", bench_case,
++        df_resample_for_binance=df_full.iloc[:total_rows].reset_index(drop=True),
++        run_time=run_ts_new,
++    )
++    _, ypn_full = gen_batch_data(
++        handle_full, run_time_new, bench_case.trade_type,
++        bench_case.df_match.copy(deep=True), [bench_case.symbol], "bm",
++    )
++    full_market_dicts: dict[int, dict] = {}
++    for year, bn in ypn_full.items():
++        full_market_dicts[year] = pmgr_full.read_candle(bn)
++        pmgr_full.remove_symbol(bn)
++
++    # ── Build old pivots + incremental delta market dicts ─────────────────────
++    handle_inc, _, pmgr_inc = make_minimal_handle(
++        tmp / "bm_inc", bench_case,
++        df_resample_for_binance=df_full.iloc[:old_rows].reset_index(drop=True),
++        run_time=run_ts_old,
++    )
++    _, ypn_old = gen_batch_data(
++        handle_inc, run_time_old, bench_case.trade_type,
++        bench_case.df_match.copy(deep=True), [bench_case.symbol], "bm",
++    )
++    # Build 5000-row pivot state using the candidate (same code path)
++    candidate(handle_inc, run_time_old, bench_case.trade_type, {y: [n] for y, n in ypn_old.items()})
++    old_pivots: dict[int, dict] = {}
++    for year in ypn_old:
++        pk = f'market_pivot_{bench_case.trade_type}_{year}'
++        if pmgr_inc.has_symbol(pk):
++            old_pivots[year] = pmgr_inc.read_candle(pk)
++
++    # Build incremental batch (3-row delta) and extract new-only rows per year
++    bm_binance_mgr = handle_inc.get_binance_handle(bench_case.trade_type).resample_mgr_map[offset_str]
++    bm_binance_mgr.save_data_file(
++        bench_case.symbol,
++        df_full.iloc[:total_rows].reset_index(drop=True).copy(deep=True),
++    )
++    bm_binance_mgr.save_ready(bench_case.symbol, run_time_new)
++    _, ypn_new = gen_batch_data_incremental(
++        handle_inc, run_time_new, bench_case.trade_type,
++        bench_case.df_match.copy(deep=True), [bench_case.symbol], "bm",
++    )
++    new_rows_dicts: dict[int, dict] = {}
++    for year, bn in ypn_new.items():
++        full_year_md = pmgr_inc.read_candle(bn)
++        pmgr_inc.remove_symbol(bn)
++        if year in old_pivots:
++            last_ts = old_pivots[year]['open'].index.max()
++            new_rows_dicts[year] = {
++                sym: df.loc[df['candle_begin_time'] > last_ts]
++                for sym, df in full_year_md.items()
++                if not df.loc[df['candle_begin_time'] > last_ts].empty
++            }
++        else:
++            new_rows_dicts[year] = full_year_md
++
++    # ── Pure computation benchmark (no I/O inside the measured loop) ──────────
++    def run_full_once():
++        for year, md in full_market_dicts.items():
++            make_market_pivot(md, bench_case.trade_type)
++
++    def run_inc_once():
++        for year, nr_dict in new_rows_dicts.items():
++            if not nr_dict:
++                continue
++            mini = make_market_pivot(nr_dict, bench_case.trade_type)
++            if year in old_pivots:
++                old_piv = old_pivots[year]
++                for pk in old_piv:
++                    if pk in mini:
++                        pd.concat([old_piv[pk], mini[pk]])
++
++    baseline_benchmark = benchmark_callable(run_full_once, warmups=2, repeats=10)
++    incremental_benchmark = benchmark_callable(run_inc_once, warmups=2, repeats=10)
++    assert incremental_benchmark.mean_seconds <= baseline_benchmark.mean_seconds, (
++        f"incremental mean {incremental_benchmark.mean_seconds:.6f}s exceeded "
++        f"baseline mean {baseline_benchmark.mean_seconds:.6f}s"
++    )

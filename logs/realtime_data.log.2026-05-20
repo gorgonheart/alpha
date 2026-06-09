@@ -1,0 +1,582 @@
+2026-05-20 00:00:05,468 [INFO] - Runtime=2026-05-20 00:05:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 00:01:05,471 [INFO] - Runtime=2026-05-20 00:05:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 00:02:05,472 [INFO] - Runtime=2026-05-20 00:05:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 00:03:05,473 [INFO] - Runtime=2026-05-20 00:05:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 00:04:05,474 [INFO] - Runtime=2026-05-20 00:05:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 00:05:05,475 [INFO] - Runtime=2026-05-20 00:10:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 00:06:05,476 [INFO] - Runtime=2026-05-20 00:10:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 00:07:05,477 [INFO] - Runtime=2026-05-20 00:10:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 00:08:05,478 [INFO] - Runtime=2026-05-20 00:10:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 00:09:05,479 [INFO] - Runtime=2026-05-20 00:10:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 00:10:05,479 [INFO] - Runtime=2026-05-20 00:15:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 00:11:05,480 [INFO] - Runtime=2026-05-20 00:15:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 00:12:05,482 [INFO] - Runtime=2026-05-20 00:15:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 00:13:05,482 [INFO] - Runtime=2026-05-20 00:15:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 00:14:05,483 [INFO] - Runtime=2026-05-20 00:15:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 00:15:05,484 [DEBUG] - ================== Update 5m Runtime=2026-05-20 00:20:00+08:00 ===================
+2026-05-20 00:19:53,632 [OK] - Exchange Info 与实时资金费获取成功, 本地时间=2026-05-20 00:19:53+0800
+2026-05-20 00:20:03,921 [INFO] - 更新市值数据, 当前时间=2026-05-20 00:20:03+0800
+2026-05-20 00:20:03,922 [INFO] - 开始请求 Data API K 线, 当前时间=2026-05-20 00:20:03+0800
+2026-05-20 00:20:03,946 [INFO] - 开始更新币安 spot K 线, 交易对数量=425, 当前时间=2026-05-20 00:20:03+0800
+2026-05-20 00:20:03,948 [INFO] - 开始更新币安 swap K 线, 交易对数量=578, 当前时间=2026-05-20 00:20:03+0800
+2026-05-20 00:20:11,188 [INFO] - 市值数据更新成功, 当前时间=2026-05-20 00:20:11+0800, 耗时=0.12分钟
+2026-05-20 00:20:17,439 [OK] - DataAPI URL 就绪, DataAPI 时间戳=2026-05-20 00:20:00+08:00, 当前时间=2026-05-20 00:20:17+0800
+2026-05-20 00:20:17,440 [INFO] - data_api_spot=https://upyun.quantclass.cn/crypto-realtime/binance-1h/202605200020-spot_1h20m.7z?_upt=47c793851779218417
+2026-05-20 00:20:17,440 [INFO] - data_api_swap=https://upyun.quantclass.cn/crypto-realtime/binance-1h/202605200020-swap_1h20m.7z?_upt=e4283bc41779218417
+2026-05-20 00:20:23,981 [OK] - Binance spot API, 获取 5m 成功, Resample 并更新 1h 成功, 耗时=20.0秒, 当前时间=2026-05-20 00:20:23+0800
+2026-05-20 00:20:28,459 [OK] - Binance swap API, 获取 5m 成功, Resample 并更新 1h 成功, 耗时=24.5秒, 当前时间=2026-05-20 00:20:28+0800
+2026-05-20 00:20:28,847 [INFO] - 开始预处理 spot, 当前时间=2026-05-20 00:20:28+0800
+2026-05-20 00:20:28,850 [INFO] - 开始预处理 swap, 当前时间=2026-05-20 00:20:28+0800
+2026-05-20 00:20:33,776 [DEBUG] - 预处理 Market Dict swap batch1 完成, 交易对=0GUSDT -- CELOUSDT, 数据源={'binance': 128}, 当前时间=2026-05-20 00:20:33+0800, 耗时 4.9 秒
+2026-05-20 00:20:34,072 [DEBUG] - 预处理 Market Dict spot batch1 完成, 交易对=0GUSDT -- ENJUSDT, 数据源={'binance': 128}, 当前时间=2026-05-20 00:20:34+0800, 耗时 5.2 秒
+2026-05-20 00:20:35,551 [OK] - 获取并合并 DataAPI 数据 spot 成功, 当前时间=2026-05-20 00:20:35+0800
+2026-05-20 00:20:37,885 [OK] - 获取并合并 DataAPI 数据 swap 成功, 当前时间=2026-05-20 00:20:37+0800
+2026-05-20 00:20:38,688 [DEBUG] - 预处理 Market Dict swap batch2 完成, 交易对=CELRUSDT -- ICPUSDT, 数据源={'binance': 128}, 当前时间=2026-05-20 00:20:38+0800, 耗时 4.8 秒
+2026-05-20 00:20:40,726 [DEBUG] - 预处理 Market Dict spot batch2 完成, 交易对=ENSOUSDT -- OGNUSDT, 数据源={'binance': 128}, 当前时间=2026-05-20 00:20:40+0800, 耗时 6.6 秒
+2026-05-20 00:20:43,792 [DEBUG] - 预处理 Market Dict swap batch3 完成, 交易对=ICXUSDT -- PIPPINUSDT, 数据源={'binance': 128}, 当前时间=2026-05-20 00:20:43+0800, 耗时 5.0 秒
+2026-05-20 00:20:46,089 [DEBUG] - 预处理 Market Dict spot batch3 完成, 交易对=OGUSDT -- VANRYUSDT, 数据源={'binance': 128}, 当前时间=2026-05-20 00:20:46+0800, 耗时 5.3 秒
+2026-05-20 00:20:47,448 [DEBUG] - 预处理 Market Dict spot batch4 完成, 交易对=VELODROMEUSDT -- 币安人生USDT, 数据源={'binance': 41}, 当前时间=2026-05-20 00:20:47+0800, 耗时 1.3 秒
+2026-05-20 00:20:47,466 [OK] - 预处理 Market Dict spot 完成, 当前时间=2026-05-20 00:20:47+0800, 耗时 18.6 秒
+2026-05-20 00:20:48,975 [DEBUG] - 预处理 Market Dict swap batch4 完成, 交易对=PIXELUSDT -- TWTUSDT, 数据源={'binance': 128}, 当前时间=2026-05-20 00:20:48+0800, 耗时 5.1 秒
+2026-05-20 00:20:49,981 [INFO] - 生成 Market Pivot spot 2024 完成
+2026-05-20 00:20:50,827 [DEBUG] - 预处理 Market Dict swap batch5 完成, 交易对=UAIUSDT -- 龙虾USDT, 数据源={'binance': 66}, 当前时间=2026-05-20 00:20:50+0800, 耗时 1.8 秒
+2026-05-20 00:20:50,851 [OK] - 预处理 Market Dict swap 完成, 当前时间=2026-05-20 00:20:50+0800, 耗时 22.0 秒
+2026-05-20 00:20:52,964 [INFO] - 生成 Market Pivot swap 2024 完成
+2026-05-20 00:20:58,074 [INFO] - 生成 Market Pivot spot 2025 完成
+2026-05-20 00:21:01,362 [INFO] - 生成 Market Pivot spot 2026 完成
+2026-05-20 00:21:01,390 [OK] - 预处理 Pivot Table spot 完成, 当前时间=2026-05-20 00:21:01+0800, 耗时 13.9 秒
+2026-05-20 00:21:01,837 [INFO] - 生成 Market Pivot swap 2025 完成
+2026-05-20 00:21:06,373 [INFO] - 生成 Market Pivot swap 2026 完成
+2026-05-20 00:21:06,418 [OK] - 预处理 Pivot Table swap 完成, 当前时间=2026-05-20 00:21:06+0800, 耗时 15.6 秒
+2026-05-20 00:23:00,002 [INFO] - 开始合并币安 spot 5m K 线, 当前时间=2026-05-20 00:23:00+0800
+2026-05-20 00:23:00,003 [INFO] - 开始合并币安 swap 5m K 线, 当前时间=2026-05-20 00:23:00+0800
+2026-05-20 00:23:04,027 [OK] - 合并币安 spot 5m K 线成功, 当前时间=2026-05-20 00:23:04+0800
+2026-05-20 00:23:07,264 [OK] - 合并币安 swap 5m K 线成功, 当前时间=2026-05-20 00:23:07+0800
+2026-05-20 00:23:07,455 [INFO] - Runtime=2026-05-20 00:25:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 00:24:07,532 [INFO] - Runtime=2026-05-20 00:25:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 00:25:07,599 [INFO] - Runtime=2026-05-20 00:30:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 00:26:07,599 [INFO] - Runtime=2026-05-20 00:30:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 00:27:07,601 [INFO] - Runtime=2026-05-20 00:30:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 00:28:07,601 [INFO] - Runtime=2026-05-20 00:30:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 00:29:07,602 [INFO] - Runtime=2026-05-20 00:30:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 00:30:07,603 [INFO] - Runtime=2026-05-20 00:35:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 00:31:07,604 [INFO] - Runtime=2026-05-20 00:35:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 00:32:07,605 [INFO] - Runtime=2026-05-20 00:35:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 00:33:07,605 [INFO] - Runtime=2026-05-20 00:35:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 00:34:07,606 [INFO] - Runtime=2026-05-20 00:35:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 00:35:07,608 [DEBUG] - ================== Update 5m Runtime=2026-05-20 00:40:00+08:00 ===================
+2026-05-20 00:39:55,251 [OK] - Exchange Info 与实时资金费获取成功, 本地时间=2026-05-20 00:39:55+0800
+2026-05-20 00:40:03,906 [INFO] - 开始请求 Data API K 线, 当前时间=2026-05-20 00:40:03+0800
+2026-05-20 00:40:03,916 [INFO] - 更新市值数据, 当前时间=2026-05-20 00:40:03+0800
+2026-05-20 00:40:03,918 [INFO] - 开始更新币安 spot K 线, 交易对数量=425, 当前时间=2026-05-20 00:40:03+0800
+2026-05-20 00:40:03,918 [INFO] - 开始更新币安 swap K 线, 交易对数量=578, 当前时间=2026-05-20 00:40:03+0800
+2026-05-20 00:40:13,101 [INFO] - 市值数据更新成功, 当前时间=2026-05-20 00:40:13+0800, 耗时=0.15分钟
+2026-05-20 00:40:17,516 [OK] - DataAPI URL 就绪, DataAPI 时间戳=2026-05-20 00:40:00+08:00, 当前时间=2026-05-20 00:40:17+0800
+2026-05-20 00:40:17,517 [INFO] - data_api_spot=https://upyun.quantclass.cn/crypto-realtime/binance-1h/202605200040-spot_1h40m.7z?_upt=d3eda5401779219617
+2026-05-20 00:40:17,517 [INFO] - data_api_swap=https://upyun.quantclass.cn/crypto-realtime/binance-1h/202605200040-swap_1h40m.7z?_upt=bdad0dc71779219617
+2026-05-20 00:40:23,803 [OK] - Binance spot API, 获取 5m 成功, Resample 并更新 1h 成功, 耗时=19.9秒, 当前时间=2026-05-20 00:40:23+0800
+2026-05-20 00:40:28,383 [OK] - Binance swap API, 获取 5m 成功, Resample 并更新 1h 成功, 耗时=24.5秒, 当前时间=2026-05-20 00:40:28+0800
+2026-05-20 00:40:28,846 [INFO] - 开始预处理 spot, 当前时间=2026-05-20 00:40:28+0800
+2026-05-20 00:40:28,849 [INFO] - 开始预处理 swap, 当前时间=2026-05-20 00:40:28+0800
+2026-05-20 00:40:33,625 [DEBUG] - 预处理 Market Dict swap batch1 完成, 交易对=0GUSDT -- CELOUSDT, 数据源={'binance': 128}, 当前时间=2026-05-20 00:40:33+0800, 耗时 4.5 秒
+2026-05-20 00:40:33,808 [DEBUG] - 预处理 Market Dict spot batch1 完成, 交易对=0GUSDT -- ENJUSDT, 数据源={'binance': 128}, 当前时间=2026-05-20 00:40:33+0800, 耗时 4.8 秒
+2026-05-20 00:40:35,940 [OK] - 获取并合并 DataAPI 数据 spot 成功, 当前时间=2026-05-20 00:40:35+0800
+2026-05-20 00:40:38,127 [OK] - 获取并合并 DataAPI 数据 swap 成功, 当前时间=2026-05-20 00:40:38+0800
+2026-05-20 00:40:38,186 [DEBUG] - 预处理 Market Dict swap batch2 完成, 交易对=CELRUSDT -- ICPUSDT, 数据源={'binance': 128}, 当前时间=2026-05-20 00:40:38+0800, 耗时 4.5 秒
+2026-05-20 00:40:38,408 [DEBUG] - 预处理 Market Dict spot batch2 完成, 交易对=ENSOUSDT -- OGNUSDT, 数据源={'binance': 128}, 当前时间=2026-05-20 00:40:38+0800, 耗时 4.5 秒
+2026-05-20 00:40:42,629 [DEBUG] - 预处理 Market Dict swap batch3 完成, 交易对=ICXUSDT -- PIPPINUSDT, 数据源={'binance': 128}, 当前时间=2026-05-20 00:40:42+0800, 耗时 4.4 秒
+2026-05-20 00:40:44,493 [DEBUG] - 预处理 Market Dict spot batch3 完成, 交易对=OGUSDT -- VANRYUSDT, 数据源={'binance': 128}, 当前时间=2026-05-20 00:40:44+0800, 耗时 6.0 秒
+2026-05-20 00:40:45,634 [DEBUG] - 预处理 Market Dict spot batch4 完成, 交易对=VELODROMEUSDT -- 币安人生USDT, 数据源={'binance': 41}, 当前时间=2026-05-20 00:40:45+0800, 耗时 1.1 秒
+2026-05-20 00:40:45,650 [OK] - 预处理 Market Dict spot 完成, 当前时间=2026-05-20 00:40:45+0800, 耗时 16.6 秒
+2026-05-20 00:40:46,824 [DEBUG] - 预处理 Market Dict swap batch4 完成, 交易对=PIXELUSDT -- TWTUSDT, 数据源={'binance': 128}, 当前时间=2026-05-20 00:40:46+0800, 耗时 4.1 秒
+2026-05-20 00:40:49,221 [DEBUG] - 预处理 Market Dict swap batch5 完成, 交易对=UAIUSDT -- 龙虾USDT, 数据源={'binance': 66}, 当前时间=2026-05-20 00:40:49+0800, 耗时 2.3 秒
+2026-05-20 00:40:49,245 [OK] - 预处理 Market Dict swap 完成, 当前时间=2026-05-20 00:40:49+0800, 耗时 20.2 秒
+2026-05-20 00:40:53,205 [INFO] - 生成 Market Pivot spot 2025 完成
+2026-05-20 00:40:56,627 [INFO] - 生成 Market Pivot spot 2026 完成
+2026-05-20 00:40:56,654 [OK] - 预处理 Pivot Table spot 完成, 当前时间=2026-05-20 00:40:56+0800, 耗时 11.0 秒
+2026-05-20 00:40:58,099 [INFO] - 生成 Market Pivot swap 2025 完成
+2026-05-20 00:41:02,666 [INFO] - 生成 Market Pivot swap 2026 完成
+2026-05-20 00:41:02,713 [OK] - 预处理 Pivot Table swap 完成, 当前时间=2026-05-20 00:41:02+0800, 耗时 13.5 秒
+2026-05-20 00:43:00,004 [INFO] - 开始合并币安 swap 5m K 线, 当前时间=2026-05-20 00:43:00+0800
+2026-05-20 00:43:03,965 [OK] - 合并币安 spot 5m K 线成功, 当前时间=2026-05-20 00:43:03+0800
+2026-05-20 00:43:05,345 [OK] - 合并币安 swap 5m K 线成功, 当前时间=2026-05-20 00:43:05+0800
+2026-05-20 00:43:05,522 [INFO] - Runtime=2026-05-20 00:45:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 00:44:05,526 [INFO] - Runtime=2026-05-20 00:45:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 00:45:05,527 [INFO] - Runtime=2026-05-20 00:50:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 00:46:05,528 [INFO] - Runtime=2026-05-20 00:50:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 00:47:05,529 [INFO] - Runtime=2026-05-20 00:50:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 00:48:05,530 [INFO] - Runtime=2026-05-20 00:50:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 00:49:05,532 [INFO] - Runtime=2026-05-20 00:50:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 21:49:20,442 [DEBUG] - ================= BMAC 版本: 分享会版 V1.1.11 2026-05-20 21:49:20 ==================
+2026-05-20 21:49:20,488 [DEBUG] - 数据目录=d:\alpha\data
+2026-05-20 21:49:20,489 [DEBUG] - 基础周期=5m, Resample 周期=1h
+2026-05-20 21:49:20,489 [DEBUG] - 1h 数量=14,060, Offset=('20m', '40m', '55m'), 5m 数量=168,756
+2026-05-20 21:49:20,489 [DEBUG] - Exchange Info 目录=d:\alpha\data\exginfo
+2026-05-20 21:49:20,489 [DEBUG] - 币安现货, 5m 目录=d:\alpha\data\binance_spot_5m
+2026-05-20 21:49:20,490 [DEBUG] - 币安现货, 1h 目录=d:\alpha\data\binance_spot_1h_resample
+2026-05-20 21:49:20,490 [DEBUG] - 币安永续合约, 5m 目录=d:\alpha\data\binance_swap_5m
+2026-05-20 21:49:20,490 [DEBUG] - 币安永续合约, 1h 目录=d:\alpha\data\binance_swap_1h_resample
+2026-05-20 21:49:20,490 [DEBUG] - 资金费目录=d:\alpha\data\funding
+2026-05-20 21:49:20,491 [DEBUG] - DataAPI 现货目录=d:\alpha\data\data_api_spot_1h_resample
+2026-05-20 21:49:20,491 [DEBUG] - DataAPI 永续合约目录=d:\alpha\data\data_api_swap_1h_resample
+2026-05-20 21:49:20,491 [DEBUG] - 预处理数据目录=d:\alpha\data\preprocess_1h_resample
+2026-05-20 21:49:20,491 [DEBUG] - 市值数据目录=d:\alpha\data\coin_cap
+2026-05-20 21:49:29,910 [DEBUG] - ============== 开始初始化历史数据, run_time=2026-05-20 21:45:00+08:00 ===============
+2026-05-20 21:49:31,901 [INFO] - 现货交易对数量=425, 永续合约交易对数量=578
+2026-05-20 21:49:31,902 [INFO] - spot 初始化历史 K线, 阶段 1, 校验并清除过时数据, 当前时间=2026-05-20 21:49:31+0800
+2026-05-20 21:49:31,903 [INFO] - swap 初始化历史 K线, 阶段 1, 校验并清除过时数据, 当前时间=2026-05-20 21:49:31+0800
+2026-05-20 21:49:31,905 [INFO] - 开始初始化市值数据, 当前时间=2026-05-20 21:49:31+0800
+2026-05-20 21:49:35,435 [INFO] - 获取历史资金费数据，当前时间=2026-05-20 21:49:35+0800，1h K线数量: 14060，全局起始时间: 2024-10-12 01:00:00+08:00，增量symbol数量: 578，全量symbol数量: 0，增量冗余小时数: 8
+2026-05-20 21:49:41,673 [DEBUG] - 更新市场数据, 日期=2026-05-19, 当前时间=2026-05-20 21:49:41+0800
+2026-05-20 21:49:43,779 [DEBUG] - swap 已完成 6.9%(40/578) 交易对校验, 耗时=0.20分钟
+2026-05-20 21:49:45,164 [DEBUG] - spot 已完成 9.4%(40/425) 交易对校验, 耗时=0.22分钟
+2026-05-20 21:49:47,057 [DEBUG] - url=https://upyun.quantclass.cn/api/coin-cap-daily/2026-05-19.csv?_upt=ab5abad41779295786
+2026-05-20 21:49:48,241 [DEBUG] - 下载资金费数据，进度=100.0%(578/578), 已耗时=0.3分钟, 当前时间=2026-05-20 21:49:48+0800
+2026-05-20 21:49:48,253 [OK] - 获取历史资金费率成功, 耗时=0.27分钟, 当前时间=2026-05-20 21:49:48+0800
+2026-05-20 21:49:50,408 [DEBUG] - swap 已完成 13.8%(80/578) 交易对校验, 耗时=0.31分钟
+2026-05-20 21:49:52,181 [DEBUG] - spot 已完成 18.8%(80/425) 交易对校验, 耗时=0.34分钟
+2026-05-20 21:49:57,154 [DEBUG] - swap 已完成 20.8%(120/578) 交易对校验, 耗时=0.42分钟
+2026-05-20 21:50:02,364 [DEBUG] - spot 已完成 28.2%(120/425) 交易对校验, 耗时=0.51分钟
+2026-05-20 21:50:05,707 [DEBUG] - swap 已完成 27.7%(160/578) 交易对校验, 耗时=0.56分钟
+2026-05-20 21:50:09,640 [OK] - 初始化市值数据成功, 当前时间=2026-05-20 21:50:09+0800, 耗时=0.63分钟
+2026-05-20 21:50:11,627 [DEBUG] - spot 已完成 37.6%(160/425) 交易对校验, 耗时=0.66分钟
+2026-05-20 21:50:12,369 [DEBUG] - swap 已完成 34.6%(200/578) 交易对校验, 耗时=0.67分钟
+2026-05-20 21:50:17,093 [DEBUG] - swap 已完成 41.5%(240/578) 交易对校验, 耗时=0.75分钟
+2026-05-20 21:50:17,942 [DEBUG] - spot 已完成 47.1%(200/425) 交易对校验, 耗时=0.77分钟
+2026-05-20 21:50:22,549 [DEBUG] - swap 已完成 48.4%(280/578) 交易对校验, 耗时=0.84分钟
+2026-05-20 21:50:23,771 [DEBUG] - spot 已完成 56.5%(240/425) 交易对校验, 耗时=0.86分钟
+2026-05-20 21:50:30,551 [DEBUG] - swap 已完成 55.4%(320/578) 交易对校验, 耗时=0.98分钟
+2026-05-20 21:50:32,556 [DEBUG] - spot 已完成 65.9%(280/425) 交易对校验, 耗时=1.01分钟
+2026-05-20 21:50:34,975 [DEBUG] - swap 已完成 62.3%(360/578) 交易对校验, 耗时=1.05分钟
+2026-05-20 21:50:40,068 [DEBUG] - spot 已完成 75.3%(320/425) 交易对校验, 耗时=1.14分钟
+2026-05-20 21:50:41,697 [DEBUG] - swap 已完成 69.2%(400/578) 交易对校验, 耗时=1.16分钟
+2026-05-20 21:50:47,530 [DEBUG] - spot 已完成 84.7%(360/425) 交易对校验, 耗时=1.26分钟
+2026-05-20 21:50:47,532 [DEBUG] - swap 已完成 76.1%(440/578) 交易对校验, 耗时=1.26分钟
+2026-05-20 21:50:54,428 [DEBUG] - swap 已完成 83.0%(480/578) 交易对校验, 耗时=1.38分钟
+2026-05-20 21:50:55,510 [DEBUG] - spot 已完成 94.1%(400/425) 交易对校验, 耗时=1.39分钟
+2026-05-20 21:50:59,617 [OK] - spot 初始化历史 K线, 阶段 1 已完成, 耗时=1.46分钟
+2026-05-20 21:50:59,619 [INFO] - spot 初始化历史 K线, 阶段 2, 补全 5m 最新数据, 交易对数量=425, 当前时间=2026-05-20 21:50:59+0800
+2026-05-20 21:51:00,785 [DEBUG] - swap 已完成 90.0%(520/578) 交易对校验, 耗时=1.48分钟
+2026-05-20 21:51:01,767 [DEBUG] - spot 阶段 2, 进度=18.8%(80/425), 已耗时=0.0分钟, 当前时间=2026-05-20 21:51:01+0800
+2026-05-20 21:51:03,248 [DEBUG] - spot 阶段 2, 进度=37.6%(160/425), 已耗时=0.1分钟, 当前时间=2026-05-20 21:51:03+0800
+2026-05-20 21:51:04,783 [DEBUG] - spot 阶段 2, 进度=56.5%(240/425), 已耗时=0.1分钟, 当前时间=2026-05-20 21:51:04+0800
+2026-05-20 21:51:06,333 [DEBUG] - spot 阶段 2, 进度=75.3%(320/425), 已耗时=0.1分钟, 当前时间=2026-05-20 21:51:06+0800
+2026-05-20 21:51:07,852 [DEBUG] - spot 阶段 2, 进度=94.1%(400/425), 已耗时=0.1分钟, 当前时间=2026-05-20 21:51:07+0800
+2026-05-20 21:51:08,449 [DEBUG] - spot 阶段 2, 进度=100.0%(425/425), 已耗时=0.1分钟, 当前时间=2026-05-20 21:51:08+0800
+2026-05-20 21:51:08,458 [OK] - spot 初始化历史 K线, 阶段 2 已完成, 当前时间=2026-05-20 21:51:08+0800, 耗时=0.15分钟
+2026-05-20 21:51:08,460 [INFO] - spot 初始化历史 K线, 阶段 3, 补全 5m K线根数, 交易对数量=425, 当前时间=2026-05-20 21:51:08+0800
+2026-05-20 21:51:09,569 [DEBUG] - swap 已完成 96.9%(560/578) 交易对校验, 耗时=1.63分钟
+2026-05-20 21:51:10,370 [DEBUG] - spot 阶段 3, 进度=18.8%(80/425), 已耗时=0.0分钟, 当前时间=2026-05-20 21:51:10+0800
+2026-05-20 21:51:12,151 [DEBUG] - spot 阶段 3, 进度=37.6%(160/425), 已耗时=0.1分钟, 当前时间=2026-05-20 21:51:12+0800
+2026-05-20 21:51:13,300 [OK] - swap 初始化历史 K线, 阶段 1 已完成, 耗时=1.69分钟
+2026-05-20 21:51:13,304 [INFO] - swap 初始化历史 K线, 阶段 2, 补全 5m 最新数据, 交易对数量=578, 当前时间=2026-05-20 21:51:13+0800
+2026-05-20 21:51:14,176 [DEBUG] - spot 阶段 3, 进度=56.5%(240/425), 已耗时=0.1分钟, 当前时间=2026-05-20 21:51:14+0800
+2026-05-20 21:51:15,772 [DEBUG] - spot 阶段 3, 进度=75.3%(320/425), 已耗时=0.1分钟, 当前时间=2026-05-20 21:51:15+0800
+2026-05-20 21:51:17,541 [DEBUG] - spot 阶段 3, 进度=94.1%(400/425), 已耗时=0.2分钟, 当前时间=2026-05-20 21:51:17+0800
+2026-05-20 21:51:17,658 [DEBUG] - swap 阶段 2, 进度=13.8%(80/578), 已耗时=0.1分钟, 当前时间=2026-05-20 21:51:17+0800
+2026-05-20 21:51:18,686 [DEBUG] - spot 阶段 3, 进度=100.0%(425/425), 已耗时=0.2分钟, 当前时间=2026-05-20 21:51:18+0800
+2026-05-20 21:51:18,698 [OK] - spot 初始化历史 K线, 阶段 3 已完成, 当前时间=2026-05-20 21:51:18+0800, 耗时=0.17分钟
+2026-05-20 21:51:19,155 [DEBUG] - swap 阶段 2, 进度=27.7%(160/578), 已耗时=0.1分钟, 当前时间=2026-05-20 21:51:19+0800
+2026-05-20 21:51:20,484 [DEBUG] - swap 阶段 2, 进度=41.5%(240/578), 已耗时=0.1分钟, 当前时间=2026-05-20 21:51:20+0800
+2026-05-20 21:51:21,807 [DEBUG] - swap 阶段 2, 进度=55.4%(320/578), 已耗时=0.1分钟, 当前时间=2026-05-20 21:51:21+0800
+2026-05-20 21:51:23,121 [DEBUG] - swap 阶段 2, 进度=69.2%(400/578), 已耗时=0.2分钟, 当前时间=2026-05-20 21:51:23+0800
+2026-05-20 21:51:24,446 [DEBUG] - swap 阶段 2, 进度=83.0%(480/578), 已耗时=0.2分钟, 当前时间=2026-05-20 21:51:24+0800
+2026-05-20 21:51:25,766 [DEBUG] - swap 阶段 2, 进度=96.9%(560/578), 已耗时=0.2分钟, 当前时间=2026-05-20 21:51:25+0800
+2026-05-20 21:51:26,193 [DEBUG] - swap 阶段 2, 进度=100.0%(578/578), 已耗时=0.2分钟, 当前时间=2026-05-20 21:51:26+0800
+2026-05-20 21:51:26,199 [OK] - swap 初始化历史 K线, 阶段 2 已完成, 当前时间=2026-05-20 21:51:26+0800, 耗时=0.21分钟
+2026-05-20 21:51:26,201 [INFO] - swap 初始化历史 K线, 阶段 3, 补全 5m K线根数, 交易对数量=578, 当前时间=2026-05-20 21:51:26+0800
+2026-05-20 21:51:27,607 [DEBUG] - swap 阶段 3, 进度=13.8%(80/578), 已耗时=0.0分钟, 当前时间=2026-05-20 21:51:27+0800
+2026-05-20 21:51:28,817 [DEBUG] - swap 阶段 3, 进度=27.7%(160/578), 已耗时=0.0分钟, 当前时间=2026-05-20 21:51:28+0800
+2026-05-20 21:51:30,042 [DEBUG] - swap 阶段 3, 进度=41.5%(240/578), 已耗时=0.1分钟, 当前时间=2026-05-20 21:51:30+0800
+2026-05-20 21:51:31,261 [DEBUG] - swap 阶段 3, 进度=55.4%(320/578), 已耗时=0.1分钟, 当前时间=2026-05-20 21:51:31+0800
+2026-05-20 21:51:32,464 [DEBUG] - swap 阶段 3, 进度=69.2%(400/578), 已耗时=0.1分钟, 当前时间=2026-05-20 21:51:32+0800
+2026-05-20 21:53:01,658 [DEBUG] - swap 阶段 3, 进度=83.0%(480/578), 已耗时=1.6分钟, 当前时间=2026-05-20 21:53:01+0800
+2026-05-20 21:53:02,830 [DEBUG] - swap 阶段 3, 进度=96.9%(560/578), 已耗时=1.6分钟, 当前时间=2026-05-20 21:53:02+0800
+2026-05-20 21:53:03,296 [DEBUG] - swap 阶段 3, 进度=100.0%(578/578), 已耗时=1.6分钟, 当前时间=2026-05-20 21:53:03+0800
+2026-05-20 21:53:03,303 [OK] - swap 初始化历史 K线, 阶段 3 已完成, 当前时间=2026-05-20 21:53:03+0800, 耗时=1.62分钟
+2026-05-20 21:53:03,307 [DEBUG] - -------------------- 开始 Resample 历史数据 2026-05-20 21:53:03 --------------------
+2026-05-20 21:53:03,329 [INFO] - 开始 Resample 历史数据，类型=spot，当前时间=2026-05-20 21:53:03+0800
+2026-05-20 21:53:07,205 [INFO] - 开始 Resample 历史数据，类型=swap，当前时间=2026-05-20 21:53:07+0800
+2026-05-20 21:53:44,351 [OK] - Resample 历史数据成功，类型=spot，当前时间=2026-05-20 21:53:44+0800
+2026-05-20 21:53:56,990 [OK] - Resample 历史数据成功，类型=swap，当前时间=2026-05-20 21:53:56+0800
+2026-05-20 21:54:12,157 [OK] - Binance 1h 复制到 Data API 成功
+2026-05-20 21:54:12,158 [DEBUG] - ================== Update 5m Runtime=2026-05-20 21:55:00+08:00 ===================
+2026-05-20 21:54:55,058 [OK] - Exchange Info 与实时资金费获取成功, 本地时间=2026-05-20 21:54:55+0800
+2026-05-20 21:55:03,864 [INFO] - 开始请求 Data API K 线, 当前时间=2026-05-20 21:55:03+0800
+2026-05-20 21:55:03,890 [INFO] - 开始更新币安 spot K 线, 交易对数量=425, 当前时间=2026-05-20 21:55:03+0800
+2026-05-20 21:55:03,890 [INFO] - 开始更新币安 swap K 线, 交易对数量=578, 当前时间=2026-05-20 21:55:03+0800
+2026-05-20 21:55:03,900 [INFO] - 更新市值数据, 当前时间=2026-05-20 21:55:03+0800
+2026-05-20 21:55:10,189 [INFO] - 市值数据更新成功, 当前时间=2026-05-20 21:55:10+0800, 耗时=0.10分钟
+2026-05-20 21:55:17,338 [OK] - DataAPI URL 就绪, DataAPI 时间戳=2026-05-20 21:55:00+08:00, 当前时间=2026-05-20 21:55:17+0800
+2026-05-20 21:55:17,339 [INFO] - data_api_spot=https://upyun.quantclass.cn/crypto-realtime/binance-1h/202605202155-spot_1h55m.7z?_upt=e9e600fc1779296116
+2026-05-20 21:55:17,340 [INFO] - data_api_swap=https://upyun.quantclass.cn/crypto-realtime/binance-1h/202605202155-swap_1h55m.7z?_upt=9b3e06681779296116
+2026-05-20 21:55:23,545 [OK] - Binance spot API, 获取 5m 成功, Resample 并更新 1h 成功, 耗时=19.7秒, 当前时间=2026-05-20 21:55:23+0800
+2026-05-20 21:55:27,743 [OK] - Binance swap API, 获取 5m 成功, Resample 并更新 1h 成功, 耗时=23.9秒, 当前时间=2026-05-20 21:55:27+0800
+2026-05-20 21:55:28,118 [INFO] - 开始预处理 spot, 当前时间=2026-05-20 21:55:28+0800
+2026-05-20 21:55:28,120 [INFO] - 开始预处理 swap, 当前时间=2026-05-20 21:55:28+0800
+2026-05-20 21:55:33,154 [DEBUG] - 预处理 Market Dict swap batch1 完成, 交易对=0GUSDT -- CELOUSDT, 数据源={'binance': 128}, 当前时间=2026-05-20 21:55:33+0800, 耗时 5.0 秒
+2026-05-20 21:55:33,827 [DEBUG] - 预处理 Market Dict spot batch1 完成, 交易对=0GUSDT -- ENJUSDT, 数据源={'binance': 128}, 当前时间=2026-05-20 21:55:33+0800, 耗时 5.7 秒
+2026-05-20 21:55:35,305 [OK] - 获取并合并 DataAPI 数据 spot 成功, 当前时间=2026-05-20 21:55:35+0800
+2026-05-20 21:55:37,639 [OK] - 获取并合并 DataAPI 数据 swap 成功, 当前时间=2026-05-20 21:55:37+0800
+2026-05-20 21:55:38,256 [DEBUG] - 预处理 Market Dict swap batch2 完成, 交易对=CELRUSDT -- ICPUSDT, 数据源={'binance': 128}, 当前时间=2026-05-20 21:55:38+0800, 耗时 5.0 秒
+2026-05-20 21:55:40,341 [DEBUG] - 预处理 Market Dict spot batch2 完成, 交易对=ENSOUSDT -- OGNUSDT, 数据源={'binance': 128}, 当前时间=2026-05-20 21:55:40+0800, 耗时 6.4 秒
+2026-05-20 21:55:43,539 [DEBUG] - 预处理 Market Dict swap batch3 完成, 交易对=ICXUSDT -- PIPPINUSDT, 数据源={'binance': 128}, 当前时间=2026-05-20 21:55:43+0800, 耗时 5.2 秒
+2026-05-20 21:55:45,763 [DEBUG] - 预处理 Market Dict spot batch3 完成, 交易对=OGUSDT -- VANRYUSDT, 数据源={'binance': 128}, 当前时间=2026-05-20 21:55:45+0800, 耗时 5.3 秒
+2026-05-20 21:55:47,123 [DEBUG] - 预处理 Market Dict spot batch4 完成, 交易对=VELODROMEUSDT -- 币安人生USDT, 数据源={'binance': 41}, 当前时间=2026-05-20 21:55:47+0800, 耗时 1.3 秒
+2026-05-20 21:55:47,152 [OK] - 预处理 Market Dict spot 完成, 当前时间=2026-05-20 21:55:47+0800, 耗时 19.0 秒
+2026-05-20 21:55:48,776 [DEBUG] - 预处理 Market Dict swap batch4 完成, 交易对=PIXELUSDT -- TWTUSDT, 数据源={'binance': 128}, 当前时间=2026-05-20 21:55:48+0800, 耗时 5.2 秒
+2026-05-20 21:55:49,692 [INFO] - 生成 Market Pivot spot 2024 完成
+2026-05-20 21:55:51,016 [DEBUG] - 预处理 Market Dict swap batch5 完成, 交易对=UAIUSDT -- 龙虾USDT, 数据源={'binance': 66}, 当前时间=2026-05-20 21:55:51+0800, 耗时 2.1 秒
+2026-05-20 21:55:51,045 [OK] - 预处理 Market Dict swap 完成, 当前时间=2026-05-20 21:55:51+0800, 耗时 22.9 秒
+2026-05-20 21:55:53,682 [INFO] - 生成 Market Pivot swap 2024 完成
+2026-05-20 21:55:57,358 [INFO] - 生成 Market Pivot spot 2025 完成
+2026-05-20 21:56:00,629 [INFO] - 生成 Market Pivot spot 2026 完成
+2026-05-20 21:56:00,652 [OK] - 预处理 Pivot Table spot 完成, 当前时间=2026-05-20 21:56:00+0800, 耗时 13.5 秒
+2026-05-20 21:56:02,161 [INFO] - 生成 Market Pivot swap 2025 完成
+2026-05-20 21:56:06,628 [INFO] - 生成 Market Pivot swap 2026 完成
+2026-05-20 21:56:06,668 [OK] - 预处理 Pivot Table swap 完成, 当前时间=2026-05-20 21:56:06+0800, 耗时 15.6 秒
+2026-05-20 21:58:00,006 [INFO] - 开始合并币安 spot 5m K 线, 当前时间=2026-05-20 21:58:00+0800
+2026-05-20 21:58:00,006 [INFO] - 开始合并币安 swap 5m K 线, 当前时间=2026-05-20 21:58:00+0800
+2026-05-20 21:58:04,012 [OK] - 合并币安 spot 5m K 线成功, 当前时间=2026-05-20 21:58:04+0800
+2026-05-20 21:58:05,340 [OK] - 合并币安 swap 5m K 线成功, 当前时间=2026-05-20 21:58:05+0800
+2026-05-20 21:58:05,499 [INFO] - Runtime=2026-05-20 22:00:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 21:59:05,500 [INFO] - Runtime=2026-05-20 22:00:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 22:00:05,502 [INFO] - Runtime=2026-05-20 22:05:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 22:01:05,503 [INFO] - Runtime=2026-05-20 22:05:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 22:02:05,504 [INFO] - Runtime=2026-05-20 22:05:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 22:03:05,505 [INFO] - Runtime=2026-05-20 22:05:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 22:04:05,506 [INFO] - Runtime=2026-05-20 22:05:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 22:05:05,507 [INFO] - Runtime=2026-05-20 22:10:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 22:06:05,509 [INFO] - Runtime=2026-05-20 22:10:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 22:07:05,510 [INFO] - Runtime=2026-05-20 22:10:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 22:08:05,511 [INFO] - Runtime=2026-05-20 22:10:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 22:09:05,512 [INFO] - Runtime=2026-05-20 22:10:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 22:10:05,513 [INFO] - Runtime=2026-05-20 22:15:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 22:11:05,514 [INFO] - Runtime=2026-05-20 22:15:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 22:12:05,515 [INFO] - Runtime=2026-05-20 22:15:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 22:13:05,516 [INFO] - Runtime=2026-05-20 22:15:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 22:14:05,517 [INFO] - Runtime=2026-05-20 22:15:00+08:00,不在 Offset=('20m', '40m', '55m') 中，休息 60s 后，跳过
+2026-05-20 22:15:05,518 [DEBUG] - ================== Update 5m Runtime=2026-05-20 22:20:00+08:00 ===================
+2026-05-20 22:20:46,082 [ERROR] - 错误 ClientConnectorError(ConnectionKey(host='api.binance.com', port=443, is_ssl=True, ssl=True, proxy=URL('http://127.0.0.1:7897'), proxy_auth=None, proxy_headers_hash=5371487378164635660), ConnectionResetError()), 剩余 0 次重试机会, 出错函数 <bound method BinanceMarketSpotApi.aioreq_exchange_info of <core.binance_market_async.BinanceMarketSpotApi object at 0x000002AFEB2CC750>>
+2026-05-20 22:20:46,083 [ERROR] - 错误 ClientConnectorError(ConnectionKey(host='fapi.binance.com', port=443, is_ssl=True, ssl=True, proxy=URL('http://127.0.0.1:7897'), proxy_auth=None, proxy_headers_hash=3548049445824545850), ConnectionResetError()), 剩余 0 次重试机会, 出错函数 <bound method BinanceMarketUMFapi.aioreq_exchange_info of <core.binance_market_async.BinanceMarketUMFapi object at 0x000002AFEB2CED10>>
+2026-05-20 22:20:46,084 [ERROR] - 错误 ClientConnectorError(ConnectionKey(host='fapi.binance.com', port=443, is_ssl=True, ssl=True, proxy=URL('http://127.0.0.1:7897'), proxy_auth=None, proxy_headers_hash=3548049445824545850), ConnectionResetError()), 剩余 0 次重试机会, 出错函数 <bound method BinanceMarketUMFapi.aioreq_premium_index of <core.binance_market_async.BinanceMarketUMFapi object at 0x000002AFEB2CE8D0>>
+2026-05-20 22:20:46,489 [DEBUG] - Traceback (most recent call last):
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\site-packages\aiohttp\connector.py", line 1254, in _start_tls_connection
+    tls_transport = await self._loop.start_tls(
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\asyncio\base_events.py", line 1268, in start_tls
+    await waiter
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\asyncio\sslproto.py", line 578, in _on_handshake_complete
+    raise handshake_exc
+ConnectionResetError
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "d:\alpha\realtime_data.py", line 153, in main
+    update_all(handle, run_time)
+  File "d:\alpha\realtime_data.py", line 42, in update_all
+    asyncio.run(update_binance_meta(handle, run_time))
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\asyncio\runners.py", line 190, in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\asyncio\runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\asyncio\base_events.py", line 654, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "d:\alpha\core\binance_update.py", line 53, in update_binance_meta
+    await asyncio.gather(*tasks)
+  File "d:\alpha\core\binance_update.py", line 21, in update_binance_exginfo
+    exginfo = await fetcher.get_exchange_info()
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "d:\alpha\core\binance_fetcher_async.py", line 196, in get_exchange_info
+    exg_info = await async_retry_getter(self.market_api.aioreq_exchange_info)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "d:\alpha\core\utils\network.py", line 15, in async_retry_getter
+    raise e
+  File "d:\alpha\core\utils\network.py", line 11, in async_retry_getter
+    return await func(**kwargs)
+           ^^^^^^^^^^^^^^^^^^^^
+  File "d:\alpha\core\binance_market_async.py", line 427, in aioreq_exchange_info
+    return await self._aio_get(url, None)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "d:\alpha\core\binance_market_async.py", line 132, in _aio_get
+    async with self.session.get(url, params=params, proxy=self.proxy) as resp:
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\site-packages\aiohttp\client.py", line 1425, in __aenter__
+    self._resp: _RetType = await self._coro
+                           ^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\site-packages\aiohttp\client.py", line 703, in _request
+    conn = await self._connector.connect(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\site-packages\aiohttp\connector.py", line 548, in connect
+    proto = await self._create_connection(req, traces, timeout)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\site-packages\aiohttp\connector.py", line 1054, in _create_connection
+    _, proto = await self._create_proxy_connection(req, traces, timeout)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\site-packages\aiohttp\connector.py", line 1516, in _create_proxy_connection
+    return await self._start_tls_connection(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\site-packages\aiohttp\connector.py", line 1284, in _start_tls_connection
+    raise client_error(req.connection_key, exc) from exc
+aiohttp.client_exceptions.ClientConnectorError: Cannot connect to host api.binance.com:443 ssl:default [None]
+
+2026-05-20 22:20:46,489 [ERROR] - ClientConnectorError(ConnectionKey(host='api.binance.com', port=443, is_ssl=True, ssl=True, proxy=URL('http://127.0.0.1:7897'), proxy_auth=None, proxy_headers_hash=5371487378164635660), ConnectionResetError())
+2026-05-20 22:20:46,489 [DEBUG] - ========================= 1 分钟后重启 2026-05-20 22:20:46 =========================
+2026-05-20 22:21:56,096 [DEBUG] - ============== 开始初始化历史数据, run_time=2026-05-20 22:20:00+08:00 ===============
+2026-05-20 22:22:57,179 [ERROR] - 错误 ClientConnectorError(ConnectionKey(host='api.binance.com', port=443, is_ssl=True, ssl=True, proxy=URL('http://127.0.0.1:7897'), proxy_auth=None, proxy_headers_hash=7325038922536352450), ConnectionResetError()), 剩余 0 次重试机会, 出错函数 <bound method BinanceMarketSpotApi.aioreq_exchange_info of <core.binance_market_async.BinanceMarketSpotApi object at 0x0000023EA460FC50>>
+2026-05-20 22:22:57,678 [DEBUG] - concurrent.futures.process._RemoteTraceback: 
+"""
+Traceback (most recent call last):
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\site-packages\aiohttp\connector.py", line 1254, in _start_tls_connection
+    tls_transport = await self._loop.start_tls(
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\asyncio\base_events.py", line 1268, in start_tls
+    await waiter
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\asyncio\sslproto.py", line 578, in _on_handshake_complete
+    raise handshake_exc
+ConnectionResetError
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\concurrent\futures\process.py", line 261, in _process_worker
+    r = call_item.fn(*call_item.args, **call_item.kwargs)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "d:\alpha\core\history_data\history.py", line 32, in run_download_all_history
+    spot_symbols = asyncio.run(get_type_symbols(handle, "spot"))
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\asyncio\runners.py", line 190, in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\asyncio\runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\asyncio\base_events.py", line 654, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "d:\alpha\core\history_data\utils.py", line 26, in get_type_symbols
+    exginfo = await fetcher.get_exchange_info()
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "d:\alpha\core\binance_fetcher_async.py", line 196, in get_exchange_info
+    exg_info = await async_retry_getter(self.market_api.aioreq_exchange_info)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "d:\alpha\core\utils\network.py", line 15, in async_retry_getter
+    raise e
+  File "d:\alpha\core\utils\network.py", line 11, in async_retry_getter
+    return await func(**kwargs)
+           ^^^^^^^^^^^^^^^^^^^^
+  File "d:\alpha\core\binance_market_async.py", line 427, in aioreq_exchange_info
+    return await self._aio_get(url, None)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "d:\alpha\core\binance_market_async.py", line 132, in _aio_get
+    async with self.session.get(url, params=params, proxy=self.proxy) as resp:
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\site-packages\aiohttp\client.py", line 1425, in __aenter__
+    self._resp: _RetType = await self._coro
+                           ^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\site-packages\aiohttp\client.py", line 703, in _request
+    conn = await self._connector.connect(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\site-packages\aiohttp\connector.py", line 548, in connect
+    proto = await self._create_connection(req, traces, timeout)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\site-packages\aiohttp\connector.py", line 1054, in _create_connection
+    _, proto = await self._create_proxy_connection(req, traces, timeout)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\site-packages\aiohttp\connector.py", line 1516, in _create_proxy_connection
+    return await self._start_tls_connection(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\site-packages\aiohttp\connector.py", line 1284, in _start_tls_connection
+    raise client_error(req.connection_key, exc) from exc
+aiohttp.client_exceptions.ClientConnectorError: Cannot connect to host api.binance.com:443 ssl:default [None]
+"""
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "d:\alpha\realtime_data.py", line 148, in main
+    init_history(handle)
+  File "d:\alpha\realtime_data.py", line 124, in init_history
+    run_time = download_task.result()
+               ^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\concurrent\futures\_base.py", line 456, in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\concurrent\futures\_base.py", line 401, in __get_result
+    raise self._exception
+aiohttp.client_exceptions.ClientConnectorError: Cannot connect to host api.binance.com:443 ssl:default [None]
+
+2026-05-20 22:22:57,678 [ERROR] - ClientConnectorError(ConnectionKey(host='api.binance.com', port=443, is_ssl=True, ssl=True, proxy=URL('http://127.0.0.1:7897'), proxy_auth=None, proxy_headers_hash=7325038922536352450), ConnectionResetError())
+2026-05-20 22:22:57,678 [DEBUG] - ========================= 1 分钟后重启 2026-05-20 22:22:57 =========================
+2026-05-20 22:24:01,427 [DEBUG] - ============== 开始初始化历史数据, run_time=2026-05-20 22:20:00+08:00 ===============
+2026-05-20 22:25:02,520 [ERROR] - 错误 ClientConnectorError(ConnectionKey(host='api.binance.com', port=443, is_ssl=True, ssl=True, proxy=URL('http://127.0.0.1:7897'), proxy_auth=None, proxy_headers_hash=294689001105015496), ConnectionResetError()), 剩余 0 次重试机会, 出错函数 <bound method BinanceMarketSpotApi.aioreq_exchange_info of <core.binance_market_async.BinanceMarketSpotApi object at 0x000002006725F990>>
+2026-05-20 22:25:02,913 [DEBUG] - concurrent.futures.process._RemoteTraceback: 
+"""
+Traceback (most recent call last):
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\site-packages\aiohttp\connector.py", line 1254, in _start_tls_connection
+    tls_transport = await self._loop.start_tls(
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\asyncio\base_events.py", line 1268, in start_tls
+    await waiter
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\asyncio\sslproto.py", line 578, in _on_handshake_complete
+    raise handshake_exc
+ConnectionResetError
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\concurrent\futures\process.py", line 261, in _process_worker
+    r = call_item.fn(*call_item.args, **call_item.kwargs)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "d:\alpha\core\history_data\history.py", line 32, in run_download_all_history
+    spot_symbols = asyncio.run(get_type_symbols(handle, "spot"))
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\asyncio\runners.py", line 190, in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\asyncio\runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\asyncio\base_events.py", line 654, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "d:\alpha\core\history_data\utils.py", line 26, in get_type_symbols
+    exginfo = await fetcher.get_exchange_info()
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "d:\alpha\core\binance_fetcher_async.py", line 196, in get_exchange_info
+    exg_info = await async_retry_getter(self.market_api.aioreq_exchange_info)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "d:\alpha\core\utils\network.py", line 15, in async_retry_getter
+    raise e
+  File "d:\alpha\core\utils\network.py", line 11, in async_retry_getter
+    return await func(**kwargs)
+           ^^^^^^^^^^^^^^^^^^^^
+  File "d:\alpha\core\binance_market_async.py", line 427, in aioreq_exchange_info
+    return await self._aio_get(url, None)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "d:\alpha\core\binance_market_async.py", line 132, in _aio_get
+    async with self.session.get(url, params=params, proxy=self.proxy) as resp:
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\site-packages\aiohttp\client.py", line 1425, in __aenter__
+    self._resp: _RetType = await self._coro
+                           ^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\site-packages\aiohttp\client.py", line 703, in _request
+    conn = await self._connector.connect(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\site-packages\aiohttp\connector.py", line 548, in connect
+    proto = await self._create_connection(req, traces, timeout)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\site-packages\aiohttp\connector.py", line 1054, in _create_connection
+    _, proto = await self._create_proxy_connection(req, traces, timeout)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\site-packages\aiohttp\connector.py", line 1516, in _create_proxy_connection
+    return await self._start_tls_connection(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\site-packages\aiohttp\connector.py", line 1284, in _start_tls_connection
+    raise client_error(req.connection_key, exc) from exc
+aiohttp.client_exceptions.ClientConnectorError: Cannot connect to host api.binance.com:443 ssl:default [None]
+"""
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "d:\alpha\realtime_data.py", line 148, in main
+    init_history(handle)
+  File "d:\alpha\realtime_data.py", line 124, in init_history
+    run_time = download_task.result()
+               ^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\concurrent\futures\_base.py", line 456, in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\concurrent\futures\_base.py", line 401, in __get_result
+    raise self._exception
+aiohttp.client_exceptions.ClientConnectorError: Cannot connect to host api.binance.com:443 ssl:default [None]
+
+2026-05-20 22:25:02,913 [ERROR] - ClientConnectorError(ConnectionKey(host='api.binance.com', port=443, is_ssl=True, ssl=True, proxy=URL('http://127.0.0.1:7897'), proxy_auth=None, proxy_headers_hash=294689001105015496), ConnectionResetError())
+2026-05-20 22:25:02,913 [DEBUG] - ========================= 1 分钟后重启 2026-05-20 22:25:02 =========================
+2026-05-20 22:26:06,595 [DEBUG] - ============== 开始初始化历史数据, run_time=2026-05-20 22:25:00+08:00 ===============
+2026-05-20 22:27:07,686 [ERROR] - 错误 ClientConnectorError(ConnectionKey(host='api.binance.com', port=443, is_ssl=True, ssl=True, proxy=URL('http://127.0.0.1:7897'), proxy_auth=None, proxy_headers_hash=4966952136925311292), ConnectionResetError()), 剩余 0 次重试机会, 出错函数 <bound method BinanceMarketSpotApi.aioreq_exchange_info of <core.binance_market_async.BinanceMarketSpotApi object at 0x000001FFA00072D0>>
+2026-05-20 22:27:08,073 [DEBUG] - concurrent.futures.process._RemoteTraceback: 
+"""
+Traceback (most recent call last):
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\site-packages\aiohttp\connector.py", line 1254, in _start_tls_connection
+    tls_transport = await self._loop.start_tls(
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\asyncio\base_events.py", line 1268, in start_tls
+    await waiter
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\asyncio\sslproto.py", line 578, in _on_handshake_complete
+    raise handshake_exc
+ConnectionResetError
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\concurrent\futures\process.py", line 261, in _process_worker
+    r = call_item.fn(*call_item.args, **call_item.kwargs)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "d:\alpha\core\history_data\history.py", line 32, in run_download_all_history
+    spot_symbols = asyncio.run(get_type_symbols(handle, "spot"))
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\asyncio\runners.py", line 190, in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\asyncio\runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\asyncio\base_events.py", line 654, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "d:\alpha\core\history_data\utils.py", line 26, in get_type_symbols
+    exginfo = await fetcher.get_exchange_info()
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "d:\alpha\core\binance_fetcher_async.py", line 196, in get_exchange_info
+    exg_info = await async_retry_getter(self.market_api.aioreq_exchange_info)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "d:\alpha\core\utils\network.py", line 15, in async_retry_getter
+    raise e
+  File "d:\alpha\core\utils\network.py", line 11, in async_retry_getter
+    return await func(**kwargs)
+           ^^^^^^^^^^^^^^^^^^^^
+  File "d:\alpha\core\binance_market_async.py", line 427, in aioreq_exchange_info
+    return await self._aio_get(url, None)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "d:\alpha\core\binance_market_async.py", line 132, in _aio_get
+    async with self.session.get(url, params=params, proxy=self.proxy) as resp:
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\site-packages\aiohttp\client.py", line 1425, in __aenter__
+    self._resp: _RetType = await self._coro
+                           ^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\site-packages\aiohttp\client.py", line 703, in _request
+    conn = await self._connector.connect(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\site-packages\aiohttp\connector.py", line 548, in connect
+    proto = await self._create_connection(req, traces, timeout)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\site-packages\aiohttp\connector.py", line 1054, in _create_connection
+    _, proto = await self._create_proxy_connection(req, traces, timeout)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\site-packages\aiohttp\connector.py", line 1516, in _create_proxy_connection
+    return await self._start_tls_connection(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\site-packages\aiohttp\connector.py", line 1284, in _start_tls_connection
+    raise client_error(req.connection_key, exc) from exc
+aiohttp.client_exceptions.ClientConnectorError: Cannot connect to host api.binance.com:443 ssl:default [None]
+"""
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "d:\alpha\realtime_data.py", line 148, in main
+    init_history(handle)
+  File "d:\alpha\realtime_data.py", line 124, in init_history
+    run_time = download_task.result()
+               ^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\concurrent\futures\_base.py", line 456, in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\miniconda3\envs\alpha311\Lib\concurrent\futures\_base.py", line 401, in __get_result
+    raise self._exception
+aiohttp.client_exceptions.ClientConnectorError: Cannot connect to host api.binance.com:443 ssl:default [None]
+
+2026-05-20 22:27:08,073 [ERROR] - ClientConnectorError(ConnectionKey(host='api.binance.com', port=443, is_ssl=True, ssl=True, proxy=URL('http://127.0.0.1:7897'), proxy_auth=None, proxy_headers_hash=4966952136925311292), ConnectionResetError())
+2026-05-20 22:27:08,074 [DEBUG] - ========================= 1 分钟后重启 2026-05-20 22:27:08 =========================
