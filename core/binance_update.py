@@ -36,7 +36,7 @@ async def update_binance_funding_rates(handle: BmacHandle, session, run_time):
 
     df_funding = df_funding.rename(columns={'next_funding_time': 'candle_begin_time'})
     for symbol, g in df_funding.groupby('symbol'):
-        funding_mgr.update_candle(symbol, run_time, g, handle.kline_count_1h)
+        funding_mgr.update_candle(symbol, run_time, g, handle.get_kline_count_1h('swap'))
 
 
 async def update_binance_meta(handle: BmacHandle, run_time):
@@ -89,7 +89,7 @@ async def fetch_update_resample(handle: BmacHandle, binance_handle: BinanceHandl
         symbol_base_df[symbol] = df_base
 
         # 将基础周期(5m) K 线 DF, Resample 成带偏移的 Resample 周期(1h) K 线 DF
-        theoretical_start = run_time - handle.kline_count_1h * resample_delta
+        theoretical_start = run_time - handle.get_kline_count_1h(trade_type) * resample_delta
         df_resample = calc_resample(df_base, resample_interval, offset_str, theoretical_start)
 
         # 增量更新时，第一根 resample K 线可能因 API 数据截断而不完整
@@ -100,7 +100,7 @@ async def fetch_update_resample(handle: BmacHandle, binance_handle: BinanceHandl
 
         # 与已有 Resample 周期(1h) K 线 DF 合并，过滤/填充 K 线缺失，最后写入硬盘
         first_begin_time, last_begin_time = update_resample_candle(resample_mgr, symbol, df_resample,
-                                                                   handle.kline_count_1h, run_time, resample_delta)
+                                                                   handle.get_kline_count_1h(trade_type), run_time, resample_delta)
         if first_begin_time is not None and last_begin_time is not None:
             symbol_begin_time[symbol] = first_begin_time, last_begin_time
 
@@ -153,7 +153,7 @@ def update_base_candles(handle: BmacHandle, run_time, trade_type, symbol_dfs):
         symbol_dir = binance_handle.base_candle_dir / symbol
         ts_mgr = TSManager(symbol_dir)
         ts_mgr.update(df_new)
-        required_first_begin = run_time - handle.num_base_candles * base_delta
+        required_first_begin = run_time - handle.get_num_base_candles(trade_type) * base_delta
         partitions = ts_mgr.list_partitions()
         ts_mgr.trim_partition(partitions[0], required_first_begin, run_time)
     logger.ok(f'合并币安 {trade_type} {handle.base_interval} K 线成功, 当前时间={now_time_str()}')

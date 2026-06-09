@@ -76,7 +76,7 @@ async def async_merge_data_api_candles(handle: BmacHandle, run_time, trade_type,
             df_symbol = df_symbol.set_index('candle_end_time').drop(columns='symbol')
             candle_mgr = data_api_handle.get_mgr_map(trade_type)[offset_str]
             first_begin_time, last_begin_time = update_resample_candle(candle_mgr, symbol, df_symbol,
-                                                                       handle.kline_count_1h, run_time, resample_delta)
+                                                                       handle.get_kline_count_1h(trade_type), run_time, resample_delta)
             if first_begin_time is not None and last_begin_time is not None:
                 symbol_begin_time[symbol] = first_begin_time, last_begin_time
         logger.ok(f'获取并合并 DataAPI 数据 {trade_type} 成功, 当前时间={now_time_str()}')

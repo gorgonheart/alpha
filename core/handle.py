@@ -128,11 +128,13 @@ class BmacHandle:
     # 重采样周期，表示对基础数据进行重采样的间隔，例如 "1h" 表示 1 小时
     resample_interval: str
 
-    # 重采样周期 K 线数量
-    kline_count_1h: int
+    # 重采样周期 K 线数量（spot/swap 分别配置）
+    kline_count_1h_spot: int
+    kline_count_1h_swap: int
 
-    # 基础周期 K 线的数量
-    num_base_candles: int
+    # 基础周期 K 线的数量（spot/swap 分别配置）
+    num_base_candles_spot: int
+    num_base_candles_swap: int
 
     # 偏移量数量，表示一个重采样周期内包含多少个基础周期
     num_offsets: int
@@ -188,6 +190,16 @@ class BmacHandle:
             return self.binance_swap
         else:
             raise ValueError(f'Unknown trade_type {trade_type}')
+
+    def get_kline_count_1h(self, trade_type: str) -> int:
+        if trade_type == 'spot':
+            return self.kline_count_1h_spot
+        return self.kline_count_1h_swap
+
+    def get_num_base_candles(self, trade_type: str) -> int:
+        if trade_type == 'spot':
+            return self.num_base_candles_spot
+        return self.num_base_candles_swap
 
 
 def create_offset_candle_mgr_map(resample_dir: Path, hour_offsets: tuple[str]) -> dict[str, CandleFileManager]:
@@ -386,7 +398,8 @@ def create_bmac_handle_from_config() -> BmacHandle:
     num_offsets = resample_delta // base_delta
 
     # 计算基础周期 K 线数量，比配置要求的重采样周期多 3 个周期，防止数据不足
-    num_base_candles = num_offsets * (bmac_config.kline_count_1h + 3)
+    num_base_candles_spot = num_offsets * (bmac_config.kline_count_1h_spot + 3)
+    num_base_candles_swap = num_offsets * (bmac_config.kline_count_1h_swap + 3)
 
     data_api_cfg = DataApiCfg(data_api_uuid=bmac_config.data_api_uuid, data_api_key=bmac_config.data_api_key)
 
@@ -430,8 +443,10 @@ def create_bmac_handle_from_config() -> BmacHandle:
         base_dir=storage_path,
         base_interval=bmac_config.base_interval,
         resample_interval=bmac_config.resample_interval,
-        kline_count_1h=bmac_config.kline_count_1h,
-        num_base_candles=num_base_candles,
+        kline_count_1h_spot=bmac_config.kline_count_1h_spot,
+        kline_count_1h_swap=bmac_config.kline_count_1h_swap,
+        num_base_candles_spot=num_base_candles_spot,
+        num_base_candles_swap=num_base_candles_swap,
         num_offsets=num_offsets,
         fetch_funding_rate=bmac_config.funding_rate,
         funding_mgr=funding_mgr,
@@ -449,9 +464,9 @@ def create_bmac_handle_from_config() -> BmacHandle:
 def debug_handle(handle: BmacHandle):
     logger.debug(f'数据目录={handle.base_dir}')
     logger.debug(f'基础周期={handle.base_interval}, Resample 周期={handle.resample_interval}')
-    logger.debug((f'{handle.resample_interval} 数量={handle.kline_count_1h:,d}, '
-                  f'Offset={handle.enabled_hour_offsets}, '
-                  f'{handle.base_interval} 数量={handle.num_base_candles:,d}'))
+    logger.debug((f'spot {handle.resample_interval} 数量={handle.kline_count_1h_spot:,d}, '
+                  f'swap {handle.resample_interval} 数量={handle.kline_count_1h_swap:,d}, '
+                  f'Offset={handle.enabled_hour_offsets}'))
 
     logger.debug(f'Exchange Info 目录={handle.exg_mgr.base_dir}')
     logger.debug(f'币安现货, {handle.base_interval} 目录={handle.binance_spot.base_candle_dir}')

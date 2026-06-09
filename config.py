@@ -8,8 +8,9 @@ from core.utils.path_kit import get_folder_path, get_file_path
 # - 全局报错机器人通知
 # - 本地存储路径
 # ====================================================================================================
-# Resample(1h) 周期 K 线数量，默认: 2000 小时
-kline_count_1h = 14060
+# Resample(1h) 周期 K 线数量
+kline_count_1h_spot = 3000
+kline_count_1h_swap = 14060
 # 全局报错机器人通知
 # - 创建企业微信机器人 参考帖子: https://bbs.quantclass.cn/thread/10975
 # - 配置案例  https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxxxxxxxxxxxxxxxx
@@ -79,8 +80,8 @@ if json_file_config.exists():
 
         # 目前只支持配置这些
         allowed_attrs = (
-            'kline_count_1h', 'error_webhook_url', 'use_api', 'data_api_uuid', 'data_api_key', 'enabled_hour_offsets',
-            'funding_rate')
+            'kline_count_1h_spot', 'kline_count_1h_swap', 'error_webhook_url', 'use_api', 'data_api_uuid', 'data_api_key',
+            'enabled_hour_offsets', 'funding_rate')
 
         for _attr in allowed_attrs:
             if _attr in config_data:

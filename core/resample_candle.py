@@ -58,7 +58,7 @@ def resample_history(handle: BmacHandle, trade_type: str, run_time: datetime):
         if df is None:
             shutil.rmtree(symbol_dir)
             return
-        theoretical_start = run_time - handle.kline_count_1h * resample_delta
+        theoretical_start = run_time - handle.get_kline_count_1h(trade_type) * resample_delta
         for offset_str, resample_mgr in resample_mgr_map.items():
             df_resample = calc_resample(df, handle.resample_interval, offset_str, theoretical_start)
             if df_resample.empty:

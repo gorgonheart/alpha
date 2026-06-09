@@ -217,7 +217,7 @@ class HistoryDownloader(Downloader):
 
     def check_finish(self, info: CandleInfo):
         base_delta = convert_interval_to_timedelta(self.handle.base_interval)
-        required_first_begin = self.run_time - base_delta * self.handle.num_base_candles
+        required_first_begin = self.run_time - base_delta * self.handle.get_num_base_candles(self.trade_type)
 
         # 起始 begin_time 已经在期望起始时间之前，则代表补全了 K 线数据
         if info.first_begin_time <= required_first_begin:
@@ -327,7 +327,7 @@ def verify_exist_history(handle: BmacHandle, trade_type: str, run_time: datetime
     base_delta = convert_interval_to_timedelta(handle.base_interval)
 
     # 推算 base 周期(5m) K线起始和终止 candle_begin_time
-    required_first_begin = run_time - base_delta * handle.num_base_candles
+    required_first_begin = run_time - base_delta * handle.get_num_base_candles(trade_type)
 
     logger.info(f"{trade_type} 初始化历史 K线, 阶段 1, 校验并清除过时数据, 当前时间={now_time_str()}")
 

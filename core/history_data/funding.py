@@ -63,8 +63,8 @@ async def async_download_funding_rates(handle: BmacHandle, run_time: datetime, s
 
     t_start = time.perf_counter()
 
-    # 1. 计算全局 start time = now - handle.kline_count_1h 小时，然后 floor 取整
-    global_start_time = run_time - timedelta(hours=handle.kline_count_1h)
+    # 1. 计算全局 start time = now - swap kline_count_1h 小时，然后 floor 取整
+    global_start_time = run_time - timedelta(hours=handle.get_kline_count_1h('swap'))
     # Floor 取整到小时
     global_start_time = global_start_time.replace(minute=0, second=0, microsecond=0)
 
@@ -85,7 +85,7 @@ async def async_download_funding_rates(handle: BmacHandle, run_time: datetime, s
     logger.info(
         f"获取历史资金费数据，"
         f"当前时间={now_time_str()}，"
-        f"1h K线数量: {handle.kline_count_1h}，"
+        f"1h K线数量(swap): {handle.get_kline_count_1h('swap')}，"
         f"全局起始时间: {global_start_time}，"
         f"增量symbol数量: {incremental_count}，"
         f"全量symbol数量: {full_count}，"
