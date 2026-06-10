@@ -9,7 +9,7 @@ from core.utils.path_kit import get_folder_path, get_file_path
 # - 本地存储路径
 # ====================================================================================================
 # Resample(1h) 周期 K 线数量
-kline_count_1h_spot = 3000
+kline_count_1h_spot = 14060
 kline_count_1h_swap = 14060
 # 全局报错机器人通知
 # - 创建企业微信机器人 参考帖子: https://bbs.quantclass.cn/thread/10975
@@ -53,7 +53,7 @@ proxy = 'http://127.0.0.1:7897'  # 如果你用clash的话
 # 只更新部分分钟偏移（hour_offset），可有效节省你的硬盘，
 # 当然如果你配置了新的hour_offset策略，需要同步更新数据中心这边的配置
 # 默认所有的offset都需要更新，kline_count_1h=25000，大概占用68GB存储
-enabled_hour_offsets = ( '20m','40m','55m',)
+enabled_hour_offsets = ( '10m','40m','20m',)
 
 # Base 周期，通常设为 5m，与 Data API 一致
 base_interval = '5m'
@@ -66,6 +66,12 @@ funding_rate = True
 
 # 是否生成预处理数据
 preprocess = True
+
+# 预计算因子配置：{因子模块名（不含 factors. 前缀）: [param 列表]}
+# 留空 dict 则跳过因子预计算步骤
+precompute_factor_configs = {
+    '动量因子210401修正': [168, 336],
+}
 
 # 预处理数据拆分 Batch 大小
 preprocess_num_batch = 128
@@ -81,7 +87,7 @@ if json_file_config.exists():
         # 目前只支持配置这些
         allowed_attrs = (
             'kline_count_1h_spot', 'kline_count_1h_swap', 'error_webhook_url', 'use_api', 'data_api_uuid', 'data_api_key',
-            'enabled_hour_offsets', 'funding_rate')
+            'enabled_hour_offsets', 'funding_rate', 'precompute_factor_configs')
 
         for _attr in allowed_attrs:
             if _attr in config_data:
