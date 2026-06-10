@@ -1,1 +1,9 @@
 data/
+logs/
+
+# cffi build artifacts
+factors/c_ext/__pycache__/
+factors/c_ext/*.o
+factors/c_ext/*.exp
+factors/c_ext/*.lib
+factors/c_ext/Release/
