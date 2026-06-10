@@ -1,3 +1,4 @@
+import importlib
 import os
 import time
 from collections import Counter, defaultdict
@@ -9,6 +10,7 @@ from typing import Optional
 
 import pandas as pd
 
+import config as bmac_config
 from core.utils.log_kit import logger
 from core.utils.time import now_time_str
 
@@ -452,9 +454,15 @@ def gen_pivot_incremental(handle: BmacHandle, run_time: datetime, trade_type: st
         new_rows_dict = {sym: df for sym, df in new_rows_dict.items() if not df.empty}
 
         # Symbol set changed → full rebuild to keep pivot columns consistent
+        # Use only symbols that actually have data in this year (non-empty DataFrames)
         old_symbols = set(old_pivot['open'].columns.tolist())
-        all_current_symbols = set(new_market_dict.keys())
+        all_current_symbols = {sym for sym, df in new_market_dict.items() if not df.empty}
         if all_current_symbols != old_symbols:
+            if int(year) < cur_year:
+                # Historical year: new symbols only have data in current year,
+                # so keep the old pivot unchanged rather than rebuilding with missing history.
+                preprocess_mgr.set_candle(pivot_key, run_time, old_pivot)
+                continue
             market_pivot = make_market_pivot(new_market_dict, trade_type)
             preprocess_mgr.set_candle(pivot_key, run_time, market_pivot)
             logger.info(f'生成 Market Pivot {trade_type} {year} 完成 (重建)')
@@ -519,6 +527,8 @@ def preprocess_type_data(handle: BmacHandle, run_time: datetime, trade_type: str
     time_elapsed = time.perf_counter() - t_start
     logger.ok(f'预处理 Market Dict {trade_type} 完成, 当前时间={now_time_str()}, 耗时 {time_elapsed:.1f} 秒')
 
+    gen_factor_data(handle, run_time, trade_type)
+
     t_start = time.perf_counter()
     gen_pivot_incremental(handle, run_time, trade_type, year_pivot_names)
     time_elapsed = time.perf_counter() - t_start
@@ -552,3 +562,64 @@ def preprocess_match_symbols(handle: BmacHandle, run_time: datetime, symbol_begi
     ]
     df_match = pd.DataFrame.from_records(match_results)
     return df_match
+
+
+def _calc_symbol_factors(item, factor_modules_params):
+    """Worker: compute all pre-configured factor columns for one symbol DataFrame.
+    ctypes/cffi calls release the GIL, so ThreadPoolExecutor achieves true CPU parallelism.
+    """
+    symbol, df = item
+    result_dfs = [df]
+    for module, factor_name, param_list in factor_modules_params:
+        raw = module.signal_multi_params(df, param_list)
+        factor_df = pd.DataFrame(raw).add_prefix(f'{factor_name}_')
+        factor_df.index = df.index
+        result_dfs.append(factor_df)
+    return symbol, pd.concat(result_dfs, axis=1)
+
+
+def gen_factor_data(handle: BmacHandle, run_time: datetime, trade_type: str):
+    """Compute pre-configured factor columns for all market_dict batches and write back.
+
+    Called after gen_batch_data_incremental, before gen_pivot_incremental.
+    Factor columns are named {factor_name}_{param}, matching factor_calc.py convention.
+    """
+    factor_configs = getattr(bmac_config, 'precompute_factor_configs', {})
+    if not factor_configs:
+        return
+
+    offset_str = get_offset_from_runtime(run_time, handle.resample_interval)
+    preprocess_mgr = handle.preprocess_handle.preprocess_mgr_map[offset_str]
+
+    factor_modules_params = [
+        (importlib.import_module(f'factors.{factor_name}'), factor_name, param_list)
+        for factor_name, param_list in factor_configs.items()
+    ]
+
+    batch_idx = 1
+    t_start = time.perf_counter()
+    total_symbols = 0
+    while True:
+        batch_key = f'{trade_type}_dict_batch{batch_idx}'
+        if not preprocess_mgr.has_symbol(batch_key):
+            break
+        market_dict: dict[str, pd.DataFrame] = preprocess_mgr.read_candle(batch_key)
+        max_workers = min(len(market_dict), os.cpu_count() or 8, 16)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            updated = dict(
+                pool.map(
+                    lambda item: _calc_symbol_factors(item, factor_modules_params),
+                    market_dict.items(),
+                )
+            )
+
+        preprocess_mgr.set_candle(batch_key, run_time, updated)
+        total_symbols += len(updated)
+        batch_idx += 1
+
+    elapsed = time.perf_counter() - t_start
+    logger.ok(
+        f'预计算因子 {trade_type} 完成, symbols={total_symbols}, '
+        f'当前时间={now_time_str()}, 耗时 {elapsed:.1f} 秒'
+    )
