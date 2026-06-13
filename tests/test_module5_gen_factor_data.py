@@ -11,6 +11,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from tests.support.module5_harness import (
+    BATCH_KEY as _M5_BATCH_KEY,
+    FACTOR_NAME as _M5_FACTOR_NAME,
+    load_btcusdt_candles as _load_m5_candles,
+    load_golden_signal,
+    make_factor_handle,
+)
+
 from core.candle_manager import CandleFileManager
 from core.preprocess import gen_factor_data
 from core.utils.time import get_offset_from_runtime
@@ -89,3 +97,49 @@ def test_gen_factor_data_no_config_is_noop(tmp, monkeypatch):
     df_result = result['BTCUSDT']
     factor_cols = [c for c in df_result.columns if FACTOR_NAME in c]
     assert factor_cols == [], f"Unexpected factor columns: {factor_cols}"
+
+
+@pytest.mark.parametrize("params", [[168], [168, 336]])
+def test_gen_factor_data_golden_values(tmp, monkeypatch, params):
+    """Factor column values written by gen_factor_data must match golden signal_multi_params output."""
+    df = _load_m5_candles()
+    run_ts = pd.Timestamp(df["candle_begin_time"].iloc[-1]).to_pydatetime()
+    handle, preprocess_mgr = make_factor_handle(tmp / f"golden_{'_'.join(map(str, params))}", df, run_ts)
+
+    fake_config = SimpleNamespace(precompute_factor_configs={_M5_FACTOR_NAME: params})
+    monkeypatch.setattr("core.preprocess.bmac_config", fake_config)
+
+    gen_factor_data(handle, run_ts, "spot")
+
+    result_dict = preprocess_mgr.read_candle(_M5_BATCH_KEY)
+    df_result = result_dict["BTCUSDT"]
+
+    for param in params:
+        col = f"{_M5_FACTOR_NAME}_{param}"
+        assert col in df_result.columns, f"Missing column {col!r}"
+        expected = load_golden_signal(param)
+        np.testing.assert_array_equal(
+            df_result[col].values, expected,
+            err_msg=f"gen_factor_data column {col!r} differs from golden. "
+                    "Re-run tests/fixtures/capture.py if algorithm changed intentionally.",
+        )
+
+
+def test_gen_factor_data_idempotent(tmp, monkeypatch):
+    """Calling gen_factor_data twice must produce identical output with no duplicate columns."""
+    df = _load_m5_candles()
+    run_ts = pd.Timestamp(df["candle_begin_time"].iloc[-1]).to_pydatetime()
+    handle, preprocess_mgr = make_factor_handle(tmp / "idempotent", df, run_ts)
+
+    fake_config = SimpleNamespace(precompute_factor_configs={_M5_FACTOR_NAME: [168]})
+    monkeypatch.setattr("core.preprocess.bmac_config", fake_config)
+
+    gen_factor_data(handle, run_ts, "spot")
+    first_values = preprocess_mgr.read_candle(_M5_BATCH_KEY)["BTCUSDT"][f"{_M5_FACTOR_NAME}_168"].values.copy()
+
+    gen_factor_data(handle, run_ts, "spot")
+    df_second = preprocess_mgr.read_candle(_M5_BATCH_KEY)["BTCUSDT"]
+
+    factor_cols = [c for c in df_second.columns if c == f"{_M5_FACTOR_NAME}_168"]
+    assert len(factor_cols) == 1, f"Duplicate factor columns after second call: {factor_cols}"
+    np.testing.assert_array_equal(df_second[f"{_M5_FACTOR_NAME}_168"].values, first_values)

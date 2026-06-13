@@ -233,11 +233,15 @@ def gen_batch_data(handle: BmacHandle, run_time: datetime, trade_type: str, df_m
     preprocess_mgr.set_candle(full_batch_name, run_time, market_dict)
 
     year_pivot_name = dict()
-    cur_year = run_time.astimezone(timezone.utc).year
+    run_utc = run_time.astimezone(timezone.utc)
+    cur_year = run_utc.year
+    in_new_year_week = run_utc.month == 1 and run_utc.day <= 7
     for year in range(start_year, end_year + 1):
         # 增量更新，这一块的数据，为了生成 pivot 准备的
+        # 跨年后一周内需同时更新上一年，之后只更新当前年
         if (Path(preprocess_mgr.format_data_file_path(f'market_pivot_{trade_type}_{year}')).exists()
-                and int(year) < cur_year - 1):
+                and (int(year) < cur_year - 1
+                     or (int(year) == cur_year - 1 and not in_new_year_week))):
             continue
 
         pivot_batch_name = f'{trade_type}_for_pivot_{batch_name}_{year}'
@@ -361,10 +365,13 @@ def gen_batch_data_incremental(handle: BmacHandle, run_time: datetime, trade_typ
 
     year_pivot_name = dict()
     if start_year is not None and end_year is not None:
-        cur_year = run_time.astimezone(timezone.utc).year
+        run_utc = run_time.astimezone(timezone.utc)
+        cur_year = run_utc.year
+        in_new_year_week = run_utc.month == 1 and run_utc.day <= 7
         for year in range(start_year, end_year + 1):
             if (Path(preprocess_mgr.format_data_file_path(f'market_pivot_{trade_type}_{year}')).exists()
-                    and int(year) < cur_year - 1):
+                    and (int(year) < cur_year - 1
+                         or (int(year) == cur_year - 1 and not in_new_year_week))):
                 continue
             pivot_batch_name = f'{trade_type}_for_pivot_{batch_name}_{year}'
             start_ts = pd.to_datetime(f'{year}-01-01 00:00:00+00:00')
@@ -384,11 +391,14 @@ def gen_pivot(handle: BmacHandle, run_time: datetime, trade_type: str, year_pivo
     offset_str = get_offset_from_runtime(run_time, handle.resample_interval)
     preprocess_mgr = preprocess_handle.preprocess_mgr_map[offset_str]
 
-    cur_year = run_time.astimezone(timezone.utc).year
+    run_utc = run_time.astimezone(timezone.utc)
+    cur_year = run_utc.year
+    in_new_year_week = run_utc.month == 1 and run_utc.day <= 7
     for year, pivot_names in year_pivot_names.items():
         # 增量更新，这一块的数据，为了生成 pivot 准备的
         if (Path(preprocess_mgr.format_data_file_path(f'market_pivot_{trade_type}_{year}')).exists()
-                and int(year) < cur_year - 1):
+                and (int(year) < cur_year - 1
+                     or (int(year) == cur_year - 1 and not in_new_year_week))):
             continue
         market_dict = dict()
         for name in pivot_names:
@@ -417,11 +427,14 @@ def gen_pivot_incremental(handle: BmacHandle, run_time: datetime, trade_type: st
     offset_str = get_offset_from_runtime(run_time, handle.resample_interval)
     preprocess_mgr = preprocess_handle.preprocess_mgr_map[offset_str]
 
-    cur_year = run_time.astimezone(timezone.utc).year
+    run_utc = run_time.astimezone(timezone.utc)
+    cur_year = run_utc.year
+    in_new_year_week = run_utc.month == 1 and run_utc.day <= 7
     for year, pivot_names in year_pivot_names.items():
         # Skip old years (matching gen_pivot behaviour exactly)
         if (Path(preprocess_mgr.format_data_file_path(f'market_pivot_{trade_type}_{year}')).exists()
-                and int(year) < cur_year - 1):
+                and (int(year) < cur_year - 1
+                     or (int(year) == cur_year - 1 and not in_new_year_week))):
             continue
 
         pivot_key = f'market_pivot_{trade_type}_{year}'
@@ -569,13 +582,12 @@ def _calc_symbol_factors(item, factor_modules_params):
     ctypes/cffi calls release the GIL, so ThreadPoolExecutor achieves true CPU parallelism.
     """
     symbol, df = item
-    result_dfs = [df]
+    factor_cols: dict[str, pd.Series] = {}
     for module, factor_name, param_list in factor_modules_params:
         raw = module.signal_multi_params(df, param_list)
-        factor_df = pd.DataFrame(raw).add_prefix(f'{factor_name}_')
-        factor_df.index = df.index
-        result_dfs.append(factor_df)
-    return symbol, pd.concat(result_dfs, axis=1)
+        for param_key, series in raw.items():
+            factor_cols[f'{factor_name}_{param_key}'] = series
+    return symbol, df.assign(**factor_cols)
 
 
 def gen_factor_data(handle: BmacHandle, run_time: datetime, trade_type: str):
