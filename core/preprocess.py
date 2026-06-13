@@ -590,9 +590,23 @@ def _calc_symbol_factors(item, factor_modules_params):
     return symbol, df.assign(**factor_cols)
 
 
+def _calc_one_factor(
+    item: tuple,
+    module,
+    factor_name: str,
+    param_list: list,
+) -> tuple:
+    """Worker: compute one factor for one symbol. Returns (symbol, factor_name, {param_key: Series})."""
+    symbol, df = item
+    raw = module.signal_multi_params(df, param_list)
+    return symbol, factor_name, raw
+
+
 def gen_factor_data(handle: BmacHandle, run_time: datetime, trade_type: str):
     """Compute pre-configured factor columns for all market_dict batches and write back.
 
+    Loads all batches into memory first, then fans out (symbol x factor) work units
+    to a single ThreadPoolExecutor so batch I/O and factor computation are fully decoupled.
     Called after gen_batch_data_incremental, before gen_pivot_incremental.
     Factor columns are named {factor_name}_{param}, matching factor_calc.py convention.
     """
@@ -608,27 +622,56 @@ def gen_factor_data(handle: BmacHandle, run_time: datetime, trade_type: str):
         for factor_name, param_list in factor_configs.items()
     ]
 
-    batch_idx = 1
+    # 1. Load all batches into memory (sequential, fast I/O)
     t_start = time.perf_counter()
-    total_symbols = 0
+    all_batches: dict[str, dict] = {}
+    batch_idx = 1
     while True:
         batch_key = f'{trade_type}_dict_batch{batch_idx}'
         if not preprocess_mgr.has_symbol(batch_key):
             break
-        market_dict: dict[str, pd.DataFrame] = preprocess_mgr.read_candle(batch_key)
-        max_workers = min(len(market_dict), os.cpu_count() or 8, 16)
-
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            updated = dict(
-                pool.map(
-                    lambda item: _calc_symbol_factors(item, factor_modules_params),
-                    market_dict.items(),
-                )
-            )
-
-        preprocess_mgr.set_candle(batch_key, run_time, updated)
-        total_symbols += len(updated)
+        all_batches[batch_key] = preprocess_mgr.read_candle(batch_key)
         batch_idx += 1
+
+    if not all_batches:
+        return
+
+    # 2. Flatten to work units: track (batch_key, symbol) alongside each job
+    work_meta: list[tuple[str, str]] = []
+    work_args: list[tuple] = []
+    for bk, market_dict in all_batches.items():
+        for symbol, df in market_dict.items():
+            for module, factor_name, param_list in factor_modules_params:
+                work_meta.append((bk, symbol))
+                work_args.append(((symbol, df), module, factor_name, param_list))
+
+    # 3. Execute all units in a single thread pool (GIL released by cffi C extensions)
+    max_workers = os.cpu_count() or 4
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [
+            pool.submit(_calc_one_factor, item, module, factor_name, param_list)
+            for item, module, factor_name, param_list in work_args
+        ]
+        raw_results = [f.result() for f in futures]
+
+    # 4. Merge: accumulate factor columns keyed by (batch_key, symbol)
+    factor_cols_map: dict[tuple, dict] = {}
+    for (bk, symbol), (_, factor_name, raw) in zip(work_meta, raw_results):
+        key = (bk, symbol)
+        if key not in factor_cols_map:
+            factor_cols_map[key] = {}
+        for param_key, series in raw.items():
+            factor_cols_map[key][f'{factor_name}_{param_key}'] = series
+
+    # 5. Assign factor columns back into DataFrames and write all batches
+    total_symbols = 0
+    for bk, market_dict in all_batches.items():
+        updated = {
+            symbol: df.assign(**factor_cols_map.get((bk, symbol), {}))
+            for symbol, df in market_dict.items()
+        }
+        preprocess_mgr.set_candle(bk, run_time, updated)
+        total_symbols += len(updated)
 
     elapsed = time.perf_counter() - t_start
     logger.ok(
