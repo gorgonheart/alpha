@@ -46,6 +46,24 @@ def _make_symbol_df(base_df: pd.DataFrame, symbol: str) -> pd.DataFrame:
     return df
 
 
+_PRICE_COLS = ["open", "high", "low", "close"]
+
+
+def _make_perturbed_symbol_df(base_df: pd.DataFrame, symbol: str, idx: int) -> pd.DataFrame:
+    """Clone base_df with symbol column set and price columns scaled by a per-symbol factor.
+    idx is 0-based index used to compute a unique but small scale factor.
+    Scaling all OHLC by the same factor preserves ratios (so factor formulas remain valid)
+    while making each symbol's factor output numerically distinct.
+    """
+    df = base_df.copy(deep=True)
+    df["symbol"] = symbol
+    scale = 1.0 + 0.01 * (idx + 1)  # 1.01, 1.02, 1.03, ... per symbol
+    for col in _PRICE_COLS:
+        if col in df.columns:
+            df[col] = df[col] * scale
+    return df
+
+
 def make_multi_batch_handle(
     tmp_path: Path,
     base_df: pd.DataFrame,
@@ -69,7 +87,10 @@ def make_multi_batch_handle(
 
     for batch_idx, symbol_list in enumerate(batches, start=1):
         batch_key = f"{trade_type}_dict_batch{batch_idx}"
-        market_dict = {sym: _make_symbol_df(base_df, sym) for sym in symbol_list}
+        market_dict = {
+            sym: _make_perturbed_symbol_df(base_df, sym, i)
+            for i, sym in enumerate(symbol_list)
+        }
         preprocess_mgr.save_data_file(batch_key, market_dict)
 
     handle = SimpleNamespace(
