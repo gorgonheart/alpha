@@ -71,6 +71,8 @@ preprocess = True
 # 留空 dict 则跳过因子预计算步骤
 precompute_factor_configs = {
     '动量因子210401修正': [168, 336],
+    'ILLQStdBbi45208':   [10000],
+    'CciV3':             [10000],
 }
 
 # 预处理数据拆分 Batch 大小

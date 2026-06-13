@@ -7,3 +7,6 @@ factors/c_ext/*.o
 factors/c_ext/*.exp
 factors/c_ext/*.lib
 factors/c_ext/Release/
+factors/c_ext/_momentum_core.c
+factors/c_ext/_illq_core.c
+factors/c_ext/_cci_core.c
