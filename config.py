@@ -76,7 +76,7 @@ precompute_factor_configs = {
 }
 
 # 预处理数据拆分 Batch 大小
-preprocess_num_batch = 128
+preprocess_num_batch = 256
 # 预处理数据近期 K 线条数（仓位管理框架）
 preprocess_num_recent = 3
 
