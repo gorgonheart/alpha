@@ -652,7 +652,15 @@ def gen_factor_data(handle: BmacHandle, run_time: datetime, trade_type: str):
             pool.submit(_calc_one_factor, item, module, factor_name, param_list)
             for item, module, factor_name, param_list in work_args
         ]
-        raw_results = [f.result() for f in futures]
+        raw_results = []
+        for (bk, symbol), fut in zip(work_meta, futures):
+            try:
+                raw_results.append(fut.result())
+            except Exception as exc:
+                logger.error(
+                    f'预计算因子 {trade_type} 失败: batch={bk}, symbol={symbol}, error={exc!r}'
+                )
+                raise
 
     # 4. Merge: accumulate factor columns keyed by (batch_key, symbol)
     factor_cols_map: dict[tuple, dict] = {}
