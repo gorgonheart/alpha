@@ -1,0 +1,9 @@
+# Files and directories excluded from git archive (production deployment)
+# Usage: git archive main | ssh user@server "tar -xf - -C ~/alpha"
+tests/             export-ignore
+docs/              export-ignore
+*.pyd              export-ignore
+diag_illq.py       export-ignore
+run_illq_tests.py  export-ignore
+illq_results.txt   export-ignore
+illq_results2.txt  export-ignore
