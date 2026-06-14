@@ -145,7 +145,7 @@ def fetch_update_binance_candles(handle: BmacHandle, run_time: datetime):
 def update_base_candles(handle: BmacHandle, run_time, trade_type, symbol_dfs):
     binance_handle: BinanceHandle = handle.get_binance_handle(trade_type)
     base_delta = convert_interval_to_timedelta(handle.base_interval)
-    asyncio.run(async_sleep_until_run_time(run_time + timedelta(minutes=3)))
+    asyncio.run(async_sleep_until_run_time(run_time + timedelta(minutes=2)))
 
     logger.info(f'开始合并币安 {trade_type} {handle.base_interval} K 线, 当前时间={now_time_str()}')
 
