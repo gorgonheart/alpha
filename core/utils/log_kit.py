@@ -117,7 +117,7 @@ class SimonsLogger:
 
     def _initialize_logger(self, name):
         self.logger = logging.getLogger(name)
-        self.logger.setLevel(logging.DEBUG)
+        self.logger.setLevel(logging.INFO)
 
         # 如果有handlers，就清理掉
         if self.logger.hasHandlers():

@@ -596,11 +596,13 @@ def preprocess_type_data(handle: BmacHandle, run_time: datetime, trade_type: str
         for col, pivot_name in year_pivot_name.items():
             year_pivot_names[col].append(pivot_name)
 
-    time_elapsed = time.perf_counter() - t_start
-    logger.ok(f'预处理 Market Dict (含因子) {trade_type} 完成, 当前时间={now_time_str()}, 耗时 {time_elapsed:.1f} 秒')
+    market_dict_elapsed = time.perf_counter() - t_start
+    logger.ok(f'预处理 Market Dict (含因子) {trade_type} 完成, 当前时间={now_time_str()}, 耗时 {market_dict_elapsed:.1f} 秒')
 
     # §3.4 Arrow 发布：原子写出消费者 mmap 读取的快照（每 symbol 一 batch + manifest）。
+    t_publish = time.perf_counter()
     publish_arrow_snapshot_for_type(handle, run_time, trade_type, market_dict)
+    publish_elapsed = time.perf_counter() - t_publish
 
     # 竞态修复（§3.2）：消费者的 gate 标志必须在因子写盘 + Arrow 发布之后才打。
     # 此时批次（含因子）与快照都已落盘，消费者看到标志即代表数据完整。
@@ -608,8 +610,15 @@ def preprocess_type_data(handle: BmacHandle, run_time: datetime, trade_type: str
 
     t_start = time.perf_counter()
     gen_pivot_incremental(handle, run_time, trade_type, year_pivot_names)
-    time_elapsed = time.perf_counter() - t_start
-    logger.ok(f'预处理 Pivot Table {trade_type} 完成, 当前时间={now_time_str()}, 耗时 {time_elapsed:.1f} 秒')
+    pivot_elapsed = time.perf_counter() - t_start
+    logger.ok(f'预处理 Pivot Table {trade_type} 完成, 当前时间={now_time_str()}, 耗时 {pivot_elapsed:.1f} 秒')
+
+    # Lever 1 决策依据：单轮各阶段墙钟分解（grep [io-stat] phase）。market_dict 阶段含
+    # 批次读回+富集+因子计算+原始批次写盘；逐文件读写明细见上方 [io-stat] read/write 行。
+    n_batches = idx - 1
+    logger.info(f'[io-stat] phase {trade_type} symbols={len(market_dict)} batches={n_batches} '
+                f'market_dict={market_dict_elapsed:.1f}s publish={publish_elapsed:.1f}s '
+                f'pivot={pivot_elapsed:.1f}s')
 
 
 def preprocess_offset_data(handle: BmacHandle, run_time: datetime, symbol_begin_time_spot, symbol_begin_time_swap):

@@ -1,10 +1,13 @@
 import os
 import shutil
+import time
 from datetime import datetime
 from glob import glob
 from pathlib import Path
 
 import pandas as pd
+
+from core.utils.log_kit import logger
 
 
 class CandleFileReader:
@@ -63,13 +66,23 @@ class CandleFileReader:
         :return:        DataFrame
         """
         df_path = self.format_data_file_path(symbol)
+        _t0 = time.perf_counter()
         if self.save_type == 'feather':
             df = pd.read_feather(df_path)
-            return df
         elif self.save_type == 'parquet':
-            return pd.read_parquet(df_path)
+            df = pd.read_parquet(df_path)
         elif self.save_type == 'pickle' or self.save_type == 'compressed_pickle':
-            return pd.read_pickle(df_path)
+            df = pd.read_pickle(df_path)
+        else:
+            return None
+        _dt = time.perf_counter() - _t0
+        try:
+            _mb = os.path.getsize(df_path) / 1e6
+            logger.debug(f'[io-stat] read {self.save_type} {symbol} dir={self.base_dir.name} '
+                         f'size={_mb:.1f}MB took={_dt * 1000:.0f}ms')
+        except OSError:
+            pass
+        return df
 
     def has_symbol(self, symbol) -> bool:
         """
@@ -104,6 +117,7 @@ class CandleFileManager(CandleFileReader):
         df_path = self.format_data_file_path(symbol)
         if os.path.exists(df_path):
             os.remove(df_path)
+        _t0 = time.perf_counter()
         if self.save_type == 'feather':
             df = df.reset_index(drop=True)
             df.to_feather(df_path)
@@ -119,6 +133,14 @@ class CandleFileManager(CandleFileReader):
                 df.to_pickle(df_path)
             else:
                 raise ValueError(f'Symbol {symbol} if of type {type(df)}, cannot save as compressed_pickle')
+        _dt = time.perf_counter() - _t0
+        try:
+            _mb = os.path.getsize(df_path) / 1e6
+            _rows = len(df) if hasattr(df, '__len__') else -1
+            logger.debug(f'[io-stat] write {self.save_type} {symbol} dir={self.base_dir.name} '
+                         f'rows={_rows} size={_mb:.1f}MB took={_dt * 1000:.0f}ms')
+        except OSError:
+            pass
 
     def set_candle(self, symbol, run_time, df: pd.DataFrame):
         """
