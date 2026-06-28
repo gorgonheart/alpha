@@ -86,6 +86,11 @@ def fill_gaps(df: pd.DataFrame, delta: pd.Timedelta) -> pd.DataFrame:
     if len(df) == len(time_range) and (df['candle_begin_time'].reset_index(drop=True) == time_range).all():
         return df
 
+    # 记录填补前的整数列 dtype：how='left' merge 会对缺失行注入 NaN，把整数列提升为
+    # float64，fillna(0) 填值后 dtype 不回落。整数列（如 trade_num）本应保持 int64，
+    # 填补完成、无 NaN 后再 astype 还原，避免下游 Arrow 单 schema 对账出现 dtype 分歧。
+    int_dtypes = {col: dt for col, dt in df.dtypes.items() if pd.api.types.is_integer_dtype(dt)}
+
     benchmark = pd.DataFrame({'candle_begin_time': time_range})
 
     # 与基准数据合并
@@ -107,6 +112,10 @@ def fill_gaps(df: pd.DataFrame, delta: pd.Timedelta) -> pd.DataFrame:
     df['trade_num'] = df['trade_num'].fillna(0)
     df['taker_buy_base_asset_volume'] = df['taker_buy_base_asset_volume'].fillna(0)
     df['taker_buy_quote_asset_volume'] = df['taker_buy_quote_asset_volume'].fillna(0)
+
+    # 还原整数列 dtype（此时缺失行已 fillna，无 NaN，astype 安全）
+    for col, dt in int_dtypes.items():
+        df[col] = df[col].astype(dt)
 
     df['candle_end_time'] = df['candle_begin_time'] + delta
     df.set_index('candle_end_time', inplace=True)

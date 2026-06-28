@@ -46,6 +46,10 @@ def _baseline_fill_gaps(df: pd.DataFrame, delta: timedelta) -> pd.DataFrame:
     if len(df) == len(time_range) and (df["candle_begin_time"].reset_index(drop=True) == time_range).all():
         return df
 
+    # 见 core.resample_candle.fill_gaps：merge 注入 NaN 会把整数列提升为 float64，
+    # 填补完成后须还原为原始整数 dtype，使 golden baseline 与生产实现一致。
+    int_dtypes = {col: dt for col, dt in df.dtypes.items() if pd.api.types.is_integer_dtype(dt)}
+
     benchmark = pd.DataFrame({"candle_begin_time": time_range})
     df = pd.merge(left=benchmark, right=df, on="candle_begin_time", how="left", sort=True)
 
@@ -59,6 +63,9 @@ def _baseline_fill_gaps(df: pd.DataFrame, delta: timedelta) -> pd.DataFrame:
 
     for column in _NUMERIC_ZERO_FILL_COLUMNS:
         df[column] = df[column].fillna(0)
+
+    for col, dt in int_dtypes.items():
+        df[col] = df[col].astype(dt)
 
     df["candle_end_time"] = df["candle_begin_time"] + delta
     df.set_index("candle_end_time", inplace=True)

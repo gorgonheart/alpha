@@ -69,9 +69,21 @@ static void phase1(
     for (int i = 0; i < tlen; i++) tp[i] = (c[i] + h[i] + l[i]) / 3.0;
     if (tlen >= 2) tp[0] = tp[1];
 
-    /* h4min = rolling(4).min(h), l4max = rolling(4).max(l) */
-    roll_min(h, tlen, 4, h4min);
-    roll_max(l, tlen, 4, l4max);
+    /* h4min = rolling(4, min_periods=4).min(h)
+     * l4max = rolling(4, min_periods=4).max(l)
+     * Python 原版在 rolling 前先做 h[0]=h[1], l[0]=l[1]，
+     * 且 pandas rolling(4) 默认 min_periods=4（前3行为 NaN）。
+     * 这里用临时数组复制 h/l 并做同样替换，rolling 后将前3行置 NaN。 */
+    double *h_work = (double *)malloc(tlen * sizeof(double));
+    double *l_work = (double *)malloc(tlen * sizeof(double));
+    memcpy(h_work, h, tlen * sizeof(double));
+    memcpy(l_work, l, tlen * sizeof(double));
+    if (tlen >= 2) { h_work[0] = h_work[1]; l_work[0] = l_work[1]; }
+    roll_min(h_work, tlen, 4, h4min);
+    roll_max(l_work, tlen, 4, l4max);
+    free(h_work); free(l_work);
+    /* 前3行不满足 min_periods=4，置 NaN（与 pandas 默认行为一致） */
+    for (int i = 0; i < 3 && i < tlen; i++) { h4min[i] = NAN; l4max[i] = NAN; }
 
     /* pctchange = (h4min - l4max) / l4max */
     for (int i = 0; i < tlen; i++) {

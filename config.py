@@ -53,7 +53,7 @@ proxy = 'http://127.0.0.1:7897'  # 如果你用clash的话
 # 只更新部分分钟偏移（hour_offset），可有效节省你的硬盘，
 # 当然如果你配置了新的hour_offset策略，需要同步更新数据中心这边的配置
 # 默认所有的offset都需要更新，kline_count_1h=25000，大概占用68GB存储
-enabled_hour_offsets = ( '10m','40m','20m',)
+enabled_hour_offsets = ( '10m','40m','30m',)
 
 # Base 周期，通常设为 5m，与 Data API 一致
 base_interval = '5m'
@@ -70,15 +70,18 @@ preprocess = True
 # 预计算因子配置：{因子模块名（不含 factors. 前缀）: [param 列表]}
 # 留空 dict 则跳过因子预计算步骤
 precompute_factor_configs = {
-    '动量因子210401修正': [168, 336],
-    'ILLQStdBbi45208':   [10000],
-    'CciV3':             [10000],
+    '动量因子210401修正': [10248, 8568, 13608, 13608],
+    'ILLQStdBbi45208':   [2856, 1344, 1512, 672, 168],
+    'CciV3':             [1176,10248,10248,5208],
 }
-
 # 预处理数据拆分 Batch 大小
-preprocess_num_batch = 256
+preprocess_num_batch = 180
 # 预处理数据近期 K 线条数（仓位管理框架）
 preprocess_num_recent = 3
+# Arrow 发布深度（设计文档 §3.5）：生产者只在 Arrow 发布文件里裁到这个深度；
+# 自身 base/recent pkl 文件仍保留全历史（因子正确性 + 增量）。
+# 约束：publish_kline_num >= 消费者 get_kline_num(4050) + run_time 过滤余量，5000 安全。
+publish_kline_num = 5000
 
 # 如果有 json 配置，则使用 json 配置覆盖掉 config.py 中的配置
 json_file_config = get_file_path('config.json', as_path_type=True)

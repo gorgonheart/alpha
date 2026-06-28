@@ -16,6 +16,7 @@ from core.utils.time import now_time_str
 
 from .candle_manager import CandleFileReader
 from .handle import BmacHandle
+from .arrow_publish import publish_arrow_snapshot
 from .utils.time import get_offset_from_runtime, wait_until_ready
 
 PIVOT_COLUMNS = ['candle_begin_time', 'symbol', 'open', 'close', 'avg_price_1m', 'funding_fee']
@@ -147,7 +148,7 @@ def calc_match(symbol_spot, symbol_swap, symbol_begin_time_spot, symbol_begin_ti
 
 
 def gen_batch_data(handle: BmacHandle, run_time: datetime, trade_type: str, df_match: pd.DataFrame,
-                   symbol_list: list[str], batch_name: str):
+                   symbol_list: list[str], batch_name: str, with_factors: bool = False):
     if not symbol_list:
         return
 
@@ -230,6 +231,12 @@ def gen_batch_data(handle: BmacHandle, run_time: datetime, trade_type: str, df_m
                 end_year = max_year
 
     full_batch_name = f'{trade_type}_dict_{batch_name}'
+    if with_factors:
+        factor_modules_params = _load_factor_modules_params()
+        market_dict = {
+            symbol: apply_precomputed_factors(df, factor_modules_params)
+            for symbol, df in market_dict.items()
+        }
     preprocess_mgr.set_candle(full_batch_name, run_time, market_dict)
 
     year_pivot_name = dict()
@@ -264,7 +271,7 @@ def gen_batch_data(handle: BmacHandle, run_time: datetime, trade_type: str, df_m
 
 
 def gen_batch_data_incremental(handle: BmacHandle, run_time: datetime, trade_type: str, df_match: pd.DataFrame,
-                               symbol_list: list[str], batch_name: str):
+                               symbol_list: list[str], batch_name: str, with_factors: bool = False):
     if not symbol_list:
         return
 
@@ -274,7 +281,8 @@ def gen_batch_data_incremental(handle: BmacHandle, run_time: datetime, trade_typ
     full_batch_name = f'{trade_type}_dict_{batch_name}'
 
     if not preprocess_mgr.has_symbol(full_batch_name):
-        return gen_batch_data(handle, run_time, trade_type, df_match, symbol_list, batch_name)
+        return gen_batch_data(handle, run_time, trade_type, df_match, symbol_list, batch_name,
+                              with_factors=with_factors)
 
     old_market_dict: dict[str, pd.DataFrame] = preprocess_mgr.read_candle(full_batch_name)
 
@@ -360,6 +368,13 @@ def gen_batch_data_incremental(handle: BmacHandle, run_time: datetime, trade_typ
         max_year = df_sym['candle_begin_time'].max().year
         if end_year is None or end_year < max_year:
             end_year = max_year
+
+    if with_factors:
+        factor_modules_params = _load_factor_modules_params()
+        new_market_dict = {
+            symbol: apply_precomputed_factors(df, factor_modules_params)
+            for symbol, df in new_market_dict.items()
+        }
 
     preprocess_mgr.set_candle(full_batch_name, run_time, new_market_dict)
 
@@ -504,6 +519,40 @@ def gen_pivot_incremental(handle: BmacHandle, run_time: datetime, trade_type: st
     preprocess_mgr.save_ready(f'market_pivot_{trade_type}', run_time)
 
 
+def publish_arrow_snapshot_for_type(handle: BmacHandle, run_time: datetime, trade_type: str,
+                                    batch_names: list[str]):
+    """§3.4 发布步骤：把本轮各批次（已含因子）合并为单个 Arrow IPC 快照。
+
+    输出 ``preprocess_1h_resample/{minute}m/{trade_type}_dict_{epoch}.arrow``，
+    与消费者 gate 标志 ``{trade_type}_dict_{epoch}.ready`` 同名（共享 stem）。
+    纯加法：失败不影响既有 pkl 批次路径与 gate 标志，消费者可自动 fallback。
+    """
+    if not batch_names:
+        return
+
+    offset_str = get_offset_from_runtime(run_time, handle.resample_interval)
+    preprocess_mgr = handle.preprocess_handle.preprocess_mgr_map[offset_str]
+
+    publish_kline_num = getattr(bmac_config, 'publish_kline_num', 5000)
+
+    market_dict: dict[str, pd.DataFrame] = {}
+    for batch_name in batch_names:
+        if preprocess_mgr.has_symbol(batch_name):
+            market_dict.update(preprocess_mgr.read_candle(batch_name))
+
+    if not market_dict:
+        return
+
+    epoch = int(run_time.timestamp())
+    out_path = Path(preprocess_mgr.base_dir) / f'{trade_type}_dict_{epoch}.arrow'
+    try:
+        # gate 标志由上层 save_ready 统一管理（清理过期 + 单一信号），此处不写 .ready。
+        publish_arrow_snapshot(market_dict, out_path, publish_kline_num, write_ready=False)
+    except Exception as exc:
+        # 加法步骤：发布失败仅记录，不影响既有 pkl 路径与后续 gate 标志。
+        logger.error(f'Arrow 发布 {trade_type} 失败（不影响 pkl 路径）: {exc!r}')
+
+
 def preprocess_type_data(handle: BmacHandle, run_time: datetime, trade_type: str, df_match: pd.DataFrame):
     num_batch = handle.preprocess_handle.num_batch
     exg_mgr = handle.exg_mgr
@@ -524,23 +573,32 @@ def preprocess_type_data(handle: BmacHandle, run_time: datetime, trade_type: str
     idx = 1
     year_pivot_names = defaultdict(list)
     t_start = time.perf_counter()
+    batch_names: list[str] = []
     while symbol_list:
         if len(symbol_list) > num_batch:
             batch, symbol_list = symbol_list[:num_batch], symbol_list[num_batch:]
         else:
             batch, symbol_list = symbol_list, []
 
-        full_batch_name, year_pivot_name = gen_batch_data_incremental(handle, run_time, trade_type, df_match, batch, f'batch{idx}')
+        # Lever 2: write each batch once, already carrying factor columns. This removes
+        # the legacy gen_factor_data read-back + full rewrite round-trip.
+        full_batch_name, year_pivot_name = gen_batch_data_incremental(
+            handle, run_time, trade_type, df_match, batch, f'batch{idx}', with_factors=True)
+        batch_names.append(full_batch_name)
         idx += 1
 
         for col, pivot_name in year_pivot_name.items():
             year_pivot_names[col].append(pivot_name)
 
-    preprocess_mgr.save_ready(f'{trade_type}_dict', run_time)
     time_elapsed = time.perf_counter() - t_start
-    logger.ok(f'预处理 Market Dict {trade_type} 完成, 当前时间={now_time_str()}, 耗时 {time_elapsed:.1f} 秒')
+    logger.ok(f'预处理 Market Dict (含因子) {trade_type} 完成, 当前时间={now_time_str()}, 耗时 {time_elapsed:.1f} 秒')
 
-    gen_factor_data(handle, run_time, trade_type)
+    # §3.4 Arrow 发布：原子写出消费者 mmap 读取的快照（每 symbol 一 batch + manifest）。
+    publish_arrow_snapshot_for_type(handle, run_time, trade_type, batch_names)
+
+    # 竞态修复（§3.2）：消费者的 gate 标志必须在因子写盘 + Arrow 发布之后才打。
+    # 此时批次（含因子）与快照都已落盘，消费者看到标志即代表数据完整。
+    preprocess_mgr.save_ready(f'{trade_type}_dict', run_time)
 
     t_start = time.perf_counter()
     gen_pivot_incremental(handle, run_time, trade_type, year_pivot_names)
@@ -577,17 +635,45 @@ def preprocess_match_symbols(handle: BmacHandle, run_time: datetime, symbol_begi
     return df_match
 
 
-def _calc_symbol_factors(item, factor_modules_params):
-    """Worker: compute all pre-configured factor columns for one symbol DataFrame.
-    ctypes/cffi calls release the GIL, so ThreadPoolExecutor achieves true CPU parallelism.
+def _load_factor_modules_params():
+    """Resolve precompute_factor_configs into [(module, factor_name, param_list), ...].
+
+    Returns an empty list when no factors are configured. Shared by gen_factor_data
+    (two-step path) and the embedded one-step path so both compute identical columns.
     """
-    symbol, df = item
+    factor_configs = getattr(bmac_config, 'precompute_factor_configs', {})
+    if not factor_configs:
+        return []
+    return [
+        (importlib.import_module(f'factors.{factor_name}'), factor_name, param_list)
+        for factor_name, param_list in factor_configs.items()
+    ]
+
+
+def apply_precomputed_factors(df: pd.DataFrame, factor_modules_params) -> pd.DataFrame:
+    """Compute all configured factor columns for one symbol DataFrame and assign them.
+
+    Columns are named ``{factor_name}_{param}`` (factor_calc.py convention). This is the
+    single source of truth for factor embedding: gen_factor_data and the one-step
+    gen_batch_data_incremental(with_factors=True) both call it, guaranteeing the
+    write-once path is value/dtype-identical to the legacy two-step path.
+    """
+    if not factor_modules_params:
+        return df
     factor_cols: dict[str, pd.Series] = {}
     for module, factor_name, param_list in factor_modules_params:
         raw = module.signal_multi_params(df, param_list)
         for param_key, series in raw.items():
             factor_cols[f'{factor_name}_{param_key}'] = series
-    return symbol, df.assign(**factor_cols)
+    return df.assign(**factor_cols)
+
+
+def _calc_symbol_factors(item, factor_modules_params):
+    """Worker: compute all pre-configured factor columns for one symbol DataFrame.
+    ctypes/cffi calls release the GIL, so ThreadPoolExecutor achieves true CPU parallelism.
+    """
+    symbol, df = item
+    return symbol, apply_precomputed_factors(df, factor_modules_params)
 
 
 def _calc_one_factor(
@@ -610,17 +696,12 @@ def gen_factor_data(handle: BmacHandle, run_time: datetime, trade_type: str):
     Called after gen_batch_data_incremental, before gen_pivot_incremental.
     Factor columns are named {factor_name}_{param}, matching factor_calc.py convention.
     """
-    factor_configs = getattr(bmac_config, 'precompute_factor_configs', {})
-    if not factor_configs:
+    factor_modules_params = _load_factor_modules_params()
+    if not factor_modules_params:
         return
 
     offset_str = get_offset_from_runtime(run_time, handle.resample_interval)
     preprocess_mgr = handle.preprocess_handle.preprocess_mgr_map[offset_str]
-
-    factor_modules_params = [
-        (importlib.import_module(f'factors.{factor_name}'), factor_name, param_list)
-        for factor_name, param_list in factor_configs.items()
-    ]
 
     # 1. Load all batches into memory (sequential, fast I/O)
     t_start = time.perf_counter()
