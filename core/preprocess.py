@@ -16,7 +16,7 @@ from core.utils.time import now_time_str
 
 from .candle_manager import CandleFileReader
 from .handle import BmacHandle
-from .arrow_publish import publish_arrow_snapshot
+from .arrow_publish import cleanup_old_snapshots, publish_arrow_snapshot
 from .utils.time import get_offset_from_runtime, wait_until_ready
 
 PIVOT_COLUMNS = ['candle_begin_time', 'symbol', 'open', 'close', 'avg_price_1m', 'funding_fee']
@@ -150,7 +150,7 @@ def calc_match(symbol_spot, symbol_swap, symbol_begin_time_spot, symbol_begin_ti
 def gen_batch_data(handle: BmacHandle, run_time: datetime, trade_type: str, df_match: pd.DataFrame,
                    symbol_list: list[str], batch_name: str, with_factors: bool = False):
     if not symbol_list:
-        return
+        return None, dict(), dict()
 
     symbol_list = sorted(symbol_list)
 
@@ -267,13 +267,13 @@ def gen_batch_data(handle: BmacHandle, run_time: datetime, trade_type: str, df_m
                  f'数据源={dict(sources)}, 当前时间={now_time_str()}, '
                  f'耗时 {time_elapsed:.1f} 秒')
 
-    return full_batch_name, year_pivot_name
+    return full_batch_name, year_pivot_name, market_dict
 
 
 def gen_batch_data_incremental(handle: BmacHandle, run_time: datetime, trade_type: str, df_match: pd.DataFrame,
                                symbol_list: list[str], batch_name: str, with_factors: bool = False):
     if not symbol_list:
-        return
+        return None, dict(), dict()
 
     offset_str = get_offset_from_runtime(run_time, handle.resample_interval)
     preprocess_handle = handle.preprocess_handle
@@ -398,7 +398,7 @@ def gen_batch_data_incremental(handle: BmacHandle, run_time: datetime, trade_typ
             preprocess_mgr.set_candle(pivot_batch_name, run_time, market_dict_for_pivot)
             year_pivot_name[year] = pivot_batch_name
 
-    return full_batch_name, year_pivot_name
+    return full_batch_name, year_pivot_name, new_market_dict
 
 
 def gen_pivot(handle: BmacHandle, run_time: datetime, trade_type: str, year_pivot_names: dict[str, list]):
@@ -520,14 +520,17 @@ def gen_pivot_incremental(handle: BmacHandle, run_time: datetime, trade_type: st
 
 
 def publish_arrow_snapshot_for_type(handle: BmacHandle, run_time: datetime, trade_type: str,
-                                    batch_names: list[str]):
-    """§3.4 发布步骤：把本轮各批次（已含因子）合并为单个 Arrow IPC 快照。
+                                    market_dict: dict[str, pd.DataFrame]):
+    """§3.4 发布步骤：把本轮（已含因子）的内存 ``market_dict`` 写为单个 Arrow IPC 快照。
 
     输出 ``preprocess_1h_resample/{minute}m/{trade_type}_dict_{epoch}.arrow``，
     与消费者 gate 标志 ``{trade_type}_dict_{epoch}.ready`` 同名（共享 stem）。
     纯加法：失败不影响既有 pkl 批次路径与 gate 标志，消费者可自动 fallback。
+
+    Finding 1：直接复用批次生成时已在内存里的 ``market_dict``，不再从磁盘回读
+    ``{type}_dict_batch*`` pkl（消除约 2.56GB/轮/offset 的无谓读盘）。
     """
-    if not batch_names:
+    if not market_dict:
         return
 
     offset_str = get_offset_from_runtime(run_time, handle.resample_interval)
@@ -535,19 +538,13 @@ def publish_arrow_snapshot_for_type(handle: BmacHandle, run_time: datetime, trad
 
     publish_kline_num = getattr(bmac_config, 'publish_kline_num', 5000)
 
-    market_dict: dict[str, pd.DataFrame] = {}
-    for batch_name in batch_names:
-        if preprocess_mgr.has_symbol(batch_name):
-            market_dict.update(preprocess_mgr.read_candle(batch_name))
-
-    if not market_dict:
-        return
-
     epoch = int(run_time.timestamp())
     out_path = Path(preprocess_mgr.base_dir) / f'{trade_type}_dict_{epoch}.arrow'
     try:
         # gate 标志由上层 save_ready 统一管理（清理过期 + 单一信号），此处不写 .ready。
         publish_arrow_snapshot(market_dict, out_path, publish_kline_num, write_ready=False)
+        # Finding 2：清理过期 epoch 快照，避免 {type}_dict_{epoch}.arrow 无限堆积。
+        cleanup_old_snapshots(preprocess_mgr.base_dir, trade_type, keep=2)
     except Exception as exc:
         # 加法步骤：发布失败仅记录，不影响既有 pkl 路径与后续 gate 标志。
         logger.error(f'Arrow 发布 {trade_type} 失败（不影响 pkl 路径）: {exc!r}')
@@ -573,7 +570,7 @@ def preprocess_type_data(handle: BmacHandle, run_time: datetime, trade_type: str
     idx = 1
     year_pivot_names = defaultdict(list)
     t_start = time.perf_counter()
-    batch_names: list[str] = []
+    market_dict: dict[str, pd.DataFrame] = {}
     while symbol_list:
         if len(symbol_list) > num_batch:
             batch, symbol_list = symbol_list[:num_batch], symbol_list[num_batch:]
@@ -582,9 +579,10 @@ def preprocess_type_data(handle: BmacHandle, run_time: datetime, trade_type: str
 
         # Lever 2: write each batch once, already carrying factor columns. This removes
         # the legacy gen_factor_data read-back + full rewrite round-trip.
-        full_batch_name, year_pivot_name = gen_batch_data_incremental(
+        _full_batch_name, year_pivot_name, batch_market_dict = gen_batch_data_incremental(
             handle, run_time, trade_type, df_match, batch, f'batch{idx}', with_factors=True)
-        batch_names.append(full_batch_name)
+        # Finding 1: keep the in-memory dict so publish never re-reads the batch pkl.
+        market_dict.update(batch_market_dict)
         idx += 1
 
         for col, pivot_name in year_pivot_name.items():
@@ -594,7 +592,7 @@ def preprocess_type_data(handle: BmacHandle, run_time: datetime, trade_type: str
     logger.ok(f'预处理 Market Dict (含因子) {trade_type} 完成, 当前时间={now_time_str()}, 耗时 {time_elapsed:.1f} 秒')
 
     # §3.4 Arrow 发布：原子写出消费者 mmap 读取的快照（每 symbol 一 batch + manifest）。
-    publish_arrow_snapshot_for_type(handle, run_time, trade_type, batch_names)
+    publish_arrow_snapshot_for_type(handle, run_time, trade_type, market_dict)
 
     # 竞态修复（§3.2）：消费者的 gate 标志必须在因子写盘 + Arrow 发布之后才打。
     # 此时批次（含因子）与快照都已落盘，消费者看到标志即代表数据完整。

@@ -32,7 +32,7 @@ def run_full_batch_and_pivot(case: Module3Case, tmp_root: Path, rows: int, run_t
     handle, binance_mgr, preprocess_mgr = make_minimal_handle(
         tmp_root, case, df_resample_for_binance=df_slice, run_time=run_ts
     )
-    full_batch_name, year_pivot_name = gen_batch_data(
+    full_batch_name, year_pivot_name, _ = gen_batch_data(
         handle, run_time, case.trade_type, case.df_match.copy(deep=True), [case.symbol], "batch1"
     )
     year_pivot_names = {}
@@ -73,7 +73,7 @@ def test_gen_pivot_incremental_first_run_matches_full_run(tmp):
     handle_full, binance_mgr_full, preprocess_mgr_full = make_minimal_handle(
         tmp / "full", case, df_resample_for_binance=df_full.iloc[:rows].reset_index(drop=True), run_time=run_ts
     )
-    full_batch_name, year_pivot_name = gen_batch_data(
+    full_batch_name, year_pivot_name, _ = gen_batch_data(
         handle_full, run_time, case.trade_type, case.df_match.copy(deep=True), [case.symbol], "batch1"
     )
     year_pivot_names = {y: [n] for y, n in year_pivot_name.items()}
@@ -83,7 +83,7 @@ def test_gen_pivot_incremental_first_run_matches_full_run(tmp):
     handle_inc, binance_mgr_inc, preprocess_mgr_inc = make_minimal_handle(
         tmp / "incremental", case, df_resample_for_binance=df_full.iloc[:rows].reset_index(drop=True), run_time=run_ts
     )
-    inc_batch_name, year_pivot_name_inc = gen_batch_data(
+    inc_batch_name, year_pivot_name_inc, _ = gen_batch_data(
         handle_inc, run_time, case.trade_type, case.df_match.copy(deep=True), [case.symbol], "batch1"
     )
     year_pivot_names_inc = {y: [n] for y, n in year_pivot_name_inc.items()}
@@ -122,7 +122,7 @@ def test_gen_pivot_incremental_second_run_appends_new_row_without_full_rebuild(t
         df_resample_for_binance=df_full.iloc[:total_rows].reset_index(drop=True),
         run_time=run_ts_new,
     )
-    full_batch_name, year_pivot_name = gen_batch_data(
+    full_batch_name, year_pivot_name, _ = gen_batch_data(
         handle_full, run_time_new, case.trade_type, case.df_match.copy(deep=True), [case.symbol], "batch1"
     )
     year_pivot_names = {y: [n] for y, n in year_pivot_name.items()}
@@ -135,7 +135,7 @@ def test_gen_pivot_incremental_second_run_appends_new_row_without_full_rebuild(t
         df_resample_for_binance=df_full.iloc[:old_rows].reset_index(drop=True),
         run_time=run_ts_old,
     )
-    inc_batch_name_old, year_pivot_name_old = gen_batch_data(
+    inc_batch_name_old, year_pivot_name_old, _ = gen_batch_data(
         handle_inc, run_time_old, case.trade_type, case.df_match.copy(deep=True), [case.symbol], "batch1"
     )
     year_pivot_names_old = {y: [n] for y, n in year_pivot_name_old.items()}
@@ -146,7 +146,7 @@ def test_gen_pivot_incremental_second_run_appends_new_row_without_full_rebuild(t
     binance_mgr_inc.save_ready(case.symbol, run_time_new)
 
     from core.preprocess import gen_batch_data_incremental
-    inc_batch_name_new, year_pivot_name_new = gen_batch_data_incremental(
+    inc_batch_name_new, year_pivot_name_new, _ = gen_batch_data_incremental(
         handle_inc, run_time_new, case.trade_type, case.df_match.copy(deep=True), [case.symbol], "batch1"
     )
     year_pivot_names_new = {y: [n] for y, n in year_pivot_name_new.items()}
@@ -187,7 +187,7 @@ def test_gen_pivot_incremental_second_run_benchmark_matches_full_run_and_is_not_
         df_resample_for_binance=df_full.iloc[:total_rows].reset_index(drop=True),
         run_time=run_ts_new,
     )
-    _, ypn_full = gen_batch_data(
+    _, ypn_full, _ = gen_batch_data(
         handle_full, run_time_new, bench_case.trade_type,
         bench_case.df_match.copy(deep=True), [bench_case.symbol], "bm",
     )
@@ -202,7 +202,7 @@ def test_gen_pivot_incremental_second_run_benchmark_matches_full_run_and_is_not_
         df_resample_for_binance=df_full.iloc[:old_rows].reset_index(drop=True),
         run_time=run_ts_old,
     )
-    _, ypn_old = gen_batch_data(
+    _, ypn_old, _ = gen_batch_data(
         handle_inc, run_time_old, bench_case.trade_type,
         bench_case.df_match.copy(deep=True), [bench_case.symbol], "bm",
     )
@@ -221,7 +221,7 @@ def test_gen_pivot_incremental_second_run_benchmark_matches_full_run_and_is_not_
         df_full.iloc[:total_rows].reset_index(drop=True).copy(deep=True),
     )
     bm_binance_mgr.save_ready(bench_case.symbol, run_time_new)
-    _, ypn_new = gen_batch_data_incremental(
+    _, ypn_new, _ = gen_batch_data_incremental(
         handle_inc, run_time_new, bench_case.trade_type,
         bench_case.df_match.copy(deep=True), [bench_case.symbol], "bm",
     )

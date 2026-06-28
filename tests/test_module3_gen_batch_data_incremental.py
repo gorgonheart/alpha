@@ -62,7 +62,7 @@ def test_gen_batch_data_incremental_first_run_matches_full_run(case, tmp):
     full_result = gen_batch_data(
         handle_full, run_time, case.trade_type, case.df_match.copy(deep=True), [case.symbol], "batch1"
     )
-    full_batch_name, _ = full_result
+    full_batch_name, _, _ = full_result
     expected_market_dict = preprocess_mgr_full.read_candle(full_batch_name)
 
     candidate = get_incremental_candidate()
@@ -75,7 +75,7 @@ def test_gen_batch_data_incremental_first_run_matches_full_run(case, tmp):
     inc_result = candidate(
         handle_inc, run_time, case.trade_type, case.df_match.copy(deep=True), [case.symbol], "batch1"
     )
-    inc_batch_name, _ = inc_result
+    inc_batch_name, _, _ = inc_result
 
     actual_market_dict = preprocess_mgr_inc.read_candle(inc_batch_name)
     assert_market_dicts_equal(actual_market_dict, expected_market_dict, context=f"first-run-{case.name}")
@@ -104,7 +104,7 @@ def test_gen_batch_data_incremental_second_run_matches_full_run(case, tmp):
     full_result = gen_batch_data(
         handle_full, run_time_new, case.trade_type, case.df_match.copy(deep=True), [case.symbol], "batch1"
     )
-    full_batch_name, _ = full_result
+    full_batch_name, _, _ = full_result
     expected_market_dict = preprocess_mgr_full.read_candle(full_batch_name)
 
     candidate = get_incremental_candidate()
@@ -131,7 +131,7 @@ def test_gen_batch_data_incremental_second_run_matches_full_run(case, tmp):
     inc_result = candidate(
         handle_first, run_time_new, case.trade_type, case.df_match.copy(deep=True), [case.symbol], "batch1"
     )
-    inc_batch_name, _ = inc_result
+    inc_batch_name, _, _ = inc_result
     actual_market_dict = preprocess_mgr_inc.read_candle(inc_batch_name)
     assert_market_dicts_equal(actual_market_dict, expected_market_dict, context=f"second-run-{case.name}")
 
@@ -161,7 +161,7 @@ def test_gen_batch_data_incremental_inherits_first_candle_time_from_old_state(tm
     first_result = candidate(
         handle_first, run_time_old, case.trade_type, case.df_match.copy(deep=True), [case.symbol], "batch1"
     )
-    first_batch_name, _ = first_result
+    first_batch_name, _, _ = first_result
     old_market_dict = preprocess_mgr.read_candle(first_batch_name)
     expected_first_candle_time = old_market_dict[case.symbol]["first_candle_time"].iloc[0]
 
@@ -177,7 +177,7 @@ def test_gen_batch_data_incremental_inherits_first_candle_time_from_old_state(tm
     second_result = candidate(
         handle_first, run_time_new, case.trade_type, case.df_match.copy(deep=True), [case.symbol], "batch1"
     )
-    second_batch_name, _ = second_result
+    second_batch_name, _, _ = second_result
     new_market_dict = preprocess_mgr.read_candle(second_batch_name)
     actual_first_candle_time = new_market_dict[case.symbol]["first_candle_time"].iloc[0]
     assert actual_first_candle_time == expected_first_candle_time, (
@@ -221,7 +221,7 @@ def test_gen_batch_data_incremental_last_candle_time_is_table_max(tmp):
     second_result = candidate(
         handle_first, run_time_new, case.trade_type, case.df_match.copy(deep=True), [case.symbol], "batch1"
     )
-    second_batch_name, _ = second_result
+    second_batch_name, _, _ = second_result
     new_market_dict = preprocess_mgr.read_candle(second_batch_name)
     df_sym = new_market_dict[case.symbol]
     expected_last = df_sym["candle_begin_time"].max()

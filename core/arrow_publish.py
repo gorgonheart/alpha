@@ -79,6 +79,41 @@ def publish_arrow_snapshot(market_dict: dict[str, pd.DataFrame], out_path, publi
             fready.write(str(pd.Timestamp.now().timestamp()))
 
 
+def cleanup_old_snapshots(base_dir, trade_type: str, keep: int = 2) -> None:
+    """删除某 trade_type 过期的 ``{trade_type}_dict_{epoch}.arrow`` 快照（设计文档 Finding 2）。
+
+    epoch 戳的快照只会累积（每轮新写一个文件，``.ready`` 标志被覆盖但旧 ``.arrow``
+    不会被清理），在 8GB 服务器上约 1.2GB/轮/offset 泄漏。这里按 epoch 升序保留最新的
+    ``keep`` 个，删除更旧的；同时清理崩溃残留的 ``*.arrow.tmp``。
+
+    :param base_dir:   快照所在目录。
+    :param trade_type: 仅清理该 trade_type（如 ``"spot"``），其他 trade_type 不受影响。
+    :param keep:       保留最新的几个 epoch（默认 2，给可能正在 mmap 读上一轮的消费者留余量）。
+    """
+    base_dir = Path(base_dir)
+
+    # 清理崩溃残留的半写文件
+    for tmp in base_dir.glob(f"{trade_type}_dict_*.arrow.tmp"):
+        tmp.unlink()
+
+    snaps = list(base_dir.glob(f"{trade_type}_dict_*.arrow"))
+
+    def _epoch(p: Path) -> int:
+        # 文件名形如 {trade_type}_dict_{epoch}.arrow
+        stem = p.name[len(f"{trade_type}_dict_"):-len(".arrow")]
+        try:
+            return int(stem)
+        except ValueError:
+            return -1
+
+    snaps.sort(key=_epoch)  # 升序，最旧在前
+    for old in snaps[:-keep] if keep > 0 else snaps:
+        old.unlink()
+        ready = old.with_suffix(".ready")
+        if ready.exists():
+            ready.unlink()
+
+
 def read_arrow_snapshot(path) -> dict[str, pd.DataFrame]:
     """读取 :func:`publish_arrow_snapshot` 产出的快照，重建 ``{symbol: DataFrame}``。"""
     path = Path(path)

@@ -160,3 +160,75 @@ def test_batch_on_disk_has_factor_columns(tmp, factor_config):
 
     disk = preprocess_mgr.read_candle("spot_dict_batch1")
     assert FACTOR_COL in disk["BTCUSDT"].columns
+
+
+def test_publish_does_not_reread_batch_from_disk(tmp, factor_config, monkeypatch):
+    """Finding 1: the Arrow publish must reuse the in-memory market_dict produced by
+    batch generation, NOT re-read the batch pickle back from disk.
+
+    On a first run, batch generation writes the batch but never reads it back; the
+    only legacy reason to read ``{type}_dict_batch*`` was the publish read-back we are
+    removing. So after the fix, ``read_candle`` is never called with a batch name.
+    """
+    df_full = load_btcusdt_spot().tail(600).reset_index(drop=True)
+    run_ts = pd.Timestamp(df_full["candle_begin_time"].iloc[-1])
+    handle, preprocess_mgr, _ = _make_full_handle(tmp, df_full, run_ts)
+
+    df_match = pd.DataFrame([{
+        "spot": "BTCUSDT", "swap": "BTCUSDT",
+        "first_begin_time": df_full["candle_begin_time"].min(),
+        "last_begin_time": df_full["candle_begin_time"].max(),
+    }])
+
+    batch_reads = []
+    orig_read_candle = CandleFileManager.read_candle
+
+    def spy_read_candle(self, symbol):
+        if symbol.startswith("spot_dict_batch"):
+            batch_reads.append(symbol)
+        return orig_read_candle(self, symbol)
+
+    monkeypatch.setattr(CandleFileManager, "read_candle", spy_read_candle)
+
+    preprocess_type_data(handle, run_ts.to_pydatetime(), "spot", df_match)
+
+    assert batch_reads == [], (
+        f"publish re-read batch pickle(s) from disk instead of using in-memory dict: {batch_reads}"
+    )
+
+    # publish still happened with factors (the in-memory dict carried them)
+    from core.arrow_publish import read_arrow_snapshot
+    snap = list(Path(preprocess_mgr.base_dir).glob("spot_dict_*.arrow"))
+    assert len(snap) == 1
+    restored = read_arrow_snapshot(snap[0])
+    assert FACTOR_COL in restored["BTCUSDT"].columns
+
+
+def test_old_arrow_snapshots_cleaned_up_across_runs(tmp, factor_config):
+    """Finding 2: across runs, only the newest few {type}_dict_{epoch}.arrow survive."""
+    df_full = load_btcusdt_spot().tail(600).reset_index(drop=True)
+
+    # three sequential runs at distinct run_times -> three distinct epochs
+    base = df_full.iloc[:597].reset_index(drop=True)
+    handle = None
+    preprocess_mgr = None
+    for i in range(3):
+        sub = df_full.iloc[:597 + i].reset_index(drop=True)
+        run_ts = pd.Timestamp(sub["candle_begin_time"].iloc[-1])
+        if handle is None:
+            handle, preprocess_mgr, _ = _make_full_handle(tmp, sub, run_ts)
+        else:
+            # feed the next run's resampled candles to the same binance mgr
+            offset_str = get_offset_from_runtime(run_ts.to_pydatetime(), RESAMPLE_INTERVAL)
+            binance_mgr = handle.get_binance_handle("spot").resample_mgr_map[offset_str]
+            binance_mgr.save_data_file("BTCUSDT", sub.copy(deep=True))
+            binance_mgr.save_ready("BTCUSDT", run_ts.to_pydatetime())
+        df_match = pd.DataFrame([{
+            "spot": "BTCUSDT", "swap": "BTCUSDT",
+            "first_begin_time": sub["candle_begin_time"].min(),
+            "last_begin_time": sub["candle_begin_time"].max(),
+        }])
+        preprocess_type_data(handle, run_ts.to_pydatetime(), "spot", df_match)
+
+    snaps = sorted(Path(preprocess_mgr.base_dir).glob("spot_dict_*.arrow"))
+    assert len(snaps) <= 2, f"old arrow snapshots not cleaned up: {[s.name for s in snaps]}"

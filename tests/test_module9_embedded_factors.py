@@ -65,7 +65,7 @@ def test_embedded_factors_match_two_step_first_run(tmp, factor_config):
     handle_a, _, mgr_a = make_minimal_handle(
         tmp / "two_step", case, df_resample_for_binance=df_full.copy(deep=True), run_time=run_ts
     )
-    name_a, _ = gen_batch_data(handle_a, run_time, case.trade_type, case.df_match.copy(deep=True),
+    name_a, _, _ = gen_batch_data(handle_a, run_time, case.trade_type, case.df_match.copy(deep=True),
                                [case.symbol], "batch1")
     gen_factor_data(handle_a, run_time, case.trade_type)
     expected = mgr_a.read_candle(name_a)
@@ -74,7 +74,7 @@ def test_embedded_factors_match_two_step_first_run(tmp, factor_config):
     handle_b, _, mgr_b = make_minimal_handle(
         tmp / "one_step", case, df_resample_for_binance=df_full.copy(deep=True), run_time=run_ts
     )
-    name_b, _ = gen_batch_data_incremental(handle_b, run_time, case.trade_type, case.df_match.copy(deep=True),
+    name_b, _, _ = gen_batch_data_incremental(handle_b, run_time, case.trade_type, case.df_match.copy(deep=True),
                                            [case.symbol], "batch1", with_factors=True)
     actual = mgr_b.read_candle(name_b)
 
@@ -103,7 +103,7 @@ def test_embedded_factors_match_two_step_second_run(tmp, factor_config):
     handle_a, _, mgr_a = make_minimal_handle(
         tmp / "two_step", case, df_resample_for_binance=combined.copy(deep=True), run_time=run_ts_new
     )
-    name_a, _ = gen_batch_data(handle_a, run_time_new, case.trade_type, case.df_match.copy(deep=True),
+    name_a, _, _ = gen_batch_data(handle_a, run_time_new, case.trade_type, case.df_match.copy(deep=True),
                                [case.symbol], "batch1")
     gen_factor_data(handle_a, run_time_new, case.trade_type)
     expected = mgr_a.read_candle(name_a)
@@ -120,7 +120,7 @@ def test_embedded_factors_match_two_step_second_run(tmp, factor_config):
     binance_mgr.save_data_file(case.symbol, combined.copy(deep=True))
     binance_mgr.save_ready(case.symbol, run_time_new)
 
-    name_b, _ = gen_batch_data_incremental(handle_b, run_time_new, case.trade_type, case.df_match.copy(deep=True),
+    name_b, _, _ = gen_batch_data_incremental(handle_b, run_time_new, case.trade_type, case.df_match.copy(deep=True),
                                            [case.symbol], "batch1", with_factors=True)
     actual = mgr_b.read_candle(name_b)
 
@@ -137,7 +137,7 @@ def test_with_factors_false_is_unchanged(tmp, factor_config):
     handle, _, mgr = make_minimal_handle(
         tmp / "no_factors", case, df_resample_for_binance=df_full.copy(deep=True), run_time=run_ts
     )
-    name, _ = gen_batch_data_incremental(handle, run_time, case.trade_type, case.df_match.copy(deep=True),
+    name, _, _ = gen_batch_data_incremental(handle, run_time, case.trade_type, case.df_match.copy(deep=True),
                                          [case.symbol], "batch1")  # with_factors defaults False
     result = mgr.read_candle(name)
     factor_cols = [c for c in result[case.symbol].columns if FACTOR_NAME in c]

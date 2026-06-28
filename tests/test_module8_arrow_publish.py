@@ -124,3 +124,53 @@ def test_empty_market_dict_is_noop(tmp):
     publish_arrow_snapshot({}, out_path, publish_kline_num=5000)
 
     assert not out_path.exists()
+
+
+def _touch(path: Path, content: str = "x") -> None:
+    path.write_text(content)
+
+
+def test_cleanup_keeps_newest_n_snapshots(tmp):
+    """cleanup_old_snapshots must keep the newest `keep` epochs and delete older ones.
+
+    Finding 2: epoch-stamped {type}_dict_{epoch}.arrow files accumulate forever
+    (only the .ready flag is overwritten). This leaks ~1.2 GB/cycle/offset on the
+    8 GB server. Cleanup keeps a small safety margin (default 2) for consumers that
+    may be mid-mmap-read of the previous snapshot.
+    """
+    from core.arrow_publish import cleanup_old_snapshots
+
+    epochs = [1782616200, 1782619800, 1782623400, 1782627000]  # ascending
+    for e in epochs:
+        _touch(tmp / f"spot_dict_{e}.arrow")
+    # an unrelated trade_type must be untouched
+    _touch(tmp / "swap_dict_1782616200.arrow")
+
+    cleanup_old_snapshots(tmp, "spot", keep=2)
+
+    remaining = sorted(p.name for p in tmp.glob("spot_dict_*.arrow"))
+    assert remaining == ["spot_dict_1782623400.arrow", "spot_dict_1782627000.arrow"], remaining
+    # other trade_type snapshot left alone
+    assert (tmp / "swap_dict_1782616200.arrow").exists()
+
+
+def test_cleanup_removes_stale_tmp(tmp):
+    """A crash can leave a *.arrow.tmp orphan; cleanup must remove stale tmp files."""
+    from core.arrow_publish import cleanup_old_snapshots
+
+    _touch(tmp / "spot_dict_1782623400.arrow")
+    _touch(tmp / "spot_dict_1782627000.arrow.tmp")  # orphaned half-write
+
+    cleanup_old_snapshots(tmp, "spot", keep=2)
+
+    assert not list(tmp.glob("*.tmp")), "stale .arrow.tmp not cleaned up"
+    assert (tmp / "spot_dict_1782623400.arrow").exists()
+
+
+def test_cleanup_noop_when_within_keep(tmp):
+    """Fewer snapshots than `keep` -> nothing deleted."""
+    from core.arrow_publish import cleanup_old_snapshots
+
+    _touch(tmp / "spot_dict_1782623400.arrow")
+    cleanup_old_snapshots(tmp, "spot", keep=2)
+    assert (tmp / "spot_dict_1782623400.arrow").exists()

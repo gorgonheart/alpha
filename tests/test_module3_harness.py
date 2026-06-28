@@ -70,7 +70,7 @@ def tmp(tmp_path: Path):
 def test_gen_batch_data_spot_returns_expected_structure(tmp):
     case = SPOT_CASE
     result, preprocess_mgr, run_ts = run_gen_batch_data_full(case, tmp / "full")
-    full_batch_name, year_pivot_name = result
+    full_batch_name, year_pivot_name, _ = result
     assert full_batch_name.startswith(case.trade_type)
     market_dict = preprocess_mgr.read_candle(full_batch_name)
     assert case.symbol in market_dict
@@ -82,7 +82,7 @@ def test_gen_batch_data_spot_returns_expected_structure(tmp):
 def test_gen_batch_data_swap_populates_funding_fee(tmp):
     case = SWAP_CASE
     result, preprocess_mgr, run_ts = run_gen_batch_data_full(case, tmp / "full_swap")
-    full_batch_name, year_pivot_name = result
+    full_batch_name, year_pivot_name, _ = result
     market_dict = preprocess_mgr.read_candle(full_batch_name)
     assert case.symbol in market_dict
     assert_market_dict_columns(market_dict, case.trade_type)
@@ -91,7 +91,7 @@ def test_gen_batch_data_swap_populates_funding_fee(tmp):
 def test_gen_batch_data_spot_first_last_candle_time_invariants(tmp):
     case = SPOT_CASE
     result, preprocess_mgr, run_ts = run_gen_batch_data_full(case, tmp / "full_invariants")
-    full_batch_name, _ = result
+    full_batch_name, _, _ = result
     market_dict = preprocess_mgr.read_candle(full_batch_name)
     df_sym = market_dict[case.symbol]
     assert df_sym["first_candle_time"].nunique() == 1
@@ -104,7 +104,7 @@ def test_gen_batch_data_spot_year_pivot_contains_pivot_columns(tmp):
     case = SPOT_CASE
     from core.preprocess import PIVOT_COLUMNS
     result, preprocess_mgr, run_ts = run_gen_batch_data_full(case, tmp / "full_pivot")
-    _, year_pivot_name = result
+    _, year_pivot_name, _ = result
     for year, pivot_batch_name in year_pivot_name.items():
         pivot_dict = preprocess_mgr.read_candle(pivot_batch_name)
         for sym, df_piv in pivot_dict.items():
