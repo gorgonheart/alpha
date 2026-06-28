@@ -83,8 +83,14 @@ def factor_config(monkeypatch):
     )
 
 
-def test_ready_flag_written_only_after_factors_on_disk(tmp, factor_config, monkeypatch):
-    """The {type}_dict gate flag must not be observable before factor cols are on disk."""
+def test_ready_flag_written_only_after_factors_in_snapshot(tmp, factor_config, monkeypatch):
+    """Race fix, Finding-3 edition: at the instant the consumer gate (``spot_dict.ready``)
+    is written, factors must already be durable — but in the Arrow snapshot, NOT the
+    batch pkl. The batch pkl carries only raw OHLCV+meta (Finding 3); the factor-carrying
+    durable artifact the consumer fast-path reads is the snapshot.
+    """
+    from core.arrow_publish import read_arrow_snapshot
+
     df_full = load_btcusdt_spot().tail(600).reset_index(drop=True)
     run_ts = pd.Timestamp(df_full["candle_begin_time"].iloc[-1])
     handle, preprocess_mgr, _ = _make_full_handle(tmp, df_full, run_ts)
@@ -100,19 +106,30 @@ def test_ready_flag_written_only_after_factors_on_disk(tmp, factor_config, monke
 
     def spy_save_ready(self, symbol, run_time):
         if symbol == "spot_dict":
-            # At the instant the consumer gate is written, the batch on disk MUST already
-            # carry factor columns. Read from a fresh reader to check what's persisted.
             reader = CandleFileManager(base_dir=self.base_dir, save_type=self.save_type)
             disk = reader.read_candle("spot_dict_batch1")
-            observed["factor_present_at_gate"] = FACTOR_COL in disk["BTCUSDT"].columns
+            observed["factor_absent_from_batch_pkl_at_gate"] = (
+                FACTOR_COL not in disk["BTCUSDT"].columns
+            )
+            snaps = list(Path(self.base_dir).glob("spot_dict_*.arrow"))
+            if snaps:
+                restored = read_arrow_snapshot(snaps[0])
+                observed["factor_present_in_snapshot_at_gate"] = (
+                    FACTOR_COL in restored["BTCUSDT"].columns
+                )
+            else:
+                observed["factor_present_in_snapshot_at_gate"] = False
         return orig_save_ready(self, symbol, run_time)
 
     monkeypatch.setattr(CandleFileManager, "save_ready", spy_save_ready)
 
     preprocess_type_data(handle, run_ts.to_pydatetime(), "spot", df_match)
 
-    assert observed.get("factor_present_at_gate") is True, (
-        "RACE: spot_dict ready flag was written before factor columns were on disk"
+    assert observed.get("factor_absent_from_batch_pkl_at_gate") is True, (
+        "Finding 3: batch pkl must NOT carry factor columns (they live in the snapshot)"
+    )
+    assert observed.get("factor_present_in_snapshot_at_gate") is True, (
+        "RACE: spot_dict gate was written before the factor-carrying Arrow snapshot was durable"
     )
 
 
@@ -144,8 +161,11 @@ def test_arrow_snapshot_published_with_factors(tmp, factor_config):
     assert (~np.isnan(vals)).any(), "published factor column is all-NaN"
 
 
-def test_batch_on_disk_has_factor_columns(tmp, factor_config):
-    """End-to-end: the persisted batch carries factor columns (write-once path)."""
+def test_batch_on_disk_is_raw_without_factor_columns(tmp, factor_config):
+    """Finding 3: the persisted batch pkl must NOT carry factor columns. Factors are
+    recomputed from OHLCV every cycle and never read back as computational input, so
+    persisting them is dead write-I/O. They live only in the Arrow snapshot.
+    """
     df_full = load_btcusdt_spot().tail(600).reset_index(drop=True)
     run_ts = pd.Timestamp(df_full["candle_begin_time"].iloc[-1])
     handle, preprocess_mgr, _ = _make_full_handle(tmp, df_full, run_ts)
@@ -159,7 +179,10 @@ def test_batch_on_disk_has_factor_columns(tmp, factor_config):
     preprocess_type_data(handle, run_ts.to_pydatetime(), "spot", df_match)
 
     disk = preprocess_mgr.read_candle("spot_dict_batch1")
-    assert FACTOR_COL in disk["BTCUSDT"].columns
+    factor_cols = [c for c in disk["BTCUSDT"].columns if FACTOR_NAME in c]
+    assert factor_cols == [], (
+        f"batch pkl must be raw (no factor columns), found: {factor_cols}"
+    )
 
 
 def test_publish_does_not_reread_batch_from_disk(tmp, factor_config, monkeypatch):

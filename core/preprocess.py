@@ -231,12 +231,10 @@ def gen_batch_data(handle: BmacHandle, run_time: datetime, trade_type: str, df_m
                 end_year = max_year
 
     full_batch_name = f'{trade_type}_dict_{batch_name}'
-    if with_factors:
-        factor_modules_params = _load_factor_modules_params()
-        market_dict = {
-            symbol: apply_precomputed_factors(df, factor_modules_params)
-            for symbol, df in market_dict.items()
-        }
+    # Finding 3: persist the RAW batch (OHLCV+meta only). Factor columns are recomputed
+    # from OHLCV every cycle and never read back as computational input, so writing them
+    # to the batch pkl is dead I/O. They are embedded only into the returned dict (consumed
+    # by the Arrow publish) below.
     preprocess_mgr.set_candle(full_batch_name, run_time, market_dict)
 
     year_pivot_name = dict()
@@ -260,6 +258,13 @@ def gen_batch_data(handle: BmacHandle, run_time: datetime, trade_type: str, df_m
         }
         preprocess_mgr.set_candle(pivot_batch_name, run_time, market_dict_for_pivot)
         year_pivot_name[year] = pivot_batch_name
+
+    if with_factors:
+        factor_modules_params = _load_factor_modules_params()
+        market_dict = {
+            symbol: apply_precomputed_factors(df, factor_modules_params)
+            for symbol, df in market_dict.items()
+        }
 
     time_elapsed = time.perf_counter() - t_start
     logger.debug(f'预处理 Market Dict {trade_type} {batch_name} 完成, '
@@ -369,13 +374,9 @@ def gen_batch_data_incremental(handle: BmacHandle, run_time: datetime, trade_typ
         if end_year is None or end_year < max_year:
             end_year = max_year
 
-    if with_factors:
-        factor_modules_params = _load_factor_modules_params()
-        new_market_dict = {
-            symbol: apply_precomputed_factors(df, factor_modules_params)
-            for symbol, df in new_market_dict.items()
-        }
-
+    # Finding 3: persist the RAW batch (OHLCV+meta only); factors are recomputed each
+    # cycle and never read back as input, so they are embedded only into the returned
+    # dict (consumed by the Arrow publish) below — not written to the batch pkl.
     preprocess_mgr.set_candle(full_batch_name, run_time, new_market_dict)
 
     year_pivot_name = dict()
@@ -397,6 +398,13 @@ def gen_batch_data_incremental(handle: BmacHandle, run_time: datetime, trade_typ
             }
             preprocess_mgr.set_candle(pivot_batch_name, run_time, market_dict_for_pivot)
             year_pivot_name[year] = pivot_batch_name
+
+    if with_factors:
+        factor_modules_params = _load_factor_modules_params()
+        new_market_dict = {
+            symbol: apply_precomputed_factors(df, factor_modules_params)
+            for symbol, df in new_market_dict.items()
+        }
 
     return full_batch_name, year_pivot_name, new_market_dict
 

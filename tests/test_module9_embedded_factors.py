@@ -70,13 +70,13 @@ def test_embedded_factors_match_two_step_first_run(tmp, factor_config):
     gen_factor_data(handle_a, run_time, case.trade_type)
     expected = mgr_a.read_candle(name_a)
 
-    # Path B: new one-step embedded
+    # Path B: new one-step embedded. Finding 3: factors live in the RETURNED dict
+    # (consumed by the Arrow publish), NOT in the persisted batch pkl (which stays raw).
     handle_b, _, mgr_b = make_minimal_handle(
         tmp / "one_step", case, df_resample_for_binance=df_full.copy(deep=True), run_time=run_ts
     )
-    name_b, _, _ = gen_batch_data_incremental(handle_b, run_time, case.trade_type, case.df_match.copy(deep=True),
+    name_b, _, actual = gen_batch_data_incremental(handle_b, run_time, case.trade_type, case.df_match.copy(deep=True),
                                            [case.symbol], "batch1", with_factors=True)
-    actual = mgr_b.read_candle(name_b)
 
     _assert_market_dicts_equal(actual, expected, context="first-run-embedded")
     # sanity: factor column actually present and not all-NaN
@@ -84,6 +84,13 @@ def test_embedded_factors_match_two_step_first_run(tmp, factor_config):
     assert col in actual[case.symbol].columns
     vals = actual[case.symbol][col].values
     assert np.isfinite(vals[~np.isnan(vals)]).all() and (~np.isnan(vals)).any()
+
+    # Finding 3: the persisted batch pkl must be raw (no factor columns).
+    disk_b = mgr_b.read_candle(name_b)
+    persisted_factor_cols = [c for c in disk_b[case.symbol].columns if FACTOR_NAME in c]
+    assert persisted_factor_cols == [], (
+        f"batch pkl must be raw, found factor columns: {persisted_factor_cols}"
+    )
 
 
 def test_embedded_factors_match_two_step_second_run(tmp, factor_config):
@@ -120,11 +127,17 @@ def test_embedded_factors_match_two_step_second_run(tmp, factor_config):
     binance_mgr.save_data_file(case.symbol, combined.copy(deep=True))
     binance_mgr.save_ready(case.symbol, run_time_new)
 
-    name_b, _, _ = gen_batch_data_incremental(handle_b, run_time_new, case.trade_type, case.df_match.copy(deep=True),
+    name_b, _, actual = gen_batch_data_incremental(handle_b, run_time_new, case.trade_type, case.df_match.copy(deep=True),
                                            [case.symbol], "batch1", with_factors=True)
-    actual = mgr_b.read_candle(name_b)
 
     _assert_market_dicts_equal(actual, expected, context="second-run-embedded")
+
+    # Finding 3: the persisted batch pkl must stay raw across the incremental second run.
+    disk_b = mgr_b.read_candle(name_b)
+    persisted_factor_cols = [c for c in disk_b[case.symbol].columns if FACTOR_NAME in c]
+    assert persisted_factor_cols == [], (
+        f"batch pkl must be raw after incremental run, found: {persisted_factor_cols}"
+    )
 
 
 def test_with_factors_false_is_unchanged(tmp, factor_config):
