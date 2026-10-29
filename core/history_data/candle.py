@@ -61,6 +61,7 @@ class Downloader(ABC):
         left_symbols = sorted(candle_infos.keys())
 
         download_round = 0
+        last_info_ts = 0.0  # 进度日志节流用（秒）
 
         # 每分钟最大权重
         max_minute_weight, once_candles = fetcher.get_api_limits()
@@ -130,13 +131,19 @@ class Downloader(ABC):
                 else:
                     in_progress_str = ""
                 progress = (num_success / num_total_symbols) * 100
-                logger.debug(
+                msg = (
                     f"{self.trade_type} {self.stage_name}, "
                     f"进度={progress:.1f}%({num_success}/{num_total_symbols}), "
                     f"已耗时={time_elapsed:.1f}分钟, "
                     f"当前时间={now_time_str()}"
                     f"{in_progress_str}"
                 )
+                logger.debug(msg)
+                # 进度按 30 秒节流输出到 INFO：首次全量补历史可能持续数小时，
+                # 只打 debug 会让控制台和日志长时间没有任何反馈，看起来像卡死
+                if download_round == 1 or time.perf_counter() - last_info_ts >= 30:
+                    last_info_ts = time.perf_counter()
+                    logger.info(msg)
         return candle_infos
 
 

@@ -14,6 +14,10 @@ from core.utils.time import now_time_str
 # 常量定义
 FUNDING_RATE_BATCH_LIMIT = 1000
 FUNDING_INCREMENTAL_BACKFILL_HOURS = 8
+# fundingRate 与 fundingInfo 共享 500/5min/IP，一次性把上千个 symbol 全打出去会被 WAF 拦成 403。
+# 实测并发 4 与 8 的吞吐都在 5 次/秒左右（瓶颈在代理），这里取 4 压住瞬时并发；
+# 若仍出现 429/403，把该值降到 2
+FUNDING_MAX_CONCURRENCY = 4
 
 
 def _calc_symbol_funding_start_time(funding_mgr, symbol: str, global_start_time: datetime, backfill_hours: int):
@@ -94,9 +98,21 @@ async def async_download_funding_rates(handle: BmacHandle, run_time: datetime, s
 
     completed_symbols = set()
     batch_count = 0
+    last_info_ts = 0.0
 
     async with create_aiohttp_session(30) as session:
         fetcher = BinanceFetcher(binance_handle.api_type, session, handle.proxy)
+
+        # 限制在途请求数，避免 756 个 symbol 同时打 fundingRate 被 WAF 403
+        semaphore = asyncio.Semaphore(FUNDING_MAX_CONCURRENCY)
+
+        async def fetch_one(symbol):
+            async with semaphore:
+                # startTime 是闭区间，这里保留毫秒精度（+1ms 的游标不能被截断成整秒）
+                start_ts = int(symbol_start_times[symbol].timestamp() * 1000)
+                return await fetcher.get_hist_funding_rate(
+                    symbol, limit=FUNDING_RATE_BATCH_LIMIT, startTime=start_ts
+                )
 
         # 2. 循环执行数据获取逻辑
         while len(completed_symbols) < len(symbols):
@@ -104,10 +120,7 @@ async def async_download_funding_rates(handle: BmacHandle, run_time: datetime, s
             remaining_symbols = [s for s in symbols if s not in completed_symbols]
 
             # 2.1 对于所有剩余 symbols，每次 batch 获取从各自的 starttime 开始的 1000 条资金费数据
-            tasks = []
-            for symbol in remaining_symbols:
-                start_ts = int(symbol_start_times[symbol].timestamp()) * 1000
-                tasks.append(fetcher.get_hist_funding_rate(symbol, limit=FUNDING_RATE_BATCH_LIMIT, startTime=start_ts))
+            tasks = [fetch_one(symbol) for symbol in remaining_symbols]
 
             results: list[pd.DataFrame] = await asyncio.gather(*tasks)
 
@@ -139,9 +152,10 @@ async def async_download_funding_rates(handle: BmacHandle, run_time: datetime, s
                 if len(df_new) < FUNDING_RATE_BATCH_LIMIT:
                     batch_completed_symbols.append(symbol)
                 else:
-                    # 2.4 对于这一batch 还没获取完成的 symbols 用 max(candle_begin_time) + 1h 作为下一batch的 start time
+                    # 2.4 对于这一batch 还没获取完成的 symbols 用 max(candle_begin_time) + 1ms 作为下一batch的 start time
+                    # startTime 为闭区间，+1ms 才能严格衔接；用 +1h 会跳过 1h 结算或 Special 资金费
                     max_time = df_new["candle_begin_time"].max()
-                    next_start_time = max_time + timedelta(hours=1)
+                    next_start_time = max_time + timedelta(milliseconds=1)
                     next_batch_start_times[symbol] = next_start_time
 
             # 更新完成的交易对和下一批次的起始时间
@@ -152,12 +166,17 @@ async def async_download_funding_rates(handle: BmacHandle, run_time: datetime, s
             if batch_count == 1 or len(batch_completed_symbols) > 0:
                 progress = (len(completed_symbols) / len(symbols)) * 100
                 time_elapsed = (time.perf_counter() - t_start) / 60
-                logger.debug(
+                msg = (
                     f"下载资金费数据，"
                     f"进度={progress:.1f}%({len(completed_symbols)}/{len(symbols)}), "
                     f"已耗时={time_elapsed:.1f}分钟, "
                     f"当前时间={now_time_str()}"
                 )
+                logger.debug(msg)
+                # 全量补历史时每轮可能要等 5 分钟，只打 debug 会让日志长时间没有反馈，看起来像卡死
+                if batch_count == 1 or time.perf_counter() - last_info_ts >= 30:
+                    last_info_ts = time.perf_counter()
+                    logger.info(msg)
 
             # 2.5 直到所有的 symbol 都更新完毕，结束循环；否则 sleep（5分钟 + 随机数）开始下一 batch 获取
             if len(completed_symbols) < len(symbols):
