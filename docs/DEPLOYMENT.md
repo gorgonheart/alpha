@@ -1,5 +1,7 @@
 # alpha Linux部署与维护
 
+2026-11-02首次部署验收：本地Windows专项101项通过，服务器独立alpha311/Linux专项100项通过；少一项为部署列表未包含Windows编码回归。运行代码验证版本dc12fdc，随后仅更新部署记录。服务器四个C扩展已本机编译，CCI既有golden差为0。alpha2只部署，不启动；旧alpha进程保留。构建/测试日志分别为/home/ubuntu/alpha2-build.log和/home/ubuntu/alpha2-verify.log。后续以git log显示的main版本为准。
+
 ## 当前布局
 
 - 工作副本：`/home/ubuntu/alpha2`，分支`main`。

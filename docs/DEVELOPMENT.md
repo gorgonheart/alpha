@@ -1,5 +1,7 @@
 # 两项目统一开发文档入口
 
+2026-11-02验收完成：本地101项通过，服务器独立alpha311(Python3.11.14)四个C扩展构建成功、Linux专项100项通过。CCI在GCC上关闭FMA contraction后与既有Windows golden逐值相同（最大差0），未改公式/golden/容差。候选运行代码dc12fdc，之后仅部署记录更新；源码提交并合并main，alpha2以Git跟踪服务器SSH私有仓库，配置为忽略文件config.json且权限600。旧alpha继续运行，本次不切换；详见[部署维护入口](DEPLOYMENT.md)。
+
 2026-11-02部署入口：[Linux部署与维护](DEPLOYMENT.md)。源码/测试入Git，机器凭据和平台差异迁至忽略的config.json（新增proxy/storage_path/publish_kline_num覆盖），四个C扩展由目标机器编译，缓存/二进制不跟踪。专项原始输入及动量Python oracle随仓库携带，移除对D盘/另一项目的测试依赖。alpha2仅部署验证，旧alpha保持运行；具体提交和Linux验收结果见统一开发说明本次记录。
 
 2026-10-31后续：空档补算缺失/不完整共享exchangeInfo时主动更新一次现货/合约信息，成功后继续补算，后续复用；关闭本次资金费刷新，失败沿用补算错误处理，获取耗时挤占预算则推迟重计算。仅core/backfill.py分支变化，realtime_data和binance_update本轮零修改；32项专项通过，未重启或联网。替代此前共享数据缺失只等待的行为。
