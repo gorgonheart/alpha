@@ -66,6 +66,8 @@ bash tools/deploy_alpha.sh verify
 
 ## 离线验证
 
+Linux CCI构建显式关闭FMA contraction，保持GCC/MSVC的标量运算顺序；既有Windows golden须逐值完全一致，不因部署放宽容差或重建golden。IDE机器设置与缓存不跟踪，生产者代码保持干净。
+
 ```bash
 cd /home/ubuntu/alpha2
 bash tools/deploy_alpha.sh build

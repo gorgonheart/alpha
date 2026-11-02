@@ -32,7 +32,8 @@ with open(_src_path, "r") as f:
 ffi.set_source(
     "_cci_core",
     _src,
-    extra_compile_args=["/O2"] if os.name == "nt" else ["-O3", "-march=native"],
+    # Preserve scalar operation order across GCC/MSVC (existing exact golden).
+    extra_compile_args=["/O2"] if os.name == "nt" else ["-O3", "-march=native", "-ffp-contract=off"],
     libraries=["m"] if os.name != "nt" else [],
 )
 

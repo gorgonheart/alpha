@@ -1,3 +1,30 @@
+# Legacy archive exclusions retained; deployment now uses Git checkout.
+# Test infrastructure
+tests/             export-ignore
+
+# Documentation
+docs/              export-ignore
+*.md               export-ignore
+LICENSE            export-ignore
+
+# IDE / tooling
+.vscode/           export-ignore
+*.patch            export-ignore
+
+# Windows-only C extensions (Linux builds its own .so)
+*.pyd              export-ignore
+
+# Runtime artifacts (server generates its own)
+logs/              export-ignore
+__pycache__/       export-ignore
+
+# Temp / scratch files
+.tmp_*/            export-ignore
+diag_illq.py       export-ignore
+run_illq_tests.py  export-ignore
+illq_results.txt   export-ignore
+illq_results2.txt  export-ignore
+
 *.py text eol=lf
 *.md text eol=lf
 *.sh text eol=lf
