@@ -3,7 +3,9 @@ import os
 import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from datetime import datetime, timezone
+from functools import partial
 from itertools import chain
 from pathlib import Path
 from typing import Optional
@@ -558,7 +560,8 @@ def publish_arrow_snapshot_for_type(handle: BmacHandle, run_time: datetime, trad
         logger.error(f'Arrow 发布 {trade_type} 失败（不影响 pkl 路径）: {exc!r}')
 
 
-def preprocess_type_data(handle: BmacHandle, run_time: datetime, trade_type: str, df_match: pd.DataFrame):
+def preprocess_type_data(handle: BmacHandle, run_time: datetime, trade_type: str, df_match: pd.DataFrame,
+                         *, factor_executor=None, factor_modules_params=None):
     num_batch = handle.preprocess_handle.num_batch
     exg_mgr = handle.exg_mgr
     exginfo_name = f'exginfo_{trade_type}'
@@ -572,6 +575,9 @@ def preprocess_type_data(handle: BmacHandle, run_time: datetime, trade_type: str
 
     df_exginfo = exg_mgr.read_candle(exginfo_name)
     symbol_list = sorted(df_exginfo['symbol'].to_list())
+    if factor_modules_params is None:
+        factor_modules_params = _load_factor_modules_params()
+    calc_factors = partial(_calc_symbol_factors, factor_modules_params=factor_modules_params)
 
     logger.info(f'开始预处理 {trade_type}, 当前时间={now_time_str()}')
 
@@ -585,10 +591,14 @@ def preprocess_type_data(handle: BmacHandle, run_time: datetime, trade_type: str
         else:
             batch, symbol_list = symbol_list, []
 
-        # Lever 2: write each batch once, already carrying factor columns. This removes
-        # the legacy gen_factor_data read-back + full rewrite round-trip.
+        # Persist raw batches first; compute full-history factors only in memory.
         _full_batch_name, year_pivot_name, batch_market_dict = gen_batch_data_incremental(
-            handle, run_time, trade_type, df_match, batch, f'batch{idx}', with_factors=True)
+            handle, run_time, trade_type, df_match, batch, f'batch{idx}', with_factors=False)
+        if factor_modules_params:
+            # Ordered consumption propagates failures before this market is published.
+            # Finish this batch before submitting another, bounding queued frame references.
+            factor_map = factor_executor.map if factor_executor is not None else map
+            batch_market_dict = dict(factor_map(calc_factors, batch_market_dict.items()))
         # Finding 1: keep the in-memory dict so publish never re-reads the batch pkl.
         market_dict.update(batch_market_dict)
         idx += 1
@@ -605,7 +615,7 @@ def preprocess_type_data(handle: BmacHandle, run_time: datetime, trade_type: str
     publish_elapsed = time.perf_counter() - t_publish
 
     # 竞态修复（§3.2）：消费者的 gate 标志必须在因子写盘 + Arrow 发布之后才打。
-    # 此时批次（含因子）与快照都已落盘，消费者看到标志即代表数据完整。
+    # 此时原始批次与含因子的快照均已处理完成；保留既有 Arrow 失败时 PKL 回退。
     preprocess_mgr.save_ready(f'{trade_type}_dict', run_time)
 
     t_start = time.perf_counter()
@@ -628,9 +638,15 @@ def preprocess_offset_data(handle: BmacHandle, run_time: datetime, symbol_begin_
         logger.error('读取现货与永续合约映射失败，预处理失败')
         return
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        spot_future = pool.submit(preprocess_type_data, handle, run_time, 'spot', df_match)
-        swap_future = pool.submit(preprocess_type_data, handle, run_time, 'swap', df_match)
+    factor_modules_params = _load_factor_modules_params()
+    workers = getattr(bmac_config, 'precompute_factor_workers', 0)
+    # Separate from market threads: sharing their pool would deadlock on nested waits.
+    factor_pool = (ThreadPoolExecutor(max_workers=workers, thread_name_prefix='factors')
+                   if workers > 0 and factor_modules_params else nullcontext(None))
+    with factor_pool as factor_executor, ThreadPoolExecutor(max_workers=2) as pool:
+        kwargs = dict(factor_executor=factor_executor, factor_modules_params=factor_modules_params)
+        spot_future = pool.submit(preprocess_type_data, handle, run_time, 'spot', df_match, **kwargs)
+        swap_future = pool.submit(preprocess_type_data, handle, run_time, 'swap', df_match, **kwargs)
         spot_future.result()
         swap_future.result()
 

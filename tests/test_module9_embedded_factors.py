@@ -47,8 +47,9 @@ def tmp(tmp_path: Path):
     return tmp_path
 
 
-@pytest.fixture()
-def factor_config(monkeypatch):
+@pytest.fixture(params=['动量因子210401修正', '动量210401_双项异常隔离V2'])
+def factor_config(monkeypatch, request):
+    monkeypatch.setitem(globals(), 'FACTOR_NAME', request.param)
     fake_config = SimpleNamespace(precompute_factor_configs={FACTOR_NAME: PARAMS})
     monkeypatch.setattr("core.preprocess.bmac_config", fake_config)
     return fake_config

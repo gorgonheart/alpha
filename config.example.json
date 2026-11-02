@@ -1,0 +1,8 @@
+{
+  "proxy": null,
+  "storage_path": "/home/ubuntu/alpha2/data",
+  "data_api_uuid": "SET_ON_SERVER",
+  "data_api_key": "SET_ON_SERVER",
+  "error_webhook_url": "",
+  "precompute_factor_workers": 4
+}

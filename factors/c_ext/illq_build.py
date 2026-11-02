@@ -26,16 +26,23 @@ ffi.cdef("""
 """)
 
 _src_path = os.path.join(_HERE, "illq_core.c")
-with open(_src_path, "r") as f:
+with open(_src_path, "r", encoding="utf-8") as f:
     _src = f.read()
 
 ffi.set_source(
     "_illq_core",
     _src,
-    extra_compile_args=["/O2"] if os.name == "nt" else ["-O3", "-march=native"],
+    extra_compile_args=["/O2", "/utf-8"] if os.name == "nt" else ["-O3", "-march=native"],
     libraries=["m"] if os.name != "nt" else [],
 )
 
 if __name__ == "__main__":
+    import sys
+    if os.name == "nt" and not sys.flags.utf8_mode:
+        # CFFI reads/writes its generated C file with the process default encoding.
+        # Re-enter in UTF-8 mode so an existing UTF-8 file is never read as GBK.
+        import subprocess
+        raise SystemExit(subprocess.call([sys.executable, "-X", "utf8",
+                                          os.path.abspath(__file__), *sys.argv[1:]]))
     ffi.compile(tmpdir=_HERE, verbose=True)
     print("Build complete. Output in:", _HERE)

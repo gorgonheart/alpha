@@ -13,9 +13,9 @@ from core.utils.time import get_offset_from_runtime
 ROOT_DIR = Path(__file__).resolve().parents[2]
 DATA_DIR = ROOT_DIR / "data"
 
-BTCUSDT_SPOT_PATH = DATA_DIR / "binance_spot_1h_resample" / "40m" / "BTCUSDT.pkl"
-BTCUSDT_SWAP_PATH = DATA_DIR / "binance_swap_1h_resample" / "40m" / "BTCUSDT.pkl"
-BTCUSDT_FUNDING_PATH = DATA_DIR / "funding" / "BTCUSDT.pkl"
+BTCUSDT_SPOT_PATH = ROOT_DIR / "tests/fixtures/pipeline/spot.pkl"
+BTCUSDT_SWAP_PATH = ROOT_DIR / "tests/fixtures/pipeline/swap.pkl"
+BTCUSDT_FUNDING_PATH = ROOT_DIR / "tests/fixtures/pipeline/funding.pkl"
 
 RESAMPLE_INTERVAL = "1h"
 

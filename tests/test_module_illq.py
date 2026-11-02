@@ -42,12 +42,11 @@ def test_output_length(df):
     assert len(_c_out(df)) == len(df)
 
 
-def test_golden(df):
-    np.testing.assert_array_equal(
-        _c_out(df), load_golden(PARAM),
-        err_msg="C output differs from committed golden. "
-                "Re-run tests/fixtures/capture_illq_cci.py if algorithm changed intentionally.",
-    )
+def test_legacy_golden_remains_numerically_compatible_with_python(df):
+    # Keep the old file unchanged. It captured the old C summation order, whose
+    # bits are not an oracle for the compensated variance correction.
+    expected=signal_multi_params_py(df,[PARAM])[str(PARAM)]
+    np.testing.assert_allclose(load_golden(PARAM),expected,rtol=1e-12,atol=1e-10,equal_nan=True)
 
 
 def test_c_vs_python(df):
@@ -57,12 +56,12 @@ def test_c_vs_python(df):
         "NaN positions differ between C and Python"
     valid = ~np.isnan(py_arr)
     np.testing.assert_allclose(
-        c_arr[valid], py_arr[valid], atol=1e-9,
-        err_msg="C and Python values differ beyond atol=1e-9",
+        c_arr[valid], py_arr[valid], rtol=1e-12, atol=1e-10,
+        err_msg="C and independent Python oracle differ",
     )
 
 
-def test_signal_multi_params_golden(tmp, df, monkeypatch):
+def test_signal_multi_params_python_oracle(tmp, df, monkeypatch):
     run_ts = pd.Timestamp(df["candle_begin_time"].iloc[-1]).to_pydatetime()
     handle, mgr = make_factor_handle(tmp, df, run_ts)
     monkeypatch.setattr(
@@ -73,7 +72,8 @@ def test_signal_multi_params_golden(tmp, df, monkeypatch):
     col = f"{FACTOR_NAME}_{PARAM}"
     df_result = mgr.read_candle(BATCH_KEY)["BTCUSDT"]
     assert col in df_result.columns, f"Column {col!r} not found"
-    np.testing.assert_array_equal(
-        df_result[col].values, load_golden(PARAM),
-        err_msg=f"gen_factor_data column {col!r} differs from golden.",
+    np.testing.assert_allclose(
+        df_result[col].values, signal_multi_params_py(df,[PARAM])[str(PARAM)],
+        rtol=1e-12,atol=1e-10,equal_nan=True,
+        err_msg=f"gen_factor_data column {col!r} differs from Python oracle.",
     )

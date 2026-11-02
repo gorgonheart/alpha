@@ -16,19 +16,40 @@ static void roll_mean(const double *x, int n, int w, double *out) {
 
 /* rolling_std: window w, ddof=1, min_periods=1 — matches pandas rolling(w,min_periods=1).std() */
 static void roll_std(const double *x, int n, int w, double *out) {
-    double sum = 0.0, sumsq = 0.0;
-    int    cnt = 0;
+    /* Compensated online central moment; subtracting squared raw sums loses
+       precision when the level is large relative to the variance. Follow the
+       remove-before-add order used by pandas' fixed rolling windows. */
+    double mean = 0.0, moment = 0.0, add_error = 0.0, remove_error = 0.0;
+    double last = NAN;
+    int cnt = 0, repeated = 0;
     for (int i = 0; i < n; i++) {
-        if (!isnan(x[i])) { sum += x[i]; sumsq += x[i] * x[i]; cnt++; }
-        if (i >= w && !isnan(x[i - w])) {
-            sum -= x[i - w]; sumsq -= x[i - w] * x[i - w]; cnt--;
+        if (i >= w && isfinite(x[i - w])) {
+            double v = x[i - w];
+            cnt--;
+            if (cnt) {
+                double old = mean - remove_error;
+                double corrected = v - remove_error;
+                double delta = corrected - mean;
+                remove_error = (delta + mean) - corrected;
+                mean -= delta / cnt;
+                moment -= (v - old) * (v - mean);
+            } else { mean = moment = 0.0; }
         }
-        if (cnt < 2) {
-            out[i] = NAN;
-        } else {
-            double var = (sumsq - sum * sum / cnt) / (cnt - 1);
-            out[i] = (var > 0.0) ? sqrt(var) : 0.0;
+        /* pandas rolling converts +/-Inf to missing before accumulating. */
+        if (isfinite(x[i])) {
+            double v = x[i];
+            cnt++;
+            repeated = (v == last) ? repeated + 1 : 1;
+            last = v;
+            double old = mean - add_error;
+            double corrected = v - add_error;
+            double delta = corrected - mean;
+            add_error = (delta + mean) - corrected;
+            mean += delta / cnt;
+            moment += (v - old) * (v - mean);
         }
+        double variance = repeated >= cnt ? 0.0 : moment / (cnt - 1);
+        out[i] = cnt < 2 ? NAN : (variance > 0.0 ? sqrt(variance) : 0.0);
     }
 }
 

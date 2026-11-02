@@ -14,7 +14,7 @@ kline_count_1h_swap = 14060
 # 全局报错机器人通知
 # - 创建企业微信机器人 参考帖子: https://bbs.quantclass.cn/thread/10975
 # - 配置案例  https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxxxxxxxxxxxxxxxx
-error_webhook_url = 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=c338c9be-1b53-457a-9510-44d52913e046'
+error_webhook_url = ""  # Machine-specific value comes from ignored config.json.
 # 数据存放路径，默认在项目目录的data文件夹
 storage_path = get_folder_path('data')
 
@@ -38,9 +38,9 @@ use_api = {
     'coin_cap': True,
 }
 # 个人中心里面的葫芦id。（网址：https://www.quantclass.cn/login）
-data_api_uuid = 'b96311ed0215388b9f490c541156b2e6'
+data_api_uuid = ""  # Machine-specific value comes from ignored config.json.
 # 个人中心里面的api_key配置。（网址：https://www.quantclass.cn/login）
-data_api_key = 'RCPT17XM78IVALDJTEFXAPANVMP7ZIZI'
+data_api_key = ""  # Machine-specific value comes from ignored config.json.
 
 # ====================================================================================================
 # ** 其他配置 **
@@ -53,7 +53,7 @@ proxy = 'http://127.0.0.1:7897'  # 如果你用clash的话
 # 只更新部分分钟偏移（hour_offset），可有效节省你的硬盘，
 # 当然如果你配置了新的hour_offset策略，需要同步更新数据中心这边的配置
 # 默认所有的offset都需要更新，kline_count_1h=25000，大概占用68GB存储
-enabled_hour_offsets = ( '10m','40m','30m',)
+enabled_hour_offsets = ( '20m','40m','55m','25m','45m','5m','5m','15m',)
 
 # Base 周期，通常设为 5m，与 Data API 一致
 base_interval = '5m'
@@ -70,10 +70,13 @@ preprocess = True
 # 预计算因子配置：{因子模块名（不含 factors. 前缀）: [param 列表]}
 # 留空 dict 则跳过因子预计算步骤
 precompute_factor_configs = {
-    '动量因子210401修正': [10248, 8568, 13608, 13608],
-    'ILLQStdBbi45208':   [2856, 1344, 1512, 672, 168],
-    'CciV3':             [1176,10248,10248,5208],
+    '动量210401_双项异常隔离V2': [13608,5421,3509,12600],
+    'ILLQStdBbi45208':   [2184, 2320, 1104, 264, 96],  # 与当前选币/动量过滤窗口一致
+    'CciV3':             [1176, 10248, 5208],
 }
+# 因子共享线程数：0 保持各市场逐币串行；2/4 按币种并行，现货与合约共用额度。
+# 本地已确认使用 4；设为 0 可恢复逐币串行，目标机器需单独测量。
+precompute_factor_workers = 4
 # 预处理数据拆分 Batch 大小
 preprocess_num_batch = 180
 # 预处理数据近期 K 线条数（仓位管理框架）
@@ -92,7 +95,8 @@ if json_file_config.exists():
         # 目前只支持配置这些
         allowed_attrs = (
             'kline_count_1h_spot', 'kline_count_1h_swap', 'error_webhook_url', 'use_api', 'data_api_uuid', 'data_api_key',
-            'enabled_hour_offsets', 'funding_rate', 'precompute_factor_configs')
+            'enabled_hour_offsets', 'funding_rate', 'precompute_factor_configs', 'precompute_factor_workers',
+            'proxy', 'storage_path', 'publish_kline_num')
 
         for _attr in allowed_attrs:
             if _attr in config_data:

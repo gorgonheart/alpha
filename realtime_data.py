@@ -7,6 +7,7 @@ author: 邢不行
 import asyncio
 import sys
 import time
+import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta
 import config
@@ -14,6 +15,7 @@ from core.utils.dingding import send_wechat_work_msg
 from core.utils.log_kit import divider, logger
 from core.version import VERSION
 from core.binance_update import fetch_update_binance_candles, update_binance_base_candles, update_binance_meta
+from core.backfill import maybe_backfill
 from core.data_api_update import update_data_api_candles
 from core.handle import BmacHandle, create_bmac_handle_from_config, debug_handle
 from core.history_data.history import run_download_all_history
@@ -30,8 +32,17 @@ if sys.platform == "win32":
 
 def update_all(handle: BmacHandle, run_time: datetime):
     if f"{run_time.minute}m" not in handle.enabled_hour_offsets:
-        logger.info(f"Runtime={run_time},不在 Offset={handle.enabled_hour_offsets} 中，休息 60s 后，跳过")
-        time.sleep(60)  # 必须休息 60s，否则会一直卡在这 1 分钟
+        logger.info(f"Runtime={run_time},不在 Offset={handle.enabled_hour_offsets} 中，等待该调度点检查补算")
+
+        # 首次启动时，除 init 那个分钟归属的 offset 外都还没有预处理 ready。
+        # Wait for this base-period tick, instead of rechecking its future time every minute.
+        sleep_until_run_time(run_time)
+        try:
+            maybe_backfill(handle)
+        except Exception as e:
+            logger.error(f"补算历史预处理失败: {e!r}")
+            logger.debug(traceback.format_exc())
+
         return
 
     divider(f"Update {handle.base_interval} Runtime={run_time}", with_timestamp=False)
@@ -39,21 +50,25 @@ def update_all(handle: BmacHandle, run_time: datetime):
     # 提前 15 秒更新 exchange info
     sleep_until_run_time(run_time - timedelta(seconds=15))
 
-    asyncio.run(update_binance_meta(handle, run_time))
-
-    # 更新现货和永续合约对应关系
-    update_symbol_match(handle, run_time)
-    logger.ok(f"Exchange Info 与实时资金费获取成功, 本地时间={now_time_str()}")
-
-    # 准点更新 K 线
-    sleep_until_run_time(run_time)
-
     # 用于记录本周期发生的错误，如有错误发送到企业微信
     errs = []
 
     is_binance_success, is_data_api_success = False, False
 
-    with ProcessPoolExecutor(max_workers=3) as exe:
+    workers = 1 + int(handle.data_api is not None) + int(handle.coin_cap_handle is not None)
+    with ProcessPoolExecutor(max_workers=workers) as exe:
+        # Occupy all workers until the target so spawn/import overlaps metadata I/O.
+        # No market request runs before metadata succeeds and the target is reached.
+        logger.info(f'开始预热采集进程, run_time={run_time}, 当前时间={now_time_str()}')
+        warmups = [exe.submit(sleep_until_run_time, run_time) for _ in range(workers)]
+        asyncio.run(update_binance_meta(handle, run_time))
+        update_symbol_match(handle, run_time)
+        logger.ok(f"Exchange Info 与实时资金费获取成功, 本地时间={now_time_str()}")
+        sleep_until_run_time(run_time)
+        for warmup in warmups:
+            warmup.result()
+        logger.info(f'采集进程预热就绪, run_time={run_time}, 当前时间={now_time_str()}')
+
         # 子进程：从币安 REST API 更新数据, 并且更新 Resample
         task_binance = exe.submit(fetch_update_binance_candles, handle, run_time)
         update_tasks = [task_binance]
@@ -142,26 +157,31 @@ def main():
     handle = create_bmac_handle_from_config()
     debug_handle(handle)
 
+    initialized = False
     while True:
         try:
-            # 阶段2: 初始化历史数据
-            init_history(handle)
+            # Initialization may clear directories: never re-enter after live updates fail.
+            if not initialized:
+                init_history(handle)
+                initialized = True
 
             # 阶段3: 更新数据
             while True:
+                run_time = None
                 run_time = next_run_time(handle.base_interval)
                 update_all(handle, run_time)
         except Exception as e:
-            import traceback
             from config import error_webhook_url
 
             ex_str = traceback.format_exc()
-            send_wechat_work_msg(f"BMAC 发生错误 {repr(e)}, {ex_str} 1 分钟后重启", error_webhook_url)
+            phase = f'运行更新 run_time={run_time}' if initialized else '首次初始化'
+            recovery = '保留已有产物，1 分钟后继续更新' if initialized else '1 分钟后重试初始化'
+            send_wechat_work_msg(f"BMAC {phase}发生错误 {repr(e)}, {ex_str} {recovery}", error_webhook_url)
 
             logger.debug(ex_str)
-            logger.error(repr(e))
+            logger.error(f'{phase}: {e!r}；{recovery}')
 
-            divider("1 分钟后重启", _logger=logger)
+            divider(recovery, _logger=logger)
             time.sleep(60)
 
 

@@ -1,5 +1,14 @@
 data/
 logs/
+config.json
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+.pytest_cache/
+.workbuddy/
+deploy.tar.gz
+*.bundle
 
 # cffi build artifacts
 factors/c_ext/__pycache__/
@@ -10,3 +19,4 @@ factors/c_ext/Release/
 factors/c_ext/_momentum_core.c
 factors/c_ext/_illq_core.c
 factors/c_ext/_cci_core.c
+factors/c_ext/_momentum_v2_core.c
