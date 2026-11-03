@@ -95,4 +95,8 @@ update只fast-forward并重新build/verify，不自动安装依赖或启动服�
 
 ## 验收记录
 
-本地Arrow/配置快速验证12项通过；完整部署专项111项通过（11.31秒）。目标Linux构建/测试结果在部署完成后补记。构建、依赖、验证和环境日志保存在`/home/ubuntu/alpha-deploy-logs/`。未完成行情初始化或真实增量运行验收。
+本地Arrow/配置快速验证12项通过；完整部署专项111项通过（11.31秒）。目标Linux四个C扩展本机编译成功，首次完整部署专项111项通过（7.41秒），既有golden/容差未修改。新环境间接依赖chardet 7.7导致Requests 2.32.3兼容警告，部署依赖清单固定chardet 5.2.0；目标机以警告即错误导入Requests成功，pip check无冲突。
+
+发布工具首次及--previous继承包已实际测试，干净包可fast-forward，全部文件树与对应源码main一致；曾发现临时仓库当前分支不可直接fetch，已改FETCH_HEAD并提交修复。源码业务变更85d39a7，发布工具782b8d1/ad92b2b，后续提交为部署依赖和验收文档；服务器发布提交说明记录精确源main。
+
+构建、依赖、验证和环境日志保存在`/home/ubuntu/alpha-deploy-logs/`（environment.log、dependencies.log、build.log、verify.log、requests-compatibility.log）；最终维护路径日志update-verify.log。工作副本main跟踪本机bare仓库，工作副本/仓库目录700、config.json权限600。本轮不启动或注册服务，API密钥暂空，未导入市值历史或行情；未完成行情初始化或真实增量运行验收。后续人工启用前仍需完成上面的配置与数据准备。

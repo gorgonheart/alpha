@@ -1,6 +1,6 @@
 # 两项目统一开发文档入口
 
-2026-11-03测试服务器发布：审核并提交完整历史Arrow发布（0表示全部、逐币写入及full_history标记），新增完整/裁尾/输入不变/非法深度测试，纳入部署verify。新增服务器43.173.122.28，独立alpha311，本轮只部署编译验证、不启动；流程和验收记录见[测试服务器部署](2026-11-03-test-server-deployment.md)。唯一新增core范围为core/arrow_publish.py，无realtime_data或因子公式变化。
+2026-11-03测试服务器发布：审核并提交完整历史Arrow发布（0表示全部、逐币写入及full_history标记），新增完整/裁尾/输入不变/非法深度测试，纳入部署verify。新增服务器43.173.122.28，独立alpha311(Python3.11.18)，Linux四扩展构建及111项专项通过；本地同组111项通过。新环境Requests间接依赖chardet固定5.2.0消除兼容警告。干净发布包不含旧Git历史，--previous维护路径已验证；本轮不启动、不传生产密钥。流程和验收记录见[测试服务器部署](2026-11-03-test-server-deployment.md)。唯一新增core范围为core/arrow_publish.py，无realtime_data或因子公式变化。
 
 2026-11-02验收完成：本地101项通过，服务器独立alpha311(Python3.11.14)四个C扩展构建成功、Linux专项100项通过。CCI在GCC上关闭FMA contraction后与既有Windows golden逐值相同（最大差0），未改公式/golden/容差。候选运行代码dc12fdc，之后仅部署记录更新；源码提交并合并main，alpha2以Git跟踪服务器SSH私有仓库，配置为忽略文件config.json且权限600。旧alpha继续运行，本次不切换；详见[部署维护入口](DEPLOYMENT.md)。
 

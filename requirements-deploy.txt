@@ -8,6 +8,8 @@ numba==0.60.0
 cffi==2.0.0
 aiohttp==3.13.3
 requests==2.32.3
+# Requests 2.32.3 checks installed chardet even when charset-normalizer is present.
+chardet==5.2.0
 psutil==6.0.0
 pytz==2025.2
 python-dateutil==2.9.0.post0
