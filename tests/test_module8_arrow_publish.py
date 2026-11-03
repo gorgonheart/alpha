@@ -174,3 +174,39 @@ def test_cleanup_noop_when_within_keep(tmp):
     _touch(tmp / "spot_dict_1782623400.arrow")
     cleanup_old_snapshots(tmp, "spot", keep=2)
     assert (tmp / "spot_dict_1782623400.arrow").exists()
+
+
+@pytest.mark.parametrize("depth", [0, 50])
+def test_full_history_marker_and_values_without_mutating_input(tmp_path, depth):
+    """Depth zero preserves all rows; both modes preserve values and input indexes."""
+    import pyarrow as pa
+    from core.arrow_publish import publish_arrow_snapshot, read_arrow_snapshot
+
+    market = _build_market_dict()
+    for frame in market.values():
+        frame.index = pd.Index(range(1000, 1000 + len(frame)), name="source_row")
+    originals = {symbol: frame.copy(deep=True) for symbol, frame in market.items()}
+    out = tmp_path / "spot_dict_1.arrow"
+    publish_arrow_snapshot(market, out, depth, write_ready=False)
+    with pa.memory_map(str(out), "r") as source:
+        reader = pa.ipc.open_file(source)
+        assert reader.schema.metadata[b"full_history"] == (b"1" if depth == 0 else b"0")
+        assert reader.num_record_batches == len(market)
+    restored = read_arrow_snapshot(out)
+    for symbol, original in originals.items():
+        expected = original if depth == 0 else original.tail(depth)
+        pd.testing.assert_frame_equal(restored[symbol], expected.reset_index(drop=True), check_exact=True)
+        pd.testing.assert_frame_equal(market[symbol], original, check_exact=True)
+    assert not out.with_suffix(".ready").exists()
+    assert not out.with_suffix(".arrow.tmp").exists()
+
+
+def test_negative_publish_depth_does_not_publish(tmp_path):
+    from core.arrow_publish import publish_arrow_snapshot
+
+    out = tmp_path / "spot_dict_1.arrow"
+    with pytest.raises(ValueError, match="publish_kline_num"):
+        publish_arrow_snapshot(_build_market_dict(), out, -1)
+    assert not out.exists()
+    assert not out.with_suffix(".ready").exists()
+    assert not out.with_suffix(".arrow.tmp").exists()

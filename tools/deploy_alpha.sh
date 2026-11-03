@@ -12,7 +12,8 @@ verify() {
   "$PYTHON" -X utf8 -B -m pytest -q -p no:cacheprovider \
     tests/test_deployment_config.py tests/test_dispatch_prewarm.py \
     tests/test_realtime_recovery.py tests/test_exchange_info_reuse.py \
-    tests/test_shared_factor_pool.py tests/test_module9_embedded_factors.py \
+    tests/test_shared_factor_pool.py tests/test_module8_arrow_publish.py \
+    tests/test_module9_embedded_factors.py \
     tests/test_module10_preprocess_pipeline.py tests/test_corrected_momentum.py \
     tests/test_illq_nonfinite_oracle.py tests/test_module_cci.py
 }

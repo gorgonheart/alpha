@@ -32,7 +32,7 @@ def publish_arrow_snapshot(market_dict: dict[str, pd.DataFrame], out_path, publi
 
     :param market_dict: ``{symbol: DataFrame}``，各 symbol 列布局需一致。
     :param out_path:    目标 ``*.arrow`` 路径。
-    :param publish_kline_num: 每 symbol 只发布 ``tail(publish_kline_num)`` 行。
+    :param publish_kline_num: 0 发布完整保留历史；正数仅发布末 N 行。
     :param write_ready: 是否同时写 ``.ready`` 标志。流水线中由上层统一管理单一 gate
         标志（并清理过期标志），此时传 False，仅做原子写 + 改名。
     """
@@ -44,28 +44,30 @@ def publish_arrow_snapshot(market_dict: dict[str, pd.DataFrame], out_path, publi
 
     symbols = list(market_dict.keys())
 
-    # 以第一个 symbol 的 schema 为基准，保证所有 record batch schema 一致（IPC 要求）。
-    ref_schema = None
-    batches: list[pa.RecordBatch] = []
-    for symbol in symbols:
-        df = market_dict[symbol].tail(publish_kline_num).reset_index(drop=True)
-        if ref_schema is None:
-            batch = pa.RecordBatch.from_pandas(df, preserve_index=False)
-            ref_schema = batch.schema
-        else:
-            batch = pa.RecordBatch.from_pandas(df, schema=ref_schema, preserve_index=False)
-        batches.append(batch)
+    if publish_kline_num < 0:
+        raise ValueError('publish_kline_num must be >= 0 (0 means full retained history)')
 
-    # manifest 写进 schema metadata：record batch index -> symbol
+    # Convert/write one symbol at a time: full publication must not retain a
+    # second market-sized list of Arrow buffers alongside market_dict.
+    def batch_for(symbol, schema=None):
+        df = market_dict[symbol]
+        if publish_kline_num:
+            df = df.tail(publish_kline_num)
+        return pa.RecordBatch.from_pandas(df, schema=schema, preserve_index=False)
+
+    first = batch_for(symbols[0])
+    ref_schema = first.schema
     metadata = dict(ref_schema.metadata or {})
     metadata[_MANIFEST_KEY] = json.dumps(symbols).encode("utf-8")
+    metadata[b'full_history'] = b'1' if publish_kline_num == 0 else b'0'
     schema_with_manifest = ref_schema.with_metadata(metadata)
-
     tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
     with open(tmp_path, "wb") as fout:
         with pa.ipc.new_file(fout, schema_with_manifest) as writer:
-            for batch in batches:
-                writer.write_batch(batch)
+            writer.write_batch(first)
+            del first
+            for symbol in symbols[1:]:
+                writer.write_batch(batch_for(symbol, ref_schema))
         fout.flush()
         os.fsync(fout.fileno())
 

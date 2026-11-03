@@ -83,8 +83,9 @@ preprocess_num_batch = 180
 preprocess_num_recent = 3
 # Arrow 发布深度（设计文档 §3.5）：生产者只在 Arrow 发布文件里裁到这个深度；
 # 自身 base/recent pkl 文件仍保留全历史（因子正确性 + 增量）。
-# 约束：publish_kline_num >= 消费者 get_kline_num(4050) + run_time 过滤余量，5000 安全。
-publish_kline_num = 5000
+# 正数深度需覆盖消费者窗口及过滤余量；0表示不裁切。
+# 0：发布全部保留历史，初始化直接复用长因子；普通消费者需先裁行再转 Pandas。
+publish_kline_num = 0
 
 # 如果有 json 配置，则使用 json 配置覆盖掉 config.py 中的配置
 json_file_config = get_file_path('config.json', as_path_type=True)
