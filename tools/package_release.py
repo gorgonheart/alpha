@@ -54,8 +54,8 @@ def main():
         git("config", "user.email", "release@localhost")
         git("config", "core.autocrlf", "false")
         if args.previous:
-            git("fetch", "--quiet", str(args.previous.resolve()), "main:refs/heads/main")
-            git("reset", "--mixed", "--quiet", "main")
+            git("fetch", "--quiet", str(args.previous.resolve()), "main")
+            git("reset", "--mixed", "--quiet", "FETCH_HEAD")
         git("add", "--all")
         git("commit", "--quiet", "--allow-empty", "-m", f"release(alpha): import source main {source}")
         git("bundle", "create", str(output), "main")
