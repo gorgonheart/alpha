@@ -16,11 +16,11 @@
 ## 首次手工部署步骤
 
 1. 开发机审核本次diff、用alpha311验证后提交功能分支，fast-forward合并main。仅提交本次源码、测试和文档；保留其他诊断文件，不复制Windows二进制、缓存、私有JSON和data。
-2. 创建并上传Git bundle（完整历史含旧配置，只允许私有传输/存放）：
+2. 审查当前提交不含真实凭据后，创建仅含当前源码和发布记录的干净Git bundle，禁止直接导出main完整历史。原历史曾含旧配置，自动审批已拒绝本轮完整历史上传，因此改用以下安全路径：
 
 ```powershell
-git -C D:/alpha bundle create D:/alpha-update.bundle main
-scp -i E:/siteup/env/visibility-deploy.pem D:/alpha-update.bundle ubuntu@43.173.122.28:/home/ubuntu/
+& "C:/Users/Administrator/miniconda3/envs/alpha311/python.exe" -X utf8 -B D:/alpha/tools/package_release.py D:/alpha-release-20261103.bundle
+scp -i E:/siteup/env/visibility-deploy.pem D:/alpha-release-20261103.bundle ubuntu@43.173.122.28:/home/ubuntu/alpha-update.bundle
 ```
 
 SSH若拒绝原密钥ACL，使用本机ssh-agent，或在本机临时复制密钥并仅授予当前用户权限；不要上传私钥或修改已有密钥内容。
@@ -49,7 +49,7 @@ cp config.example.json config.json
 chmod 600 config.json
 ```
 
-5. 编辑config.json：proxy为null、storage_path为`/home/ubuntu/alpha/data`、本机Data API凭据、通知URL按需配置。公共offset/历史长度/因子参数继承Git的config.py；仅测试部分offset时通过JSON的enabled_hour_offsets覆盖。部署所用JSON不写入Git，不打印密钥。默认4个因子线程、完整Arrow发布。
+5. 编辑config.json：proxy为null、storage_path为`/home/ubuntu/alpha/data`、本机Data API凭据、通知URL按需配置。本轮不复制生产密钥，Data API两字段置空，联网启用前人工填写；空凭据不影响离线测试。公共offset/历史长度/因子参数继承Git的config.py；仅测试部分offset时通过JSON的enabled_hour_offsets覆盖。部署所用JSON不写入Git，不打印密钥。默认4个因子线程、完整Arrow发布。
 6. 在目标机编译四个扩展并离线验证：
 
 ```bash
@@ -72,6 +72,15 @@ cd /home/ubuntu/alpha
 本轮不执行该命令。验收后选择一个进程管理器，固定cwd和绝对解释器；控制台日志不要覆盖程序自身轮转日志。测试端交易消费者应独立部署和dry_run，不能管理同一线上账户。
 
 ## 后续更新与回滚
+
+本地main保留完整开发历史；服务器main仅保存已审查的干净发布提交，提交号与源码main不同，发布提交说明记录来源源码main。不要把源main直接push到这个干净仓库。保留上一次干净bundle，后续打包加--previous继承它的发布历史，才能fast-forward：
+
+```powershell
+& "C:/Users/Administrator/miniconda3/envs/alpha311/python.exe" -X utf8 -B D:/alpha/tools/package_release.py D:/alpha-release-NEXT.bundle --previous D:/alpha-release-20261103.bundle
+scp -i E:/siteup/env/visibility-deploy.pem D:/alpha-release-NEXT.bundle ubuntu@43.173.122.28:/home/ubuntu/alpha-update.bundle
+```
+
+仅能传入本工具生成的干净bundle作为previous，不得传入完整源码历史包。打包自动包括已跟踪的docs/tests，忽略工作区未提交修改和被忽略的机器文件。保留上轮bundle用于下次打包/回滚，不覆盖原文件。
 
 只更新本安装：先停止并等待其全部子进程退出，保留config.json与业务data。上传新bundle后：
 
