@@ -30,4 +30,14 @@ bash tools/deploy_alpha.sh verify
 
 需要改变生产排除规则时可查看`git sparse-checkout list`；不要执行`git sparse-checkout disable`，否则Git会重新检出根tests目录。其他机器开发工作副本不自动启用该规则。
 
-服务器验收结果与实际迁移清单在发布后记录。
+## 正式验收记录
+
+部署代码提交`ef4af1134afc1097be767faa62a7fb9d1980c2df`，Git主干和正式alpha2已同步。core、config、factors、realtime_data及startup均无本轮业务差异，没有重编译或替换运行中的C扩展。
+
+工具专项4通过；本地原入口152通过（23.85秒），新隔离入口152通过（36.60秒）；Ubuntu新隔离入口152通过（10.88秒）。报告为`/home/ubuntu/alpha2/test/verify-a_ps_rxc/verify.log`。
+
+正式已将原`tests/`和9个旧测试/构建报告、独立对拍脚本迁入`test/archive/`。旧报告原先位于`/home/ubuntu/alpha-deploy-logs/`及`/home/ubuntu/alpha2-*.log`，历史文档里的旧路径只代表迁移前位置。部署备份、业务日志和原生扩展保持原位。测试目录最终899个文件，全部保留等待人工删除，没有代用户删除整个test目录。
+
+Git sparse checkout排除根tests/后工作区干净。生产实际执行了可逆缺目录验证：临时将test改名隐藏，新的Python进程从生产路径成功导入config、core.arrow_publish、core.preprocess、realtime_data，确认模块和storage_path均不指向test；随后恢复test。测试fixture另验证过实际删除test后业务仍可运行且verify可重新生成。
+
+迁移前后PM2状态一致：alpha为stopped、PID0（与更早只读审计时online不同，是本轮执行前已有状态）；alpha2为online、PID3855266。config.json逐字节保持，未启动/停止/重启任何服务，未下单，未清业务数据。检查结束可用空间约79GiB；该容量变化不能归因于本次测试迁移。
