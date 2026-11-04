@@ -254,4 +254,4 @@ def test_old_arrow_snapshots_cleaned_up_across_runs(tmp, factor_config):
         preprocess_type_data(handle, run_ts.to_pydatetime(), "spot", df_match)
 
     snaps = sorted(Path(preprocess_mgr.base_dir).glob("spot_dict_*.arrow"))
-    assert len(snaps) <= 2, f"old arrow snapshots not cleaned up: {[s.name for s in snaps]}"
+    assert len(snaps) == 1, f"old arrow snapshots not cleaned up: {[s.name for s in snaps]}"

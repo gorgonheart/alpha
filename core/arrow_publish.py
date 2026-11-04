@@ -62,17 +62,21 @@ def publish_arrow_snapshot(market_dict: dict[str, pd.DataFrame], out_path, publi
     metadata[b'full_history'] = b'1' if publish_kline_num == 0 else b'0'
     schema_with_manifest = ref_schema.with_metadata(metadata)
     tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
-    with open(tmp_path, "wb") as fout:
-        with pa.ipc.new_file(fout, schema_with_manifest) as writer:
-            writer.write_batch(first)
-            del first
-            for symbol in symbols[1:]:
-                writer.write_batch(batch_for(symbol, ref_schema))
-        fout.flush()
-        os.fsync(fout.fileno())
+    try:
+        with open(tmp_path, "wb") as fout:
+            with pa.ipc.new_file(fout, schema_with_manifest) as writer:
+                writer.write_batch(first)
+                del first
+                for symbol in symbols[1:]:
+                    writer.write_batch(batch_for(symbol, ref_schema))
+            fout.flush()
+            os.fsync(fout.fileno())
 
-    # 原子改名：消费者要么看到完整快照，要么看到上一轮。
-    os.replace(tmp_path, out_path)
+        # 保留旧文件直到新文件完整落盘；同轮重跑也是原子替换。
+        os.replace(tmp_path, out_path)
+    finally:
+        # 发布失败（如磁盘写满）也回收本轮半成品，不动已有完整快照。
+        tmp_path.unlink(missing_ok=True)
 
     # ready 标志（与既有 CandleFileManager 约定一致：同名 .ready 旁车文件）
     if write_ready:
@@ -81,7 +85,7 @@ def publish_arrow_snapshot(market_dict: dict[str, pd.DataFrame], out_path, publi
             fready.write(str(pd.Timestamp.now().timestamp()))
 
 
-def cleanup_old_snapshots(base_dir, trade_type: str, keep: int = 2) -> None:
+def cleanup_old_snapshots(base_dir, trade_type: str, keep: int = 1, *, current_epoch: int | None = None) -> None:
     """删除某 trade_type 过期的 ``{trade_type}_dict_{epoch}.arrow`` 快照（设计文档 Finding 2）。
 
     epoch 戳的快照只会累积（每轮新写一个文件，``.ready`` 标志被覆盖但旧 ``.arrow``
@@ -90,8 +94,11 @@ def cleanup_old_snapshots(base_dir, trade_type: str, keep: int = 2) -> None:
 
     :param base_dir:   快照所在目录。
     :param trade_type: 仅清理该 trade_type（如 ``"spot"``），其他 trade_type 不受影响。
-    :param keep:       保留最新的几个 epoch（默认 2，给可能正在 mmap 读上一轮的消费者留余量）。
+    :param keep:       保留轮数，默认 1，必须是正整数。
+    :param current_epoch: 已成功发布的当前轮，补算旧轮时也必须保留，供同轮消费者读取。
     """
+    if type(keep) is not int or keep < 1:
+        raise ValueError('keep must be a positive integer')
     base_dir = Path(base_dir)
 
     # 清理崩溃残留的半写文件
@@ -108,8 +115,9 @@ def cleanup_old_snapshots(base_dir, trade_type: str, keep: int = 2) -> None:
         except ValueError:
             return -1
 
-    snaps.sort(key=_epoch)  # 升序，最旧在前
-    for old in snaps[:-keep] if keep > 0 else snaps:
+    # 当前发布轮优先；补算时间早于磁盘残留轮次时，不能删掉刚发布的文件。
+    snaps.sort(key=lambda p: (_epoch(p) == current_epoch, _epoch(p)))
+    for old in snaps[:-keep]:
         old.unlink()
         ready = old.with_suffix(".ready")
         if ready.exists():

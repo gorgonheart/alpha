@@ -554,7 +554,8 @@ def publish_arrow_snapshot_for_type(handle: BmacHandle, run_time: datetime, trad
         # gate 标志由上层 save_ready 统一管理（清理过期 + 单一信号），此处不写 .ready。
         publish_arrow_snapshot(market_dict, out_path, publish_kline_num, write_ready=False)
         # Finding 2：清理过期 epoch 快照，避免 {type}_dict_{epoch}.arrow 无限堆积。
-        cleanup_old_snapshots(preprocess_mgr.base_dir, trade_type, keep=2)
+        cleanup_old_snapshots(preprocess_mgr.base_dir, trade_type,
+                              keep=getattr(bmac_config, 'arrow_snapshot_keep', 1), current_epoch=epoch)
     except Exception as exc:
         # 加法步骤：发布失败仅记录，不影响既有 pkl 路径与后续 gate 标志。
         logger.error(f'Arrow 发布 {trade_type} 失败（不影响 pkl 路径）: {exc!r}')

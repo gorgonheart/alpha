@@ -1,5 +1,8 @@
 # alpha Linux部署与维护
 
+2026-11-05：完整Arrow默认仅保留当前发布一轮，配置arrow_snapshot_keep=1（config.py；私有JSON可覆盖），发布仍按epoch命名并原子替换，不改消费者同轮读取。写入过程需额外临时空间，失败回收半成品。清理、最小core范围与验证见[单轮保留](2026-11-05-arrow-single-snapshot.md)。
+
+
 2026-11-03新增测试服务器`43.173.122.28`：使用package_release.py输出不含开发历史的干净Git包，后续加--previous保持发布历史fast-forward；不向新服务器传递下述旧式完整main bundle。首次手工安装、Git bundle传递、配置、启用前准备与维护见[新测试服务器部署](2026-11-03-test-server-deployment.md)。本轮目标目录为/home/ubuntu/alpha，区别于原服务器alpha2；仅部署离线验证，不启动。
 
 2026-11-02首次部署验收：本地Windows专项101项通过，服务器独立alpha311/Linux专项100项通过；少一项为部署列表未包含Windows编码回归。运行代码验证版本dc12fdc，随后仅更新部署记录。服务器四个C扩展已本机编译，CCI既有golden差为0。alpha2只部署，不启动；旧alpha进程保留。构建/测试日志分别为/home/ubuntu/alpha2-build.log和/home/ubuntu/alpha2-verify.log。后续以git log显示的main版本为准。

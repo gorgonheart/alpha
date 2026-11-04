@@ -16,3 +16,17 @@ def test_ignored_json_overrides_server_paths_proxy_and_credentials(tmp_path, mon
     spec.loader.exec_module(module)
     for key, value in settings.items():
         assert getattr(module, key) == value
+
+
+def test_retention_defaults_to_one_and_json_can_override(tmp_path, monkeypatch):
+    monkeypatch.setattr(path_kit, 'get_file_path', lambda *args, **kwargs: tmp_path/args[0])
+    monkeypatch.setattr(path_kit, 'get_folder_path', lambda *args, **kwargs: str(tmp_path/'data'))
+    source = Path(__file__).resolve().parents[1]/'config.py'
+    def load():
+        spec = importlib.util.spec_from_file_location('retention_config', source)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    assert load().arrow_snapshot_keep == 1
+    (tmp_path/'config.json').write_text(json.dumps({'arrow_snapshot_keep': 2}), encoding='utf-8')
+    assert load().arrow_snapshot_keep == 2

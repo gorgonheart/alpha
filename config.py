@@ -86,6 +86,9 @@ preprocess_num_recent = 3
 # 正数深度需覆盖消费者窗口及过滤余量；0表示不裁切。
 # 0：发布全部保留历史，初始化直接复用长因子；普通消费者需先裁行再转 Pandas。
 publish_kline_num = 0
+# 每个 offset、每个市场保留的完整 Arrow 轮数；新轮原子发布后再清旧轮。
+# 1 表示只保留当前发布轮，写入时仍需要一份临时文件空间。
+arrow_snapshot_keep = 1
 
 # 如果有 json 配置，则使用 json 配置覆盖掉 config.py 中的配置
 json_file_config = get_file_path('config.json', as_path_type=True)
@@ -97,8 +100,11 @@ if json_file_config.exists():
         allowed_attrs = (
             'kline_count_1h_spot', 'kline_count_1h_swap', 'error_webhook_url', 'use_api', 'data_api_uuid', 'data_api_key',
             'enabled_hour_offsets', 'funding_rate', 'precompute_factor_configs', 'precompute_factor_workers',
-            'proxy', 'storage_path', 'publish_kline_num')
+            'proxy', 'storage_path', 'publish_kline_num', 'arrow_snapshot_keep')
 
         for _attr in allowed_attrs:
             if _attr in config_data:
                 globals()[_attr] = config_data[_attr]  # 自动转换为全局变量
+
+if type(arrow_snapshot_keep) is not int or arrow_snapshot_keep < 1:
+    raise ValueError('arrow_snapshot_keep must be a positive integer')

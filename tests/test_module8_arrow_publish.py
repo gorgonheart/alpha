@@ -135,8 +135,8 @@ def test_cleanup_keeps_newest_n_snapshots(tmp):
 
     Finding 2: epoch-stamped {type}_dict_{epoch}.arrow files accumulate forever
     (only the .ready flag is overwritten). This leaks ~1.2 GB/cycle/offset on the
-    8 GB server. Cleanup keeps a small safety margin (default 2) for consumers that
-    may be mid-mmap-read of the previous snapshot.
+    8 GB server. An explicit keep=2 retains a previous round; the production default is one
+    successfully published round.
     """
     from core.arrow_publish import cleanup_old_snapshots
 
