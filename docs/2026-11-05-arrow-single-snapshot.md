@@ -26,4 +26,15 @@
 
 ubuntu的dump.pm2与dump.pm2.bak均不存在，日志06:14起ENOSPC，06:27的pm2.pid是0字节，当前daemon列表为空。不能直接pm2 resurrect恢复原列表；应从既有startup.json/历史命令逐项重建，确认无同程序存活，再pm2 save。不能为了恢复alpha2同时自动启动所有交易实例。此次检查不承诺EOFError已修复；空间不足后PKL读取错误需要另行定位。
 
-Linux验收、提交号和日志在发布后追加。
+## 正式发布验收
+
+代码提交`9e5e15d218d05037f69d1668712b80e8c81c6092`已快进合并main并部署到正式alpha2及私有origin/main。四个C扩展构建成功，Ubuntu alpha311专项148通过（6.59秒），pip check正常；原有5/15/25/35/45/55m、完整历史深度、storage_path及凭据保留，受跟踪工作区干净，私有JSON权限600。
+
+实际`/home/ubuntu/alphatrade/core/utils/arrow_reader.py`离线读取44组逐值一致，包含全部11个offset和现货/合约的完整及裁尾读取；Ubuntu还实际验证了新轮发布、旧路径删除后已经打开的mmap仍能读取。目录最终12份完整Arrow、无Arrow临时文件、磁盘约16GiB可用。独立代码复核无Critical/Important问题；strict逐币重新开路径的消费者仍需在下一小时同offset发布前完成读取，不能把已打开mmap可用外推为旧路径永久可用。
+
+- 备份：`/home/ubuntu/alpha-deploy-backups/alpha2-single-arrow-20261104T233834Z`（UTC命名，目录700，文件600）。
+- 日志：`/home/ubuntu/alpha-deploy-logs/alpha2-single-arrow-20261105-{build,verify,consumer}.log`。
+- PM2：检查时无dump、无备份、无注册程序；未创建新服务、未启动生产者、未自动恢复交易。未发现所核查业务目录中仍存活的Python主程序；历史启动命令可作为逐项重建依据，但不能恢复原来的PM2 ID/内存状态。
+- PM2 CLI源码确认`kill`操作针对daemon，且有多余参数拒绝逻辑，不能仅凭历史`pm2 kill 3`就断言其成功执行并导致丢列表。服务器未重启（系统启动时间2026-01-16）；空间不足日志是确定证据，daemon清单丢失的完整因果未证明。
+
+本次为代码部署和离线接口验收，不代表生产者已恢复运行。需要按原启动命令重建PM2条目后`pm2 save`；恢复所有交易程序需要单独明确指令。此前EOFError是否已解除也未通过真实运行验证。
