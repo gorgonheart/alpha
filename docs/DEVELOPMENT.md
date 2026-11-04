@@ -1,5 +1,8 @@
 # 两项目统一开发文档入口
 
+2026-11-05：正式alpha2离线验证统一在可删除test/目录内生成独立已提交源码副本，空凭据和隔离数据/缓存/报告；正式Git排除根tests/，开发仓库不变。删除test不影响业务，下次verify自动重建，无core或运行入口修改。详见[可删除测试目录](2026-11-05-disposable-test-directory.md)。
+
+
 2026-11-05：Arrow保留轮数移至config.py的arrow_snapshot_keep=1，成功原子发布后清旧轮，失败回收tmp并保留旧完整快照；旧轮补算保留current_epoch，时间戳/ready及下游接口不变。core仅arrow_publish和preprocess两文件，无realtime_data或alphaonline修改。本地148专项及44组实际消费者读取通过，正式已先清理旧轮，Linux发布验证见[单轮保留说明](2026-11-05-arrow-single-snapshot.md)。
 
 

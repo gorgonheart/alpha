@@ -21,3 +21,6 @@ factors/c_ext/_momentum_core.c
 factors/c_ext/_illq_core.c
 factors/c_ext/_cci_core.c
 factors/c_ext/_momentum_v2_core.c
+
+# Disposable production verification, safe to remove after checks.
+test/

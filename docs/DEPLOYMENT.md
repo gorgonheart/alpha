@@ -1,5 +1,8 @@
 # alpha Linux部署与维护
 
+2026-11-05：正式alpha2离线验证统一在可删除test/目录内生成独立已提交源码副本，空凭据和隔离数据/缓存/报告；正式Git排除根tests/，开发仓库不变。删除test不影响业务，下次verify自动重建，无core或运行入口修改。详见[可删除测试目录](2026-11-05-disposable-test-directory.md)。
+
+
 2026-11-05：完整Arrow默认仅保留当前发布一轮，配置arrow_snapshot_keep=1（config.py；私有JSON可覆盖），发布仍按epoch命名并原子替换，不改消费者同轮读取。写入过程需额外临时空间，失败回收半成品。清理、最小core范围与验证见[单轮保留](2026-11-05-arrow-single-snapshot.md)。
 
 
