@@ -19,4 +19,14 @@ TDD新增9项首次全部失败；实现后市值/配置11项通过，关联调�
 
 目标仅`43.173.122.28:/home/ubuntu/alpha`。验证先在隔离副本运行11项测试，再通过实际7897代理读取产品状态、获取一天已完成市值数据的下载链接并下载解析CSV，不写业务缓存、不输出密钥或签名URL。通过后备份运行文件和机器JSON，开启测试机开关，仅重启PM2 realtime_data；不改动交易消费者、Mihomo或正式服务器。
 
-部署后验证与日志位置在实施完成时追加。
+## 测试服发布结果
+
+功能提交`f7f4bf48b3ead0e612bebd6aec1e8541324d0e0b`保存在隔离分支，未合并或修改另一工作区的未提交Arrow候选。测试机不是Git安装，本轮只增量发布`config.py`、`config.json`和上述两个core文件；其他代码、原生扩展、策略与机器差异保持。
+
+Ubuntu隔离副本11项通过（1.68秒）。真实代理验证取得2026-11-04市值CSV，832行/830币，产品状态、鉴权下载链接、CSV三次请求均断言传入代理：候选2.794秒；发布后直接加载已安装Quantclass客户端再验1.876秒，均成功，不写业务市值缓存、不输出API密钥或签名URL。
+
+16:33（UTC+8）仅重启测试PM2 realtime_data，PID753634→981057；交易端alphatrade-dryrun PID850132不变。新启动日志16:33:37确认“初始化市值数据成功”；Mihomo未重启，正式服务器未操作。测试机私有JSON已设置`coin_cap_use_proxy=true`，代理`http://127.0.0.1:7897`，权限600。
+
+- 测试及日志：`/home/ubuntu/alpha/test/coin-cap-proxy-6doauf9e/`，含offline.log、online.log、installed_online.log及隔离副本，验证结束后可整体人工删除。
+- 运行文件/机器配置备份：`/home/ubuntu/alpha-deploy-backups/coin-cap-proxy-20261105T083324Z`，UTC命名、目录700/文件600；不依赖test目录。回退需恢复四个备份文件并仅重启测试alpha。
+- 发布前16:25日志另有DataAPI K线下载链接超时；本轮该通道保持原直连行为，不能把市值验证通过描述为DataAPI全部请求恢复。
