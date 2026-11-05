@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 import time
 from typing import Optional
 import pandas as pd
+import config as bmac_config
 
 from core.handle import BmacHandle, CoinCapHandle
 from core.quantclass_async import QuantclassDataApi
@@ -41,7 +42,8 @@ async def coin_cap_update_to_recent(handle: BmacHandle, run_time: datetime):
 
     async with create_aiohttp_session(handle.http_timeout_sec) as session:
         cfg = handle.coin_cap_handle.cfg
-        api = QuantclassDataApi(session, cfg.data_api_key, cfg.data_api_uuid)
+        api = QuantclassDataApi(session, cfg.data_api_key, cfg.data_api_uuid,
+                               coin_cap_proxy=handle.proxy if bmac_config.coin_cap_use_proxy else None)
         df_product = await async_retry_getter(api.aioreq_product_infos)
 
     last_update_time: datetime = df_product.loc['coin-cap-daily', 'update_time']
@@ -59,7 +61,8 @@ async def update_daily_coin_cap(handle: BmacHandle, dt: datetime, run_time: date
     logger.debug(f'更新市场数据, 日期={dt.date()}, 当前时间={now_time_str()}')
     async with create_aiohttp_session(handle.http_timeout_sec) as session:
         cfg = handle.coin_cap_handle.cfg
-        api = QuantclassDataApi(session, cfg.data_api_key, cfg.data_api_uuid)
+        api = QuantclassDataApi(session, cfg.data_api_key, cfg.data_api_uuid,
+                               coin_cap_proxy=handle.proxy if bmac_config.coin_cap_use_proxy else None)
         data_url = await async_retry_getter(api.aioreq_coincap_url, run_time=dt)
         logger.debug(f'url={data_url}')
         df: Optional[pd.DataFrame] = await async_retry_getter(api.aioreq_coincap_df, url=data_url)
