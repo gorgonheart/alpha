@@ -127,3 +127,22 @@ def test_four_factor_workers_progress_across_both_markets(tmp_path, monkeypatch,
     oracle_factor[0][0].signal_multi_params = synchronized
     pp.preprocess_offset_data(handle, stamp, begins, begins)
     assert len(threads) == 4
+
+
+def test_demand_depth_captured_once_for_both_markets(tmp_path, monkeypatch):
+    import core.arrow_demand as demand
+    monkeypatch.setattr(pp, 'bmac_config', SimpleNamespace(precompute_factor_workers=0,
+        publish_kline_num=4050, arrow_demand_enabled=True))
+    monkeypatch.setattr(pp, 'preprocess_match_symbols', lambda *args: pd.DataFrame())
+    monkeypatch.setattr(pp, '_load_factor_modules_params', lambda: [])
+    monkeypatch.setattr(pp, 'get_offset_from_runtime', lambda *args:'25m')
+    reads=[];seen=[]
+    def resolve(*args,**kwargs):
+        reads.append(1)
+        return 0 if len(reads)==1 else 4050
+    monkeypatch.setattr(demand,'publication_rows',resolve)
+    monkeypatch.setattr(pp,'preprocess_type_data',lambda *args,**kwargs:seen.append(kwargs['publish_kline_num']))
+    handle=SimpleNamespace(resample_interval='1h',preprocess_handle=SimpleNamespace(
+        preprocess_mgr_map={'25m':SimpleNamespace(base_dir=tmp_path)}))
+    pp.preprocess_offset_data(handle,None,None,None)
+    assert reads==[1] and seen==[0,0]

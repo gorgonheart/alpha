@@ -1,3 +1,4 @@
+from core.coin_cap_schema import COIN_CAP_DTYPES
 from datetime import datetime, timedelta
 from io import BytesIO
 from typing import Optional
@@ -12,10 +13,12 @@ from core.utils.log_kit import logger
 
 class QuantclassDataApi:
 
-    def __init__(self, session: aiohttp.ClientSession, api_key, uuid):
+    def __init__(self, session: aiohttp.ClientSession, api_key, uuid, coin_cap_proxy=None):
         self.api_key = api_key
         self.uuid = uuid
         self.session = session
+        # Only market-cap requests use this opt-in proxy; Kline routes stay unchanged.
+        self.coin_cap_proxy = coin_cap_proxy
 
     async def aioreq_data_api(self, offset) -> dict:
         url = 'https://api.quantclass.cn/api/data/realtime/coin/binance-1h'
@@ -38,16 +41,16 @@ class QuantclassDataApi:
         params = {'uuid': self.uuid}
         headers = {'api-key': self.api_key}
 
-        async with self.session.get(url, params=params, headers=headers) as resp:
+        async with self.session.get(url, params=params, headers=headers, proxy=self.coin_cap_proxy) as resp:
             data = await resp.text()
             return data
 
     async def aioreq_coincap_df(self, url) -> Optional[pd.DataFrame]:
-        async with self.session.get(url) as resp:
+        async with self.session.get(url, proxy=self.coin_cap_proxy) as resp:
             if not str(resp.status).startswith('2'):
                 return None
             raw_data = BytesIO(await resp.read())
-        df = pd.read_csv(raw_data, encoding='gbk', skiprows=1, parse_dates=['candle_begin_time', 'date_added'])
+        df = pd.read_csv(raw_data, encoding='gbk', skiprows=1, parse_dates=['candle_begin_time', 'date_added'], dtype=COIN_CAP_DTYPES)
         df['symbol'] = df['symbol'].str.replace('-', '')
         return df
 
@@ -83,7 +86,7 @@ class QuantclassDataApi:
         last_error = None
         for url in urls:
             try:
-                async with self.session.get(url) as resp:
+                async with self.session.get(url, proxy=self.coin_cap_proxy) as resp:
                     if not str(resp.status).startswith('2'):
                         raise ValueError(f'HTTP {resp.status}')
                     data = (await resp.json(content_type=None))['data']

@@ -1,8 +1,10 @@
+from core.coin_cap_schema import COIN_CAP_DTYPES
 import asyncio
 from datetime import datetime, timedelta
 import time
 from typing import Optional
 import pandas as pd
+import config as bmac_config
 
 from core.handle import BmacHandle, CoinCapHandle
 from core.quantclass_async import QuantclassDataApi
@@ -16,7 +18,7 @@ def convert_coin_cap_csv(coin_cap_handle: CoinCapHandle, run_time: datetime):
     base_dir = coin_cap_mgr.base_dir
     csv_files = base_dir.glob('*.csv')
     for csv_file in csv_files:
-        df_cap = pd.read_csv(csv_file, skiprows=1, encoding='gbk', parse_dates=['candle_begin_time', 'date_added'])
+        df_cap = pd.read_csv(csv_file, skiprows=1, encoding='gbk', parse_dates=['candle_begin_time', 'date_added'], dtype=COIN_CAP_DTYPES)
         symbol = csv_file.stem.replace('-', '')
         df_cap['symbol'] = df_cap['symbol'].str.replace('-', '')
 
@@ -41,7 +43,8 @@ async def coin_cap_update_to_recent(handle: BmacHandle, run_time: datetime):
 
     async with create_aiohttp_session(handle.http_timeout_sec) as session:
         cfg = handle.coin_cap_handle.cfg
-        api = QuantclassDataApi(session, cfg.data_api_key, cfg.data_api_uuid)
+        api = QuantclassDataApi(session, cfg.data_api_key, cfg.data_api_uuid,
+                               coin_cap_proxy=handle.proxy if bmac_config.coin_cap_use_proxy else None)
         df_product = await async_retry_getter(api.aioreq_product_infos)
 
     last_update_time: datetime = df_product.loc['coin-cap-daily', 'update_time']
@@ -59,7 +62,8 @@ async def update_daily_coin_cap(handle: BmacHandle, dt: datetime, run_time: date
     logger.debug(f'更新市场数据, 日期={dt.date()}, 当前时间={now_time_str()}')
     async with create_aiohttp_session(handle.http_timeout_sec) as session:
         cfg = handle.coin_cap_handle.cfg
-        api = QuantclassDataApi(session, cfg.data_api_key, cfg.data_api_uuid)
+        api = QuantclassDataApi(session, cfg.data_api_key, cfg.data_api_uuid,
+                               coin_cap_proxy=handle.proxy if bmac_config.coin_cap_use_proxy else None)
         data_url = await async_retry_getter(api.aioreq_coincap_url, run_time=dt)
         logger.debug(f'url={data_url}')
         df: Optional[pd.DataFrame] = await async_retry_getter(api.aioreq_coincap_df, url=data_url)

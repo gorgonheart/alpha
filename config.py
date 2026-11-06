@@ -49,6 +49,8 @@ data_api_key = ""  # Machine-specific value comes from ignored config.json.
 # 如果使用代理 注意替换IP和Port
 # proxy = None
 proxy = 'http://127.0.0.1:7897'  # 如果你用clash的话
+# Market-cap requests only; the existing machine JSON may opt in.
+coin_cap_use_proxy = False
 
 # 只更新部分分钟偏移（hour_offset），可有效节省你的硬盘，
 # 当然如果你配置了新的hour_offset策略，需要同步更新数据中心这边的配置
@@ -89,6 +91,11 @@ publish_kline_num = 0
 # 每个 offset、每个市场保留的完整 Arrow 轮数；新轮原子发布后再清旧轮。
 # 1 表示只保留当前发布轮，写入时仍需要一份临时文件空间。
 arrow_snapshot_keep = 1
+# Opt-in shared consumer demand; capture once for both markets, no raw-history trim.
+arrow_demand_enabled = False
+# None preserves publish_kline_num for unregistered consumers (0 = full).
+# Set e.g. 5000 only after confirming ALL non-participating readers fit it.
+arrow_demand_min_rows = None
 
 # 如果有 json 配置，则使用 json 配置覆盖掉 config.py 中的配置
 json_file_config = get_file_path('config.json', as_path_type=True)
@@ -100,7 +107,7 @@ if json_file_config.exists():
         allowed_attrs = (
             'kline_count_1h_spot', 'kline_count_1h_swap', 'error_webhook_url', 'use_api', 'data_api_uuid', 'data_api_key',
             'enabled_hour_offsets', 'funding_rate', 'precompute_factor_configs', 'precompute_factor_workers',
-            'proxy', 'storage_path', 'publish_kline_num', 'arrow_snapshot_keep')
+            'coin_cap_use_proxy', 'proxy', 'storage_path', 'publish_kline_num', 'arrow_snapshot_keep', 'arrow_demand_enabled', 'arrow_demand_min_rows')
 
         for _attr in allowed_attrs:
             if _attr in config_data:
@@ -108,3 +115,8 @@ if json_file_config.exists():
 
 if type(arrow_snapshot_keep) is not int or arrow_snapshot_keep < 1:
     raise ValueError('arrow_snapshot_keep must be a positive integer')
+
+if type(coin_cap_use_proxy) is not bool:
+    raise ValueError('coin_cap_use_proxy must be a boolean')
+if coin_cap_use_proxy and not proxy:
+    raise ValueError('coin_cap_use_proxy requires a configured proxy')

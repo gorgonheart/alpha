@@ -5,6 +5,8 @@ author: 邢不行
 微信: xbx6660
 """
 import asyncio
+from copy import copy
+from core.publication_sources import choose_publication_inputs
 import sys
 import time
 import traceback
@@ -16,6 +18,7 @@ from core.utils.log_kit import divider, logger
 from core.version import VERSION
 from core.binance_update import fetch_update_binance_candles, update_binance_base_candles, update_binance_meta
 from core.backfill import maybe_backfill
+from core.funding_backfill import defer_funding_backfill
 from core.data_api_update import update_data_api_candles
 from core.handle import BmacHandle, create_bmac_handle_from_config, debug_handle
 from core.history_data.history import run_download_all_history
@@ -32,7 +35,9 @@ if sys.platform == "win32":
 
 def update_all(handle: BmacHandle, run_time: datetime):
     if f"{run_time.minute}m" not in handle.enabled_hour_offsets:
-        logger.info(f"Runtime={run_time},不在 Offset={handle.enabled_hour_offsets} 中，等待该调度点检查补算")
+        logger.info(f"Runtime={run_time} 未启用该 Offset，刷新市场信息与资金费后检查补算")
+        sleep_until_run_time(run_time - timedelta(seconds=15))
+        asyncio.run(update_binance_meta(handle, run_time))
 
         # 首次启动时，除 init 那个分钟归属的 offset 外都还没有预处理 ready。
         # Wait for this base-period tick, instead of rechecking its future time every minute.
@@ -83,25 +88,46 @@ def update_all(handle: BmacHandle, run_time: datetime):
         if handle.coin_cap_handle is not None:
             task_coin_cap = exe.submit(run_coin_cap_update_to_recent, handle, run_time)
 
-        # 使用 as_completed 等待任意一个任务完成
+        # Binance completion fixes source priority. A missing/failed DataAPI
+        # does not delay publication once Binance covers the current market.
         task_preprocess = None
+        binance_result = data_api_result = None
+        binance_done = False
+        data_api_done = handle.data_api is None
+        coverage_failed = False
         for future in as_completed(update_tasks):
-            is_success = False
+            # A failed source must not discard a completed alternative or stop
+            # the durable 5m update. Coverage still decides whether to publish.
+            try:
+                result = future.result()
+            except Exception as error:
+                source_name = 'Binance' if future == task_binance else 'DataAPI'
+                logger.warning(f'{source_name}采集任务失败: {type(error).__name__}')
+                result = None
             if future == task_binance:
-                binance_result = task_binance.result()
+                binance_done = True
+                binance_result = result
                 if binance_result is not None:
-                    is_success = is_binance_success = True
-                    spot_dfs, swap_dfs, spot_begin_ts, swap_begin_ts = binance_result
-            elif future == task_data_api:
-                data_api_result = task_data_api.result()
-                if data_api_result is not None:
-                    is_success = is_data_api_success = True
-                    spot_begin_ts, swap_begin_ts = data_api_result
-
-            # 子进程：预处理数据
-            # 只要任何一个数据源成功更新完成，就开始预处理
-            if handle.preprocess_handle is not None and task_preprocess is None and is_success:
-                task_preprocess = exe.submit(preprocess_offset_data, handle, run_time, spot_begin_ts, swap_begin_ts)
+                    is_binance_success = True
+                    spot_dfs, swap_dfs, _, _ = binance_result
+            else:
+                data_api_done = True
+                data_api_result = result
+                is_data_api_success = data_api_result is not None
+            if handle.preprocess_handle is not None and task_preprocess is None and not coverage_failed:
+                try:
+                    chosen = choose_publication_inputs(handle, run_time, binance_result, data_api_result,
+                        binance_done=binance_done, data_api_done=data_api_done)
+                except ValueError as error:
+                    errs.append(str(error))
+                    coverage_failed = True
+                    chosen = None
+                if chosen is not None:
+                    sources, spot_begin_ts, swap_begin_ts = chosen
+                    publication_handle = copy(handle)
+                    publication_handle.publication_sources = sources
+                    task_preprocess = exe.submit(preprocess_offset_data, publication_handle, run_time,
+                                                  spot_begin_ts, swap_begin_ts)
 
         if task_preprocess is not None:
             task_preprocess.result()
@@ -164,6 +190,8 @@ def main():
             if not initialized:
                 init_history(handle)
                 initialized = True
+                if handle.fetch_funding_rate:
+                    defer_funding_backfill()
 
             # 阶段3: 更新数据
             while True:

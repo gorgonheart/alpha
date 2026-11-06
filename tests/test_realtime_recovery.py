@@ -1,5 +1,6 @@
 """Run only the scheduler with fake initialization/I/O, never the live service."""
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pandas as pd
 import pytest
@@ -12,7 +13,8 @@ class EndLoop(BaseException):
 
 
 def setup_loop(monkeypatch):
-    handle = SimpleNamespace(base_interval='5m', enabled_hour_offsets=('20m', '40m', '55m'))
+    handle = SimpleNamespace(base_interval='5m', enabled_hour_offsets=('20m', '40m', '55m'), fetch_funding_rate=False)
+    monkeypatch.setattr(rt, 'update_binance_meta', AsyncMock())
     monkeypatch.setattr(rt, 'create_bmac_handle_from_config', lambda: handle)
     monkeypatch.setattr(rt, 'debug_handle', lambda *args: None)
     monkeypatch.setattr(rt, 'divider', lambda *args, **kwargs: None)
@@ -146,4 +148,4 @@ def test_backfill_waits_for_five_minute_boundaries_after_offset_finishes(monkeyp
         rt.main()
     next_check = (checks[0] + pd.Timedelta(seconds=work_seconds)).floor('5min') + pd.Timedelta(minutes=5)
     assert checks == [pd.Timestamp('2026-10-31 08:25', tz='Asia/Hong_Kong'), next_check]
-    assert waits == updates[1:]
+    assert waits == [target for stamp in updates[1:] for target in (stamp-pd.Timedelta(seconds=15), stamp)]

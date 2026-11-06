@@ -1,5 +1,5 @@
 import asyncio
-import random
+from collections import deque
 import time
 from datetime import datetime, timedelta
 
@@ -7,6 +7,7 @@ import pandas as pd
 
 from core.binance_fetcher_async import BinanceFetcher
 from core.handle import BmacHandle
+from core.funding_backfill import REQUEST_LIMIT, WINDOW_SECONDS, recent_funding_window, save_funding_hours, settled_funding_hours
 from core.utils.log_kit import logger
 from core.utils.network import create_aiohttp_session
 from core.utils.time import now_time_str
@@ -20,7 +21,7 @@ FUNDING_INCREMENTAL_BACKFILL_HOURS = 8
 FUNDING_MAX_CONCURRENCY = 4
 
 
-def _calc_symbol_funding_start_time(funding_mgr, symbol: str, global_start_time: datetime, backfill_hours: int):
+def _calc_symbol_funding_start_time(funding_mgr, symbol, global_start_time, recent_start, observed_until):
     """计算单个交易对的资金费历史下载起始时间。
 
     返回:
@@ -40,13 +41,15 @@ def _calc_symbol_funding_start_time(funding_mgr, symbol: str, global_start_time:
         return global_start_time, "full"
 
     time_series = pd.to_datetime(df_existing["candle_begin_time"], utc=True, errors="coerce").dropna()
+    # The nextFundingTime forecast may lie after this snapshot's observed history.
+    time_series = time_series.loc[time_series <= observed_until]
     if time_series.empty:
         return global_start_time, "full"
 
     latest_local_time = time_series.max().to_pydatetime()
-    incremental_start = latest_local_time - timedelta(hours=backfill_hours)
+    incremental_start = latest_local_time - timedelta(hours=FUNDING_INCREMENTAL_BACKFILL_HOURS)
     incremental_start = incremental_start.replace(minute=0, second=0, microsecond=0)
-    start_time = max(global_start_time, incremental_start)
+    start_time = max(global_start_time, min(incremental_start, recent_start))
     return start_time, "incremental"
 
 
@@ -71,6 +74,9 @@ async def async_download_funding_rates(handle: BmacHandle, run_time: datetime, s
     global_start_time = run_time - timedelta(hours=handle.get_kline_count_1h('swap'))
     # Floor 取整到小时
     global_start_time = global_start_time.replace(minute=0, second=0, microsecond=0)
+    recent_ms, end_ms = recent_funding_window(run_time)
+    recent_start = pd.Timestamp(recent_ms, unit='ms', tz='UTC')
+    observed_until = pd.Timestamp(end_ms, unit='ms', tz='UTC')
 
     # 为每个 symbol 初始化起始时间
     symbol_start_times = {}
@@ -78,7 +84,7 @@ async def async_download_funding_rates(handle: BmacHandle, run_time: datetime, s
     full_count = 0
     for symbol in symbols:
         start_time, mode = _calc_symbol_funding_start_time(
-            funding_mgr, symbol, global_start_time, FUNDING_INCREMENTAL_BACKFILL_HOURS
+            funding_mgr, symbol, global_start_time, recent_start, observed_until
         )
         symbol_start_times[symbol] = start_time
         if mode == "incremental":
@@ -96,92 +102,55 @@ async def async_download_funding_rates(handle: BmacHandle, run_time: datetime, s
         f"增量冗余小时数: {FUNDING_INCREMENTAL_BACKFILL_HOURS}"
     )
 
-    completed_symbols = set()
-    batch_count = 0
-    last_info_ts = 0.0
+    # Bound peak memory by keeping at most four symbols' pages in flight. The
+    # full hour may straddle pages, so combine once, after reaching endTime.
+    pending = iter(symbol_start_times.items())
+    request_times = deque()
+    completed = 0
+    last_progress = t_start
 
     async with create_aiohttp_session(30) as session:
         fetcher = BinanceFetcher(binance_handle.api_type, session, handle.proxy)
 
-        # 限制在途请求数，避免 756 个 symbol 同时打 fundingRate 被 WAF 403
-        semaphore = asyncio.Semaphore(FUNDING_MAX_CONCURRENCY)
+        async def reserve_request():
+            # Called for every HTTP attempt, including retries. No await between
+            # the capacity check and reservation on the shared event loop.
+            while True:
+                now = time.monotonic()
+                while request_times and request_times[0] <= now - WINDOW_SECONDS:
+                    request_times.popleft()
+                if len(request_times) < REQUEST_LIMIT:
+                    request_times.append(now)
+                    return
+                await asyncio.sleep(request_times[0] + WINDOW_SECONDS - now)
 
-        async def fetch_one(symbol):
-            async with semaphore:
-                # startTime 是闭区间，这里保留毫秒精度（+1ms 的游标不能被截断成整秒）
-                start_ts = int(symbol_start_times[symbol].timestamp() * 1000)
-                return await fetcher.get_hist_funding_rate(
-                    symbol, limit=FUNDING_RATE_BATCH_LIMIT, startTime=start_ts
-                )
+        async def worker():
+            nonlocal completed, last_progress
+            for symbol, start in pending:
+                cursor = int(start.timestamp() * 1000)
+                pages = []
+                while cursor <= end_ms:
+                    page = await fetcher.get_hist_funding_rate(
+                        symbol, limit=FUNDING_RATE_BATCH_LIMIT, startTime=cursor, endTime=end_ms,
+                        _reserve_request=reserve_request)
+                    if page.empty:
+                        break
+                    pages.append(page)
+                    if len(page) < FUNDING_RATE_BATCH_LIMIT:
+                        break
+                    cursor = page['candle_begin_time'].max().value // 1_000_000 + 1
 
-        # 2. 循环执行数据获取逻辑
-        while len(completed_symbols) < len(symbols):
-            batch_count += 1
-            remaining_symbols = [s for s in symbols if s not in completed_symbols]
+                if pages:
+                    settled = settled_funding_hours(pd.concat(pages, ignore_index=True))
+                    save_funding_hours(funding_mgr, symbol, run_time, settled, None)
+                completed += 1
+                if time.perf_counter() - last_progress >= 30:
+                    logger.info('下载资金费数据，进度=%d/%d', completed, len(symbol_start_times))
+                    last_progress = time.perf_counter()
 
-            # 2.1 对于所有剩余 symbols，每次 batch 获取从各自的 starttime 开始的 1000 条资金费数据
-            tasks = [fetch_one(symbol) for symbol in remaining_symbols]
-
-            results: list[pd.DataFrame] = await asyncio.gather(*tasks)
-
-            # 2.2 遍历所有获得的资金费 DataFrame，使用 funding_mgr，对于每个 symbol 和已有的资金费数据合并
-            batch_completed_symbols = []
-            next_batch_start_times = {}
-
-            for symbol, df_new in zip(remaining_symbols, results):
-                if df_new.empty:
-                    # 如果获取的数据为空，标记为完成
-                    batch_completed_symbols.append(symbol)
-                    continue
-
-                # 获取现有数据并合并
-                if funding_mgr.has_symbol(symbol):
-                    df_existing = funding_mgr.read_candle(symbol)
-                    df_merged = pd.concat([df_existing, df_new], ignore_index=True)
-                else:
-                    df_merged = df_new
-
-                # 按照 candle_begin_time 排序去重
-                df_merged.drop_duplicates("candle_begin_time", ignore_index=True, inplace=True)
-                df_merged.sort_values("candle_begin_time", inplace=True, ignore_index=True)
-
-                # 保存合并后的数据
-                funding_mgr.set_candle(symbol, run_time, df_merged)
-
-                # 2.3 如果某 symbol 这一batch获取的数量不足 FUNDING_RATE_BATCH_LIMIT，则标记为该symbol已经完成
-                if len(df_new) < FUNDING_RATE_BATCH_LIMIT:
-                    batch_completed_symbols.append(symbol)
-                else:
-                    # 2.4 对于这一batch 还没获取完成的 symbols 用 max(candle_begin_time) + 1ms 作为下一batch的 start time
-                    # startTime 为闭区间，+1ms 才能严格衔接；用 +1h 会跳过 1h 结算或 Special 资金费
-                    max_time = df_new["candle_begin_time"].max()
-                    next_start_time = max_time + timedelta(milliseconds=1)
-                    next_batch_start_times[symbol] = next_start_time
-
-            # 更新完成的交易对和下一批次的起始时间
-            completed_symbols.update(batch_completed_symbols)
-            symbol_start_times.update(next_batch_start_times)
-
-            # 只在第一轮和有新的symbol更新完成时才打印进度信息
-            if batch_count == 1 or len(batch_completed_symbols) > 0:
-                progress = (len(completed_symbols) / len(symbols)) * 100
-                time_elapsed = (time.perf_counter() - t_start) / 60
-                msg = (
-                    f"下载资金费数据，"
-                    f"进度={progress:.1f}%({len(completed_symbols)}/{len(symbols)}), "
-                    f"已耗时={time_elapsed:.1f}分钟, "
-                    f"当前时间={now_time_str()}"
-                )
-                logger.debug(msg)
-                # 全量补历史时每轮可能要等 5 分钟，只打 debug 会让日志长时间没有反馈，看起来像卡死
-                if batch_count == 1 or time.perf_counter() - last_info_ts >= 30:
-                    last_info_ts = time.perf_counter()
-                    logger.info(msg)
-
-            # 2.5 直到所有的 symbol 都更新完毕，结束循环；否则 sleep（5分钟 + 随机数）开始下一 batch 获取
-            if len(completed_symbols) < len(symbols):
-                sleep_time = 300 + random.uniform(30, 60)
-                await asyncio.sleep(sleep_time)
+        async with asyncio.TaskGroup() as group:
+            for _ in range(min(len(symbol_start_times), FUNDING_MAX_CONCURRENCY)):
+                group.create_task(worker())
 
     time_elapsed = (time.perf_counter() - t_start) / 60
     logger.ok(f"获取历史资金费率成功, 耗时={time_elapsed:.2f}分钟, 当前时间={now_time_str()}")

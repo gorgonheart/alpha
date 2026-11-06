@@ -3,6 +3,7 @@ import shutil
 
 from core.utils.log_kit import logger
 from core.handle import BmacHandle
+from core.candle_origins import preserve_published_origins
 
 
 def init_offset_dirs(offset_candle_mgr_map: dict):
@@ -21,6 +22,10 @@ def ensure_dir(dir_path, remove_exist=True):
 
 
 def init_dirs(handle: BmacHandle):
+    if handle.preprocess_handle is not None:
+        for mgr in handle.preprocess_handle.preprocess_mgr_map.values():
+            preserve_published_origins(mgr)
+
     # 确保创建 exginfo 目录
     ensure_dir(handle.exg_mgr.base_dir)
 
