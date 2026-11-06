@@ -10,7 +10,7 @@ build() {
 }
 verify() {
   "$PYTHON" -X utf8 -B tools/run_deployment_tests.py \
-    tests/test_deployment_config.py tests/test_deployment_test_directory.py tests/test_dispatch_prewarm.py \
+    tests/test_deployment_config.py tests/test_coin_cap_proxy.py tests/test_deployment_test_directory.py tests/test_dispatch_prewarm.py \
     tests/test_realtime_recovery.py tests/test_exchange_info_reuse.py \
     tests/test_shared_factor_pool.py tests/test_module8_arrow_publish.py \
     tests/test_arrow_single_snapshot.py \
