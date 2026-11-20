@@ -228,7 +228,8 @@ def apply_symbol_match(frame, trade_type, symbol, row):
 
 
 def gen_batch_data(handle: BmacHandle, run_time: datetime, trade_type: str, df_match: pd.DataFrame,
-                   symbol_list: list[str], batch_name: str, with_factors: bool = False, *, funding_publication=None):
+                   symbol_list: list[str], batch_name: str, with_factors: bool = False, *,
+                   funding_publication=None, year_pivot_out=None):
     if not symbol_list:
         return None, dict(), dict()
 
@@ -327,8 +328,11 @@ def gen_batch_data(handle: BmacHandle, run_time: datetime, trade_type: str, df_m
             sym: df.loc[df['candle_begin_time'].between(start_ts, end_ts), PIVOT_COLUMNS]
             for sym, df in market_dict.items()
         }
-        preprocess_mgr.set_candle(pivot_batch_name, run_time, market_dict_for_pivot)
-        year_pivot_name[year] = pivot_batch_name
+        if year_pivot_out is not None:
+            year_pivot_out.setdefault(year, {}).update(market_dict_for_pivot)
+        else:
+            preprocess_mgr.set_candle(pivot_batch_name, run_time, market_dict_for_pivot)
+            year_pivot_name[year] = pivot_batch_name
 
     if with_factors:
         factor_modules_params = _load_factor_modules_params()
@@ -348,7 +352,7 @@ def gen_batch_data(handle: BmacHandle, run_time: datetime, trade_type: str, df_m
 
 def gen_batch_data_incremental(handle: BmacHandle, run_time: datetime, trade_type: str, df_match: pd.DataFrame,
                                symbol_list: list[str], batch_name: str, with_factors: bool = False, *,
-                               funding_publication=None):
+                               funding_publication=None, year_pivot_out=None):
     if not symbol_list:
         return None, dict(), dict()
 
@@ -361,7 +365,8 @@ def gen_batch_data_incremental(handle: BmacHandle, run_time: datetime, trade_typ
 
     if not preprocess_mgr.has_symbol(full_batch_name):
         return gen_batch_data(handle, run_time, trade_type, df_match, symbol_list, batch_name,
-                              with_factors=with_factors, funding_publication=funding_publication)
+                              with_factors=with_factors, funding_publication=funding_publication,
+                              year_pivot_out=year_pivot_out)
 
     old_market_dict: dict[str, pd.DataFrame] = preprocess_mgr.read_candle(full_batch_name)
 
@@ -465,8 +470,11 @@ def gen_batch_data_incremental(handle: BmacHandle, run_time: datetime, trade_typ
                 sym: df.loc[df['candle_begin_time'].between(start_ts, end_ts), PIVOT_COLUMNS]
                 for sym, df in new_market_dict.items()
             }
-            preprocess_mgr.set_candle(pivot_batch_name, run_time, market_dict_for_pivot)
-            year_pivot_name[year] = pivot_batch_name
+            if year_pivot_out is not None:
+                year_pivot_out.setdefault(year, {}).update(market_dict_for_pivot)
+            else:
+                preprocess_mgr.set_candle(pivot_batch_name, run_time, market_dict_for_pivot)
+                year_pivot_name[year] = pivot_batch_name
 
     if with_factors:
         factor_modules_params = _load_factor_modules_params()
@@ -542,16 +550,20 @@ def update_pivot_rows(pivot, market_dict, trade_type):
 
 
 def gen_pivot_incremental(handle: BmacHandle, run_time: datetime, trade_type: str, year_pivot_names: dict[str, list],
-                          *, funding_publication=None):
+                          *, funding_publication=None, year_pivot_data=None):
     """Append new candles and repair overlap, without rewriting unchanged pivots."""
     offset_str = get_offset_from_runtime(run_time, handle.resample_interval)
     preprocess_mgr = handle.preprocess_handle.preprocess_mgr_map[offset_str]
     years = set(year_pivot_names)
+    if year_pivot_data is not None:
+        years.update(year_pivot_data)
     if funding_publication is not None:
         years.update(funding_publication.by_year)
     for year in sorted(years):
         pivot_key = f'market_pivot_{trade_type}_{year}'
         market_dict = {}
+        if year_pivot_data is not None and year in year_pivot_data:
+            market_dict.update(year_pivot_data.pop(year))
         for name in year_pivot_names.get(year, []):
             market_dict.update(preprocess_mgr.read_candle(name))
             preprocess_mgr.remove_symbol(name)
@@ -632,6 +644,7 @@ def preprocess_type_data(handle: BmacHandle, run_time: datetime, trade_type: str
 
     idx = 1
     year_pivot_names = defaultdict(list)
+    year_pivot_data: dict[int, dict[str, pd.DataFrame]] = {}
     t_start = time.perf_counter()
     market_dict: dict[str, pd.DataFrame] = {}
     funding_publication = (FundingPublication(preprocess_mgr.base_dir, run_time)
@@ -643,9 +656,11 @@ def preprocess_type_data(handle: BmacHandle, run_time: datetime, trade_type: str
             batch, symbol_list = symbol_list, []
 
         # Persist raw batches first; compute full-history factors only in memory.
+        # Pass year_pivot_out so pivot slices stay in memory instead of round-tripping
+        # through temporary *_for_pivot_batch*_{year}.pkl files on disk.
         _full_batch_name, year_pivot_name, batch_market_dict = gen_batch_data_incremental(
             handle, run_time, trade_type, df_match, batch, f'batch{idx}', with_factors=False,
-            funding_publication=funding_publication)
+            funding_publication=funding_publication, year_pivot_out=year_pivot_data)
         if factor_modules_params:
             # Ordered consumption propagates failures before this market is published.
             # Finish this batch before submitting another, bounding queued frame references.
@@ -670,7 +685,8 @@ def preprocess_type_data(handle: BmacHandle, run_time: datetime, trade_type: str
     publish_elapsed = time.perf_counter() - t_publish
 
     t_start = time.perf_counter()
-    gen_pivot_incremental(handle, run_time, trade_type, year_pivot_names, funding_publication=funding_publication)
+    gen_pivot_incremental(handle, run_time, trade_type, year_pivot_names,
+                          funding_publication=funding_publication, year_pivot_data=year_pivot_data)
     # Consumers open the batch/Arrow and the year pivot on this one signal.
     preprocess_mgr.save_ready(f'{trade_type}_dict', run_time)
     remember_ready_origins(preprocess_mgr.base_dir, trade_type, run_time, market_dict)

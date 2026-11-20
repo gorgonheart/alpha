@@ -255,3 +255,49 @@ def test_old_arrow_snapshots_cleaned_up_across_runs(tmp, factor_config):
 
     snaps = sorted(Path(preprocess_mgr.base_dir).glob("spot_dict_*.arrow"))
     assert len(snaps) == 1, f"old arrow snapshots not cleaned up: {[s.name for s in snaps]}"
+
+
+def test_pivot_skips_temp_for_pivot_batch_disk_io_and_matches_oracle(tmp, factor_config, monkeypatch):
+    """P4-4 (Finding 4): preprocess_type_data must pass per-year pivot slices directly in memory
+    to gen_pivot_incremental instead of writing/reading/deleting temporary *_for_pivot_batch*_{year}.pkl,
+    producing identical market_pivot_{type}_{year} output."""
+    df_full = load_btcusdt_spot().tail(600).reset_index(drop=True)
+    run_ts = pd.Timestamp(df_full["candle_begin_time"].iloc[-1])
+    handle, preprocess_mgr, _ = _make_full_handle(tmp, df_full, run_ts)
+
+    df_match = pd.DataFrame([{
+        "spot": "BTCUSDT", "swap": "BTCUSDT",
+        "first_begin_time": df_full["candle_begin_time"].min(),
+        "last_begin_time": df_full["candle_begin_time"].max(),
+    }])
+
+    temp_pivot_io = []
+    orig_set_candle = CandleFileManager.set_candle
+    orig_read_candle = CandleFileManager.read_candle
+
+    def spy_set_candle(self, symbol, run_time, data):
+        if "_for_pivot_" in symbol:
+            temp_pivot_io.append(("write", symbol))
+        return orig_set_candle(self, symbol, run_time, data)
+
+    def spy_read_candle(self, symbol):
+        if "_for_pivot_" in symbol:
+            temp_pivot_io.append(("read", symbol))
+        return orig_read_candle(self, symbol)
+
+    monkeypatch.setattr(CandleFileManager, "set_candle", spy_set_candle)
+    monkeypatch.setattr(CandleFileManager, "read_candle", spy_read_candle)
+
+    preprocess_type_data(handle, run_ts.to_pydatetime(), "spot", df_match)
+
+    assert temp_pivot_io == [], (
+        f"Expected 0 temporary *_for_pivot_* disk reads/writes, got: {temp_pivot_io}"
+    )
+
+    year = run_ts.tz_convert("UTC").year if run_ts.tzinfo else run_ts.year
+    pivot_key = f"market_pivot_spot_{year}"
+    assert preprocess_mgr.has_symbol(pivot_key)
+    pivot = preprocess_mgr.read_candle(pivot_key)
+    assert "BTCUSDT" in pivot["close"].columns
+    assert len(pivot["close"]) > 0
+
