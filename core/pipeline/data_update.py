@@ -312,15 +312,25 @@ async def fetch_update_resample(
         if window_truncated and resample_mgr.has_symbol(symbol) and len(df_resample) > 1:
             df_resample = df_resample.iloc[1:]
 
-        first_begin_time, last_begin_time = update_resample_candle(
-            resample_mgr,
-            symbol,
-            df_resample,
-            bound_num_candles,
-            run_time,
-            resample_delta,
-            min_ts=min_ts,
-        )
+        if min_ts is not None:
+            first_begin_time, last_begin_time = update_resample_candle(
+                resample_mgr,
+                symbol,
+                df_resample,
+                bound_num_candles,
+                run_time,
+                resample_delta,
+                min_ts=min_ts,
+            )
+        else:
+            first_begin_time, last_begin_time = update_resample_candle(
+                resample_mgr,
+                symbol,
+                df_resample,
+                bound_num_candles,
+                run_time,
+                resample_delta,
+            )
         if first_begin_time is not None and last_begin_time is not None:
             symbol_begin_time[symbol] = first_begin_time, last_begin_time
 
@@ -409,7 +419,12 @@ def update_base_candles(handle: BmacHandle, run_time, trade_type, symbol_dfs):
         symbol_dir = market_handle.base_candle_dir / symbol
         ts_mgr = TSManager(symbol_dir)
         ts_mgr.update(df_new)
-        ts_mgr.trim(required_first_begin, run_time)
+        if hasattr(ts_mgr, 'trim'):
+            ts_mgr.trim(required_first_begin, run_time)
+        else:
+            partitions = ts_mgr.list_partitions()
+            if partitions:
+                ts_mgr.trim_partition(partitions[0], required_first_begin, run_time)
     logger.ok(f'合并{name} {trade_type} {handle.base_interval} K 线成功, 当前时间={now_time_str()}')
 
 

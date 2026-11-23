@@ -61,6 +61,8 @@ def test_selected_source_cannot_switch_when_other_source_arrives():
 @pytest.mark.parametrize('first',['api','binance'])
 @pytest.mark.parametrize('failure',[None,'api','binance'])
 def test_scheduler_dispatches_once_and_source_failure_does_not_lose_other_source(monkeypatch,first,failure):
+    import core.app as app
+    import core.pipeline.update_cycle as uc
     import realtime_data as rt
     h=handle();h.enabled_hour_offsets=('25m',);h.base_interval='5m'
     h.data_api=object();h.coin_cap_handle=None;h.preprocess_handle=object()
@@ -88,17 +90,18 @@ def test_scheduler_dispatches_once_and_source_failure_does_not_lose_other_source
         return ({'OLD':BOUNDS,'NEW':BOUNDS},{'OLD':BOUNDS,'NEW':BOUNDS})
     def publish(*a):events.append(('publish',a[0].publication_sources))
     async def meta(*a):pass
-    monkeypatch.setattr(rt,'ProcessPoolExecutor',Pool)
-    monkeypatch.setattr(rt,'sleep_until_run_time',lambda *a:None)
-    monkeypatch.setattr(rt,'update_binance_meta',meta)
-    monkeypatch.setattr(rt,'update_symbol_match',lambda *a:None)
-    monkeypatch.setattr(rt,'fetch_update_binance_candles',binance)
-    monkeypatch.setattr(rt,'update_data_api_candles',api)
-    monkeypatch.setattr(rt,'preprocess_offset_data',publish)
-    monkeypatch.setattr(rt,'as_completed',lambda _:iter([jobs[first],jobs['api' if first=='binance' else 'binance']]))
-    monkeypatch.setattr(rt,'update_binance_base_candles',lambda *a:events.append(('base',None)))
-    monkeypatch.setattr(rt,'copy_data_api_candles',lambda *a:None)
-    monkeypatch.setattr(rt,'send_wechat_work_msg',lambda *a:None)
+    monkeypatch.setattr(app,'sleep_until_run_time',lambda *a:None)
+    monkeypatch.setattr(app,'copy_data_api_candles',lambda *a:None)
+    monkeypatch.setattr(app,'send_wechat_work_msg',lambda *a:None)
+    monkeypatch.setattr(uc,'ProcessPoolExecutor',Pool)
+    monkeypatch.setattr(uc,'sleep_until_run_time',lambda *a:None)
+    monkeypatch.setattr(uc,'update_meta',meta)
+    monkeypatch.setattr(uc,'update_symbol_match',lambda *a:None)
+    monkeypatch.setattr(uc,'fetch_update_binance_candles',binance)
+    monkeypatch.setattr(uc,'update_data_api_candles',api)
+    monkeypatch.setattr(uc,'preprocess_offset_data',publish)
+    monkeypatch.setattr(uc,'as_completed',lambda _:iter([jobs[first],jobs['api' if first=='binance' else 'binance']]))
+    monkeypatch.setattr(uc,'update_binance_base_candles',lambda *a:events.append(('base',None)))
     rt.update_all(h,STAMP.to_pydatetime())
     assert sum(name=='submit' for name,_ in events)==1
     assert sum(name=='publish' for name,_ in events)==1

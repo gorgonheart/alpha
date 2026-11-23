@@ -16,7 +16,11 @@ verify() {
     tests/test_arrow_single_snapshot.py \
     tests/test_module9_embedded_factors.py \
     tests/test_module10_preprocess_pipeline.py tests/test_corrected_momentum.py \
-    tests/test_illq_nonfinite_oracle.py tests/test_module_cci.py
+    tests/test_illq_nonfinite_oracle.py tests/test_module_cci.py \
+    tests/test_2b_config_and_handle.py tests/test_2b_writer_and_storage.py \
+    tests/test_2b_history_and_resample.py tests/test_2b_funding_coincap_backfill.py \
+    tests/test_2b_preprocess_peak_and_trim.py tests/test_2b_ws_supervisor.py \
+    tests/test_2b_ws_cycle_and_app.py
 }
 case "${1:-status}" in
   build) build ;;

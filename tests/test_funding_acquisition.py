@@ -107,11 +107,13 @@ def test_replacement_preserves_existing_reader_permissions(tmp_path, monkeypatch
 
 
 def test_disabled_offset_fetches_metadata_then_checks_backfill(monkeypatch):
+    import core.app as app
     sequence = []
     async def meta(*args): sequence.append('meta')
-    monkeypatch.setattr(rt, 'update_binance_meta', meta)
-    monkeypatch.setattr(rt, 'sleep_until_run_time', sequence.append)
-    monkeypatch.setattr(rt, 'maybe_backfill', lambda h: sequence.append('backfill'))
+    monkeypatch.setattr(app, 'update_meta', meta)
+    monkeypatch.setattr(app, 'update_symbol_match', lambda *args: None)
+    monkeypatch.setattr(app, 'sleep_until_run_time', sequence.append)
+    monkeypatch.setattr(app, 'maybe_backfill', lambda h: sequence.append('backfill'))
     rt.update_all(SimpleNamespace(enabled_hour_offsets=('5m',)), HOUR)
     assert sequence == [HOUR - pd.Timedelta(seconds=15), 'meta', HOUR, 'backfill']
 
