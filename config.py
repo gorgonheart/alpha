@@ -9,8 +9,8 @@ from core.utils.path_kit import get_folder_path, get_file_path
 # - 本地存储路径
 # ====================================================================================================
 # Resample(1h) 周期 K 线数量
-kline_count_1h_spot = 14060
-kline_count_1h_swap = 14060
+kline_count_1h_spot = 15000
+kline_count_1h_swap = 15000
 # 全局报错机器人通知
 # - 创建企业微信机器人 参考帖子: https://bbs.quantclass.cn/thread/10975
 # - 配置案例  https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxxxxxxxxxxxxxxxx
@@ -99,6 +99,13 @@ arrow_demand_min_rows = None
 # REST 实时采集相对 run_time 的延后秒数（避开币安跨 5m 边界瞬间未定稿的 K 线，
 # 减少下游交易端 preflight 每小时 2h 伪修订 replay）。0 表示准点立即抓取。
 rest_fetch_delay_seconds = 3.0
+# v2.0.2 / 2B WebSocket 与存储保留配置
+use_websocket = True
+num_writers = 2
+ws_flat_pkl_bars = 240
+base_5m_retention_days = 30
+min_history_start_date = '2025-03-25'
+history_trim_date = None
 
 # 如果有 json 配置，则使用 json 配置覆盖掉 config.py 中的配置
 json_file_config = get_file_path('config.json', as_path_type=True)
@@ -108,20 +115,44 @@ if json_file_config.exists():
 
         # 目前只支持配置这些
         allowed_attrs = (
-            'kline_count_1h_spot', 'kline_count_1h_swap', 'error_webhook_url', 'use_api', 'data_api_uuid', 'data_api_key',
+            'kline_count_1h', 'kline_count_1h_spot', 'kline_count_1h_swap',
+            'error_webhook_url', 'use_api', 'data_api_uuid', 'data_api_key',
             'enabled_hour_offsets', 'funding_rate', 'precompute_factor_configs', 'precompute_factor_workers',
             'coin_cap_use_proxy', 'proxy', 'storage_path', 'publish_kline_num', 'arrow_snapshot_keep',
-            'arrow_demand_enabled', 'arrow_demand_min_rows', 'rest_fetch_delay_seconds')
+            'arrow_demand_enabled', 'arrow_demand_min_rows', 'rest_fetch_delay_seconds',
+            'use_websocket', 'num_writers', 'ws_flat_pkl_bars', 'base_5m_retention_days',
+            'min_history_start_date', 'history_trim_date',
+        )
 
         for _attr in allowed_attrs:
             if _attr in config_data:
                 globals()[_attr] = config_data[_attr]  # 自动转换为全局变量
+
+        if 'kline_count_1h' in config_data:
+            if 'kline_count_1h_spot' not in config_data:
+                kline_count_1h_spot = config_data['kline_count_1h']
+            if 'kline_count_1h_swap' not in config_data:
+                kline_count_1h_swap = config_data['kline_count_1h']
+
+kline_count_1h = max(kline_count_1h_spot, kline_count_1h_swap)
 
 if type(arrow_snapshot_keep) is not int or arrow_snapshot_keep < 1:
     raise ValueError('arrow_snapshot_keep must be a positive integer')
 
 if type(coin_cap_use_proxy) is not bool:
     raise ValueError('coin_cap_use_proxy must be a boolean')
+
+if type(use_websocket) is not bool:
+    raise ValueError('use_websocket must be a boolean')
+
+if type(num_writers) is not int or num_writers < 1:
+    raise ValueError('num_writers must be an integer >= 1')
+
+if type(ws_flat_pkl_bars) is not int or ws_flat_pkl_bars < 1:
+    raise ValueError('ws_flat_pkl_bars must be an integer >= 1')
+
+if type(base_5m_retention_days) is not int or base_5m_retention_days < 7:
+    raise ValueError('base_5m_retention_days must be an integer >= 7')
 
 if isinstance(rest_fetch_delay_seconds, bool) or not isinstance(rest_fetch_delay_seconds, (int, float)) or rest_fetch_delay_seconds < 0:
     raise ValueError('rest_fetch_delay_seconds must be a non-negative number')
