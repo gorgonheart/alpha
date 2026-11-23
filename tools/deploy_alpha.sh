@@ -20,7 +20,7 @@ verify() {
     tests/test_2b_config_and_handle.py tests/test_2b_writer_and_storage.py \
     tests/test_2b_history_and_resample.py tests/test_2b_funding_coincap_backfill.py \
     tests/test_2b_preprocess_peak_and_trim.py tests/test_2b_ws_supervisor.py \
-    tests/test_2b_ws_cycle_and_app.py
+    tests/test_2b_ws_cycle_and_app.py tests/test_2b_cross_repo_contract.py
 }
 case "${1:-status}" in
   build) build ;;
