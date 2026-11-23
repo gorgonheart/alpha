@@ -102,6 +102,7 @@ class WsRunner:
         self._cache: Optional[WsLocalCache] = None
         # 多连接 chunk 列表：[(chunk_idx, client, streams), ...]
         self._chunks: list[tuple[int, Any, list[str]]] = []
+        self._pending_connect_chunks: set[int] = set()
         self._client: Optional[Any] = None  # 向后兼容属性（指向首个 client 或 None）
         self._started: bool = False
         self._stop_event: Optional[asyncio.Event] = None
@@ -258,6 +259,7 @@ class WsRunner:
             self._cache = WsLocalCache(self.cache_path)
         self._stop_event = asyncio.Event()
         self._chunks = []
+        self._pending_connect_chunks = set()
         self._client = None
 
         all_symbols = list(symbols)
@@ -274,20 +276,31 @@ class WsRunner:
         ]
         interval = self._interval_str()
 
-        # 1) 先 connect + subscribe 所有 chunk，确保重放期间实时帧不漏。
+        # 1) 先 connect + subscribe 所有 chunk，确保重放期间实时帧不漏；
+        #    单 chunk 初始握手/订阅失败仅记入待重连集合，由 run() 独立退避恢复，绝不中断其他 chunk。
         for chunk_idx, chunk_syms in enumerate(symbol_chunks):
             chunk_url = self._protocol.ws_url(self.trade_type, chunk_idx)
             client = self._create_client(chunk_url, chunk_idx)
             streams = [self._protocol.stream_name(s, interval) for s in chunk_syms]
-            await client.connect()
-            await client.subscribe(streams)
+            try:
+                await client.connect()
+                await client.subscribe(streams)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "ws_runner[%s] chunk=%d initial connect/subscribe failed (%r); "
+                    "will retry in run loop",
+                    self.trade_type, chunk_idx, exc,
+                )
+                self._pending_connect_chunks.add(chunk_idx)
             self._chunks.append((chunk_idx, client, streams))
 
         self._client = self._chunks[0][1] if self._chunks else None
         self._started = True
         logger.info(
-            "ws_runner[%s] subscribed %d streams across %d chunks",
-            self.trade_type, len(all_symbols), len(self._chunks),
+            "ws_runner[%s] initialized %d streams across %d chunks (pending_connect=%d)",
+            self.trade_type, len(all_symbols), len(self._chunks), len(self._pending_connect_chunks),
         )
 
         # 2) 再重放缓存，并在重放后清理 48h 之前的旧行。
@@ -299,7 +312,33 @@ class WsRunner:
         """单个 chunk 的独立接收 + 异常隔离退避重连循环。"""
         assert self._stop_event is not None
         backoff = self.chunk_retry_base_sec
+        needs_connect = chunk_idx in self._pending_connect_chunks
         while not self._stop_event.is_set():
+            if needs_connect:
+                try:
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=backoff)
+                    break
+                except asyncio.TimeoutError:
+                    pass
+                if self._stop_event.is_set():
+                    break
+                try:
+                    await client.connect()
+                    if streams:
+                        await client.subscribe(streams)
+                    self._pending_connect_chunks.discard(chunk_idx)
+                    needs_connect = False
+                    backoff = self.chunk_retry_base_sec
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "ws_runner[%s] chunk=%d reconnect failed (%r); backoff=%.2fs",
+                        self.trade_type, chunk_idx, exc, backoff,
+                    )
+                    backoff = min(backoff * 2.0, self.chunk_retry_max_sec)
+                    continue
+
             try:
                 await client.run()
                 if self._stop_event.is_set():
@@ -312,29 +351,7 @@ class WsRunner:
                     "ws_runner[%s] chunk=%d run raised (%r); backoff=%.2fs",
                     self.trade_type, chunk_idx, exc, backoff,
                 )
-
-            if self._stop_event.is_set():
-                break
-            try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=backoff)
-                break
-            except asyncio.TimeoutError:
-                pass
-            backoff = min(backoff * 2.0, self.chunk_retry_max_sec)
-
-            if self._stop_event.is_set():
-                break
-            try:
-                await client.connect()
-                if streams:
-                    await client.subscribe(streams)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.warning(
-                    "ws_runner[%s] chunk=%d reconnect failed (%r)",
-                    self.trade_type, chunk_idx, exc,
-                )
+            needs_connect = True
 
     async def _prune_loop(self) -> None:
         """运行期每 prune_interval_sec（默认 1 小时）清理 48h 之前的本地缓存。"""

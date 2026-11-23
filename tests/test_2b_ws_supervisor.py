@@ -91,6 +91,86 @@ def test_ws_runner_multichunk_single_process_isolates_chunk_failure_and_empty_sy
     asyncio.run(exercise_empty())
 
 
+def test_ws_runner_isolates_initial_connect_failure_per_chunk_and_recovers_in_run(tmp_path):
+    """Chunk 1 failing during initial connect() in start() must not abort chunks 0/2 and must recover in run()."""
+    from core.ws.ws_runner import WsRunner
+    from core.exchange.protocol import BinanceProtocol
+
+    created_clients = []
+    q = queue.Queue()
+
+    class FlakyConnectClient:
+        def __init__(self, url, chunk_idx, on_closed):
+            self.url = url
+            self.chunk_idx = chunk_idx
+            self.on_closed = on_closed
+            self.connect_attempts = 0
+            self.connected = False
+            self.subscribed = []
+            self.run_attempts = 0
+            self.stopped = False
+
+        async def connect(self):
+            self.connect_attempts += 1
+            if self.chunk_idx == 1 and self.connect_attempts == 1:
+                raise OSError("initial handshake failed on chunk 1")
+            self.connected = True
+
+        async def subscribe(self, streams):
+            assert self.connected, "subscribe called before connect succeeded"
+            self.subscribed = list(streams)
+
+        async def run(self):
+            assert self.connected, "run called before connect succeeded"
+            self.run_attempts += 1
+            self.on_closed({"symbol": f"SYM_C{self.chunk_idx}", "kline": {
+                "begin_time_ms": 1_700_000_000_000, "open": 1, "high": 1, "low": 1, "close": 1,
+                "volume": 1, "quote_volume": 1, "trade_num": 1, "taker_buy_base": 1, "taker_buy_quote": 1,
+            }})
+            await asyncio.sleep(0.05)
+
+        async def close(self):
+            self.stopped = True
+
+    def factory(on_closed, url=None, chunk_idx=0):
+        c = FlakyConnectClient(url, chunk_idx, on_closed)
+        created_clients.append(c)
+        return c
+
+    runner = WsRunner(
+        url="wss://example", trade_type="spot", queue=q,
+        cache_path=tmp_path / "spot.sqlite", base_delta=timedelta(minutes=5),
+        ws_client_factory=factory, protocol=BinanceProtocol(), chunk_retry_base_sec=0.01,
+    )
+    symbols = [f"SYM{i}" for i in range(450)]  # 3 chunks: 200 + 200 + 50
+
+    async def exercise():
+        # start() must succeed even though chunk 1 fails initial connect()
+        await runner.start(symbols=symbols, replay_on_start=False)
+        assert len(created_clients) == 3
+        assert len(created_clients[0].subscribed) == 200
+        assert created_clients[1].subscribed == []  # failed initial connect
+        assert len(created_clients[2].subscribed) == 50
+
+        task = asyncio.create_task(runner.run())
+        await asyncio.sleep(0.08)
+        await runner.stop()
+        await asyncio.wait_for(task, timeout=1.0)
+
+    asyncio.run(exercise())
+
+    # Chunk 1 recovered in run(): connected, subscribed 200 streams, and ran
+    assert created_clients[1].connect_attempts >= 2
+    assert len(created_clients[1].subscribed) == 200
+    assert created_clients[1].run_attempts >= 1
+    # All 3 chunks emitted klines
+    emitted = set()
+    while not q.empty():
+        emitted.add(q.get_nowait()["symbol"])
+    assert {"SYM_C0", "SYM_C1", "SYM_C2"}.issubset(emitted)
+    assert all(c.stopped for c in created_clients)
+
+
 def test_ws_runner_prunes_stale_cache_on_start_and_periodically(tmp_path):
     from core.ws.ws_local_cache import WsLocalCache
     from core.ws.ws_runner import WsRunner
