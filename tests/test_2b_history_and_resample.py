@@ -206,3 +206,74 @@ def test_run_download_all_history_compat_and_with_backfill(monkeypatch):
 
     rt_compat = hist_mod.run_download_all_history(h)
     assert rt_compat == run_time
+
+
+def test_resample_history_multi_offset_self_heal_preserves_healthy_offset_head(tmp_path):
+    """When 25m is healthy (head at 2025-03-08) and 40m is missing, self-heal must preserve 25m head,
+    build 40m, and trim temporary deep base_5m partitions back to 30d."""
+    from core.pipeline.resample import resample_history
+    from core.storage.candle_manager import CandleFileManager
+    from core.storage.ts_manager import TSManager
+
+    run_time = datetime(2026, 11, 23, 2, 40, tzinfo=timezone.utc)
+    base_dir = tmp_path / "spot_5m"
+    ts_mgr = TSManager(base_dir / "BTCUSDT")
+    # Deep 5m backfill starts at 2025-04-01 (later than existing 25m head 2025-03-08)
+    t_old = pd.date_range("2025-04-01 00:00", periods=24, freq="5min", tz="UTC")
+    t_new = pd.date_range("2026-11-22 23:00", "2026-11-23 02:35", freq="5min", tz="UTC")
+    all_t = t_old.append(t_new)
+    ts_mgr.update(pd.DataFrame({
+        "candle_begin_time": all_t, "open": 10.0, "high": 10.0, "low": 10.0, "close": 10.0,
+        "volume": 1.0, "quote_volume": 10.0, "trade_num": 1,
+        "taker_buy_base_asset_volume": 0.5, "taker_buy_quote_asset_volume": 5.0,
+    }))
+
+    # 25m offset is already healthy with pre-min_history_start_date head at 2025-03-08
+    res_dir_25 = tmp_path / "spot_1h" / "25m"
+    res_dir_25.mkdir(parents=True)
+    res_mgr_25 = CandleFileManager(res_dir_25, "pickle")
+    old_25 = pd.DataFrame({
+        "candle_begin_time": pd.to_datetime(["2025-03-08 00:25", "2026-11-22 23:25", "2026-11-23 00:25"], utc=True),
+        "open": [10.0, 10.0, 10.0], "high": [10.0, 10.0, 10.0],
+        "low": [10.0, 10.0, 10.0], "close": [10.0, 10.0, 10.0],
+        "volume": [1.0, 1.0, 1.0], "quote_volume": [10.0, 10.0, 10.0], "trade_num": [1, 1, 1],
+        "taker_buy_base_asset_volume": [0.5, 0.5, 0.5], "taker_buy_quote_asset_volume": [5.0, 5.0, 5.0],
+    })
+    res_mgr_25.save_data_file("BTCUSDT", old_25)
+
+    # 40m offset is newly enabled / missing
+    res_dir_40 = tmp_path / "spot_1h" / "40m"
+    res_dir_40.mkdir(parents=True)
+    res_mgr_40 = CandleFileManager(res_dir_40, "pickle")
+
+    exg_dir = tmp_path / "exg"
+    exg_dir.mkdir()
+    exg_mgr = CandleFileManager(exg_dir, "pickle")
+    exg_mgr.save_data_file("exginfo_spot", pd.DataFrame({"symbol": ["BTCUSDT"]}))
+
+    h = SimpleNamespace(
+        base_interval="5m", resample_interval="1h", enabled_hour_offsets=("25m", "40m"),
+        base_5m_retention_days=30, base_5m_retention_bars=lambda: 30 * 24 * 12,
+        history_trim_ts=lambda: None, effective_kline_count_1h=lambda tt, rt: 15000,
+        exg_mgr=exg_mgr,
+        get_market_handle=lambda _: SimpleNamespace(
+            base_candle_dir=base_dir,
+            resample_mgr_map={"25m": res_mgr_25, "40m": res_mgr_40},
+        ),
+    )
+
+    resample_history(h, "spot", run_time, full_backfill_symbols={"BTCUSDT"})
+
+    out_25 = res_mgr_25.read_candle("BTCUSDT")
+    assert out_25 is not None
+    assert out_25["candle_begin_time"].min() == pd.Timestamp("2025-03-08 00:25", tz="UTC")
+    assert pd.Timestamp("2026-11-23 01:25", tz="UTC") in set(out_25["candle_begin_time"])
+
+    out_40 = res_mgr_40.read_candle("BTCUSDT")
+    assert out_40 is not None
+    assert out_40["candle_begin_time"].min() <= pd.Timestamp("2025-04-01 01:40", tz="UTC")
+    assert pd.Timestamp("2026-11-23 01:40", tz="UTC") in set(out_40["candle_begin_time"])
+
+    assert "202504" not in ts_mgr.list_partitions()
+    assert "202611" in ts_mgr.list_partitions()
+

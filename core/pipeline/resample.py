@@ -284,14 +284,24 @@ def update_resample_candle_incremental(
     return first_begin_time, last_begin_time
 
 
-def _has_nonempty_existing_resample(resample_mgr: CandleFileManager, symbol: str) -> bool:
+def _is_healthy_existing_resample(
+    resample_mgr: CandleFileManager,
+    symbol: str,
+    stale_cutoff: pd.Timestamp,
+) -> bool:
+    """判断某个 offset 下的现有 1h 文件是否健康（存在、可读、非空且最新 bar 未超期）。"""
     if not resample_mgr.has_symbol(symbol):
         return False
     try:
         df_old = resample_mgr.read_candle(symbol)
     except Exception:
         return False
-    return isinstance(df_old, pd.DataFrame) and not df_old.empty and 'candle_begin_time' in df_old.columns
+    if not isinstance(df_old, pd.DataFrame) or df_old.empty or 'candle_begin_time' not in df_old.columns:
+        return False
+    last_ts = df_old['candle_begin_time'].max()
+    if pd.isna(last_ts):
+        return False
+    return bool(last_ts >= stale_cutoff)
 
 
 def resample_history(
@@ -316,6 +326,8 @@ def resample_history(
     kline_count_1h = _resolve_kline_count_1h(handle, trade_type, run_time)
     theoretical_start = run_time - kline_count_1h * resample_delta
     retention_bars = _resolve_base_5m_retention_bars(handle, base_delta)
+    retention_days = int(getattr(handle, 'base_5m_retention_days', 30))
+    stale_cutoff = pd.Timestamp(run_time) - timedelta(days=max(1, retention_days - 2))
 
     symbols = sorted(item.name for item in base_candle_dir.iterdir() if item.is_dir())
 
@@ -337,10 +349,11 @@ def resample_history(
         df_min_time = df['candle_begin_time'].min()
 
         for offset_str, resample_mgr in resample_mgr_map.items():
-            has_existing = _has_nonempty_existing_resample(resample_mgr, symbol)
+            is_healthy = _is_healthy_existing_resample(resample_mgr, symbol, stale_cutoff)
 
-            if not is_full_backfill and has_existing:
-                # 常规快路径：基于 30 天 base_5m 增量合并，丢弃截断窗口首根不完整 1h bar，保留历史头部
+            if is_healthy:
+                # 健康 offset 始终走增量合并（即便同 symbol 因其他 offset 缺失处于自愈中），
+                # 丢弃截断窗口首根不完整 1h bar，绝不覆盖既有历史头部
                 df_resample = calc_resample(df, handle.resample_interval, offset_str, theoretical_start)
                 if df_resample.empty:
                     continue
@@ -358,7 +371,7 @@ def resample_history(
                     min_ts=trim_ts,
                 )
             else:
-                # 自愈/缺盘路径：基于完整 base_5m 全量重采样写入
+                # 缺失/损坏/超期 offset：基于完整 base_5m 全量重采样覆盖写入
                 df_resample = calc_resample(df, handle.resample_interval, offset_str, theoretical_start)
                 if df_resample.empty:
                     logger.warning(f'{trade_type} {symbol} {offset_str} Resamaple K 线为空，跳过')
