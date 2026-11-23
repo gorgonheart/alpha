@@ -23,7 +23,7 @@ async def init_coin_cap(handle: BmacHandle, run_time: datetime):
     logger.ok(f"初始化市值数据成功, 当前时间={now_time_str()}, 耗时={time_elapsed:.2f}分钟")
 
 
-def run_download_all_history(handle: BmacHandle):
+def run_download_all_history_with_backfill(handle: BmacHandle) -> tuple[datetime, dict[str, set[str]]]:
     while True:
         # 计算历史数据 run_time
         run_time = next_run_time(handle.base_interval) - convert_interval_to_timedelta(handle.base_interval)
@@ -51,8 +51,17 @@ def run_download_all_history(handle: BmacHandle):
             for download_task in as_completed(tasks):
                 download_task.result()
 
+            spot_backfill = download_spot.result() or set()
+            swap_backfill = download_swap.result() or set()
+
         # 设置3个resample(1h)的容错，避免大参数下载资金费数据时间过长导致循环下载
         if now_time() - run_time < convert_interval_to_timedelta(handle.resample_interval) * 3:
-            return run_time
+            return run_time, {"spot": set(spot_backfill), "swap": set(swap_backfill)}
 
-        # 如果本期下载时间太长，导致结束时间距离 run_time 大于一个 resample(1h) 周期，则再下载一次
+        # 如果本期下载时间太长，导致结束时间距离 run_time 大于三个 resample(1h) 周期，则再下载一次
+
+
+def run_download_all_history(handle: BmacHandle) -> datetime:
+    """兼容旧调用签名：仅返回 run_time。"""
+    run_time, _ = run_download_all_history_with_backfill(handle)
+    return run_time

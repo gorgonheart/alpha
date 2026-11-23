@@ -9,14 +9,108 @@ from typing import Optional
 
 import pandas as pd
 
-from core.binance_fetcher_async import BinanceFetcher
-from core.handle import BinanceHandle, BmacHandle
-from core.ts_manager import TSManager
+from core.exchange.fetcher_factory import create_fetcher
+from core.handle import BmacHandle, MarketHandle
+from core.storage.ts_manager import TSManager
 from core.utils.log_kit import logger
 from core.utils.network import create_aiohttp_session
 from core.utils.time import (async_sleep_until_run_time,
                              convert_interval_to_timedelta, next_run_time,
                              now_time_str)
+
+
+def _is_rate_limited(exc: Exception) -> bool:
+    """Duck-typing 判断异常是否为 429 / Too Many Requests。"""
+    if getattr(exc, 'status_code', None) == 429:
+        return True
+    if getattr(exc, 'code', None) in (50011, '50011'):
+        return True
+    if 'Too Many Requests' in str(exc):
+        return True
+    return False
+
+
+def _get_market_handle(handle: BmacHandle, trade_type: str) -> MarketHandle:
+    if hasattr(handle, 'get_market_handle'):
+        return handle.get_market_handle(trade_type)
+    return handle.get_binance_handle(trade_type)
+
+
+def _resolve_base_5m_retention_bars(handle: BmacHandle, base_delta: timedelta) -> int:
+    if hasattr(handle, 'base_5m_retention_bars'):
+        return int(handle.base_5m_retention_bars())
+    retention_days = int(getattr(handle, 'base_5m_retention_days', 30))
+    bars_per_day = int(timedelta(days=1) // base_delta)
+    return retention_days * bars_per_day
+
+
+def _resolve_full_backfill_base_bars(handle: BmacHandle, trade_type: str, run_time: datetime) -> int:
+    base_delta = convert_interval_to_timedelta(handle.base_interval)
+    resample_delta = convert_interval_to_timedelta(handle.resample_interval)
+    num_offsets = resample_delta // base_delta
+    if hasattr(handle, 'effective_kline_count_1h'):
+        kline_1h = int(handle.effective_kline_count_1h(trade_type, run_time))
+        return int(num_offsets * (kline_1h + 3))
+    if hasattr(handle, 'get_num_base_candles'):
+        return int(handle.get_num_base_candles(trade_type))
+    return int(getattr(handle, 'num_base_candles', num_offsets * (15000 + 3)))
+
+
+def _required_first_begin_for_symbol(
+    handle: BmacHandle,
+    trade_type: str,
+    run_time: datetime,
+    is_full_backfill: bool,
+) -> datetime:
+    base_delta = convert_interval_to_timedelta(handle.base_interval)
+    if is_full_backfill:
+        bars = _resolve_full_backfill_base_bars(handle, trade_type, run_time)
+    else:
+        bars = _resolve_base_5m_retention_bars(handle, base_delta)
+    return run_time - base_delta * bars
+
+
+def detect_full_backfill_symbols(
+    handle: BmacHandle,
+    trade_type: str,
+    symbols: list[str],
+    run_time: datetime,
+) -> set[str]:
+    """检测需要深历史 5m 自愈补拉的 symbol 集合。
+
+    严格只包含两类条件（绝不因既有 1h 头部较短而触发隐式前置补拉）：
+      - 条件 1：任一启用 offset 的 resample_1h 文件缺失、为空、损坏或缺少 candle_begin_time；
+      - 条件 2：任一启用 offset 的 resample_1h 最新 bar 早于
+        ``run_time - timedelta(days=base_5m_retention_days - 2)``。
+    """
+    market_handle = _get_market_handle(handle, trade_type)
+    resample_mgr_map = market_handle.resample_mgr_map
+    offsets = getattr(handle, 'enabled_hour_offsets', tuple(resample_mgr_map.keys()))
+    retention_days = int(getattr(handle, 'base_5m_retention_days', 30))
+    stale_days = max(1, retention_days - 2)
+    stale_cutoff = pd.Timestamp(run_time) - timedelta(days=stale_days)
+
+    flagged: set[str] = set()
+    for symbol in symbols:
+        for offset_str in offsets:
+            mgr = resample_mgr_map.get(offset_str)
+            if mgr is None or not mgr.has_symbol(symbol):
+                flagged.add(symbol)
+                break
+            try:
+                df = mgr.read_candle(symbol)
+            except Exception:
+                flagged.add(symbol)
+                break
+            if not isinstance(df, pd.DataFrame) or df.empty or 'candle_begin_time' not in df.columns:
+                flagged.add(symbol)
+                break
+            last_ts = df['candle_begin_time'].max()
+            if pd.isna(last_ts) or last_ts < stale_cutoff:
+                flagged.add(symbol)
+                break
+
+    return flagged
 
 
 @dataclass
@@ -27,12 +121,17 @@ class CandleInfo:
 
 
 class Downloader(ABC):
+    # 非 429 异常：同一 symbol 连续失败此次数则本阶段放弃（成功一次即清零）
+    MAX_SYMBOL_FAILURES = 3
+    # 整批 429 时的整体冷却：30s 起，逐次翻倍，最长 300s
+    RATE_LIMIT_COOLDOWN_BASE_SEC = 30
+    RATE_LIMIT_COOLDOWN_MAX_SEC = 300
 
     def __init__(
         self,
         handle: BmacHandle,
-        binance_handle: BinanceHandle,
-        fetcher: BinanceFetcher,
+        binance_handle: MarketHandle,
+        fetcher,
         trade_type: str,
         run_time: datetime,
         stage_name: str,
@@ -45,54 +144,83 @@ class Downloader(ABC):
         self.stage_name = stage_name
 
     @abstractmethod
-    def fetch(self, symbol, info) -> tuple[pd.DataFrame, bool]:
+    async def fetch(self, symbol: str, info: CandleInfo) -> tuple[pd.DataFrame, bool]:
         pass
 
     @abstractmethod
-    def check_finish(self, info):
+    def check_finish(self, symbol: str, info: CandleInfo) -> bool:
         pass
 
+    async def _acquire_rate_limit(self, batch_len: int) -> None:
+        if hasattr(self.fetcher, 'acquire'):
+            await self.fetcher.acquire(batch_len)
+            return
+        max_minute_weight, _ = self.fetcher.get_api_limits()
+        while True:
+            _server_time, weight = await self.fetcher.get_time_and_weight()
+            if weight > max_minute_weight * 0.9:
+                await async_sleep_until_run_time(next_run_time("1m"))
+                continue
+            return
+
+    def _batch_size(self) -> int:
+        if hasattr(self.fetcher, 'batch_size'):
+            return int(self.fetcher.batch_size())
+        return 80
+
+    def _once_candles(self) -> int:
+        if hasattr(self.fetcher, 'once_candles'):
+            return int(self.fetcher.once_candles())
+        _, once_candles = self.fetcher.get_api_limits()
+        return int(once_candles)
+
     async def run_download(self, candle_infos: dict[str, CandleInfo]):
-        fetcher = self.fetcher
         time_start = time.perf_counter()
         num_total_symbols = len(candle_infos)
 
-        # 还未完成补全的交易对
+        failures: dict[str, int] = {}
+        skipped: set[str] = set()
+        cooldown_streak = 0
+
         left_symbols = sorted(candle_infos.keys())
 
         download_round = 0
-        last_info_ts = 0.0  # 进度日志节流用（秒）
+        last_info_ts = 0.0  # 进度日志 30s 节流用（秒）
 
-        # 每分钟最大权重
-        max_minute_weight, once_candles = fetcher.get_api_limits()
-
-        # 限制同时在途的请求数，避免瞬时大量连接打穿代理或触发币安连接拒绝
+        # 限制同时在途的请求数，避免瞬时大量连接打穿代理或触发交易所连接拒绝
         semaphore = asyncio.Semaphore(50)
 
         async def fetch_with_sem(symbol, info):
             async with semaphore:
                 return await self.fetch(symbol, info)
 
-        # 循环分批获取每个 symbol 历史数据
         while left_symbols:
             download_round += 1
 
-            # 获取当前的权重和服务器时间。如果已使用的权重超过最大限额的 90%，则 sleep 直至下一分钟
-            server_time, weight = await fetcher.get_time_and_weight()
-            if weight > max_minute_weight * 0.9:
-                await async_sleep_until_run_time(next_run_time("1m"))
-                continue
+            fetch_symbols = left_symbols[:self._batch_size()]
 
-            # 每轮从剩余 symbol 中选择 80 个
-            fetch_symbols = left_symbols[:80]
+            # 限速门控：按本批数量申请配额
+            await self._acquire_rate_limit(len(fetch_symbols))
 
-            # 并发获取 K 线，最多 50 个请求同时在途
+            # 并发获取 K 线，最多 50 个请求同时在途；return_exceptions=True 隔离单 symbol 异常
             tasks = [fetch_with_sem(symbol, candle_infos[symbol]) for symbol in fetch_symbols]
-            results: list[tuple[pd.DataFrame, bool]] = await asyncio.gather(*tasks)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
             num_finished_round = 0
-            # 更新每个 symbol 的 K线数据
-            for symbol, (df_new, not_enough) in zip(fetch_symbols, results):
+            num_rate_limited = 0
+            for symbol, result in zip(fetch_symbols, results):
+                if isinstance(result, BaseException):
+                    if not isinstance(result, Exception):
+                        raise result
+                    if _is_rate_limited(result):
+                        num_rate_limited += 1
+                    if self._on_symbol_failed(symbol, result, left_symbols, candle_infos, failures, skipped):
+                        num_finished_round += 1
+                    continue
+
+                failures.pop(symbol, None)
+                df_new, not_enough = result
+
                 symbol_dir = self.binance_handle.base_candle_dir / symbol
                 ts_mgr = TSManager(symbol_dir)
 
@@ -101,8 +229,7 @@ class Downloader(ABC):
 
                 partitions = ts_mgr.list_partitions()
 
-                # K 线数量不足
-                if not_enough or not partitions:
+                if not partitions:
                     num_finished_round += 1
                     left_symbols.remove(symbol)
                     del candle_infos[symbol]
@@ -114,8 +241,12 @@ class Downloader(ABC):
                 candle_info = CandleInfo(False, first_begin_time, last_begin_time)
                 candle_infos[symbol] = candle_info
 
-                # 已经补全了 K 线数据
-                if self.check_finish(candle_info):
+                if not_enough:
+                    num_finished_round += 1
+                    left_symbols.remove(symbol)
+                    continue
+
+                if self.check_finish(symbol, candle_info):
                     num_finished_round += 1
                     left_symbols.remove(symbol)
 
@@ -130,7 +261,7 @@ class Downloader(ABC):
                     in_progress_str = f", 正在下载: {symbol_in_progress[0]} -- {symbol_in_progress[-1]}"
                 else:
                     in_progress_str = ""
-                progress = (num_success / num_total_symbols) * 100
+                progress = (num_success / num_total_symbols) * 100 if num_total_symbols > 0 else 100.0
                 msg = (
                     f"{self.trade_type} {self.stage_name}, "
                     f"进度={progress:.1f}%({num_success}/{num_total_symbols}), "
@@ -139,24 +270,74 @@ class Downloader(ABC):
                     f"{in_progress_str}"
                 )
                 logger.debug(msg)
-                # 进度按 30 秒节流输出到 INFO：首次全量补历史可能持续数小时，
-                # 只打 debug 会让控制台和日志长时间没有任何反馈，看起来像卡死
+                # 进度按 30 秒节流输出到 INFO
                 if download_round == 1 or time.perf_counter() - last_info_ts >= 30:
                     last_info_ts = time.perf_counter()
                     logger.info(msg)
+
+            # 整批全部 429：整体冷却后再继续（逐次翻倍，最长 300s）
+            if fetch_symbols and num_rate_limited == len(fetch_symbols):
+                cooldown = min(
+                    self.RATE_LIMIT_COOLDOWN_BASE_SEC * (2 ** cooldown_streak),
+                    self.RATE_LIMIT_COOLDOWN_MAX_SEC,
+                )
+                cooldown_streak += 1
+                logger.warning(
+                    f"{self.trade_type} {self.stage_name}: 本批 {len(fetch_symbols)} 个 symbol 全部 429，"
+                    f"整体冷却 {cooldown}s 后继续，剩余 {len(left_symbols)} 个"
+                )
+                await asyncio.sleep(cooldown)
+            else:
+                cooldown_streak = 0
+
+        if skipped:
+            logger.warning(
+                f"{self.trade_type} {self.stage_name}: {len(skipped)} 个 symbol 连续失败 "
+                f"{self.MAX_SYMBOL_FAILURES} 次已跳过，下次整体重下或重启时会继续补: {sorted(skipped)}"
+            )
         return candle_infos
+
+    def _on_symbol_failed(
+        self,
+        symbol: str,
+        exc: Exception,
+        left_symbols: list,
+        candle_infos: dict,
+        failures: dict,
+        skipped: set,
+    ) -> bool:
+        rate_limited = _is_rate_limited(exc)
+        if not rate_limited:
+            failures[symbol] = failures.get(symbol, 0) + 1
+        n_fail = failures.get(symbol, 0)
+
+        left_symbols.remove(symbol)
+        if n_fail >= self.MAX_SYMBOL_FAILURES:
+            skipped.add(symbol)
+            if not TSManager(self.binance_handle.base_candle_dir / symbol).list_partitions():
+                candle_infos.pop(symbol, None)
+            logger.warning(
+                f"{self.trade_type} {self.stage_name}: {symbol} 连续失败 {n_fail} 次，本阶段跳过: {exc!r}"
+            )
+            return True
+
+        left_symbols.append(symbol)
+        if not rate_limited:
+            logger.warning(
+                f"{self.trade_type} {self.stage_name}: {symbol} 下载失败"
+                f"（第 {n_fail}/{self.MAX_SYMBOL_FAILURES} 次），稍后重试: {exc!r}"
+            )
+        return False
 
 
 class RecentDownloader(Downloader):
-    """
-    下载直到现在的最新 K线
-    """
+    """下载直到现在的最新 K线。"""
 
     def __init__(
         self,
         handle: BmacHandle,
-        binance_handle: BinanceHandle,
-        fetcher: BinanceFetcher,
+        binance_handle: MarketHandle,
+        fetcher,
         trade_type: str,
         run_time: datetime,
     ):
@@ -164,19 +345,23 @@ class RecentDownloader(Downloader):
 
     async def fetch(self, symbol: str, info: CandleInfo):
         not_enough = False
-        fetcher = self.fetcher
-        max_minute_weight, once_candles = self.fetcher.get_api_limits()
+        once_candles = self._once_candles()
 
-        if info.is_empty:  # 没有已存在的历史 K线, 根据 run_time 获取最近的
+        if info.is_empty:
             end_ts = int(self.run_time.timestamp()) * 1000
             df_new = await self.fetcher.get_candle(
                 symbol, self.handle.base_interval, limit=once_candles, endTime=end_ts
             )
             not_enough = df_new.empty
-        else:  # 有已存在的历史 K线, 从 last_begin_time 向现在获取
+        else:
             start_ts = int(info.last_begin_time.timestamp()) * 1000
-            df_new = await fetcher.get_candle(symbol, self.handle.base_interval, limit=once_candles, startTime=start_ts)
-            not_enough = df_new["candle_begin_time"].max() < self.run_time and len(df_new) < once_candles
+            df_new = await self.fetcher.get_candle(
+                symbol, self.handle.base_interval, limit=once_candles, startTime=start_ts
+            )
+            not_enough = df_new.empty or (
+                df_new["candle_begin_time"].max() < self.run_time
+                and len(df_new) < once_candles
+            )
 
         if not_enough:
             return df_new, not_enough
@@ -184,37 +369,32 @@ class RecentDownloader(Downloader):
         df_new = df_new[df_new["candle_begin_time"] < self.run_time]
         return df_new, not_enough
 
-    def check_finish(self, info: CandleInfo):
-        # 已经补全了 K 线数据
+    def check_finish(self, symbol: str, info: CandleInfo) -> bool:
         base_delta = convert_interval_to_timedelta(self.handle.base_interval)
-        if info.last_begin_time + base_delta >= self.run_time:
-            return True
-
-        return False
+        return bool(info.last_begin_time + base_delta >= self.run_time)
 
 
 class HistoryDownloader(Downloader):
-    """
-    下载历史 K线
-    """
+    """下载历史 K线（常规 symbol 30 天，full_backfill_symbols 按 effective_kline_count_1h 下满）。"""
 
     def __init__(
         self,
         handle: BmacHandle,
-        binance_handle: BinanceHandle,
-        fetcher: BinanceFetcher,
+        binance_handle: MarketHandle,
+        fetcher,
         trade_type: str,
         run_time: datetime,
+        full_backfill_symbols: Optional[set[str]] = None,
     ):
         super().__init__(handle, binance_handle, fetcher, trade_type, run_time, "阶段 3")
+        self.full_backfill_symbols = set(full_backfill_symbols or ())
 
     async def fetch(self, symbol: str, info: CandleInfo):
-        fetcher = self.fetcher
-        max_minute_weight, once_candles = self.fetcher.get_api_limits()
-
-        # 根据已存在的历史 K线, 从 first_begin_time 向现在获取
+        once_candles = self._once_candles()
         end_ts = int(info.first_begin_time.timestamp()) * 1000
-        df_new = await fetcher.get_candle(symbol, self.handle.base_interval, limit=once_candles, endTime=end_ts)
+        df_new = await self.fetcher.get_candle(
+            symbol, self.handle.base_interval, limit=once_candles, endTime=end_ts
+        )
         df_new = df_new[df_new["candle_begin_time"] < self.run_time]
 
         if len(df_new) < once_candles:
@@ -222,21 +402,28 @@ class HistoryDownloader(Downloader):
 
         return df_new, False
 
-    def check_finish(self, info: CandleInfo):
-        base_delta = convert_interval_to_timedelta(self.handle.base_interval)
-        required_first_begin = self.run_time - base_delta * self.handle.get_num_base_candles(self.trade_type)
+    def check_finish(self, symbol: str, info: CandleInfo) -> bool:
+        required_first_begin = _required_first_begin_for_symbol(
+            self.handle,
+            self.trade_type,
+            self.run_time,
+            symbol in self.full_backfill_symbols,
+        )
+        return bool(info.first_begin_time <= required_first_begin)
 
-        # 起始 begin_time 已经在期望起始时间之前，则代表补全了 K 线数据
-        if info.first_begin_time <= required_first_begin:
-            return True
 
-        return False
+def _enable_fail_fast_on_rate_limit(fetcher) -> None:
+    if hasattr(fetcher, "fail_fast_on_rate_limit"):
+        fetcher.fail_fast_on_rate_limit = True
 
 
 async def download_recent_until_runtime(
-    handle: BmacHandle, trade_type: str, run_time: datetime, candle_infos: dict[str, CandleInfo]
+    handle: BmacHandle,
+    trade_type: str,
+    run_time: datetime,
+    candle_infos: dict[str, CandleInfo],
 ):
-    binance_handle = handle.get_binance_handle(trade_type)
+    market_handle = _get_market_handle(handle, trade_type)
 
     logger.info(
         f"{trade_type} 初始化历史 K线, 阶段 2, 补全 {handle.base_interval} 最新数据, "
@@ -247,15 +434,15 @@ async def download_recent_until_runtime(
     t_start = time.perf_counter()
 
     async with create_aiohttp_session(handle.http_timeout_sec) as session:
-        fetcher = BinanceFetcher(binance_handle.api_type, session, handle.proxy)
-        downloader = RecentDownloader(handle, binance_handle, fetcher, trade_type, run_time)
+        fetcher = create_fetcher(handle, trade_type, session)
+        _enable_fail_fast_on_rate_limit(fetcher)
+        downloader = RecentDownloader(handle, market_handle, fetcher, trade_type, run_time)
         candle_infos = await downloader.run_download(candle_infos)
 
     time_elapsed = (time.perf_counter() - t_start) / 60
 
     logger.ok(
         f"{trade_type} 初始化历史 K线, 阶段 2 已完成, "
-        #   f'需要继续补全的交易对数量={len(candle_infos)}, '
         f"当前时间={now_time_str()}, "
         f"耗时={time_elapsed:.2f}分钟"
     )
@@ -264,40 +451,67 @@ async def download_recent_until_runtime(
 
 
 async def download_enough_history(
-    handle: BmacHandle, trade_type: str, run_time: datetime, candle_infos: dict[str, CandleInfo]
+    handle: BmacHandle,
+    trade_type: str,
+    run_time: datetime,
+    candle_infos: dict[str, CandleInfo],
+    full_backfill_symbols: Optional[set[str]] = None,
 ):
-    binance_handle = handle.get_binance_handle(trade_type)
+    market_handle = _get_market_handle(handle, trade_type)
+    full_backfill_set = set(full_backfill_symbols or ())
+
+    # 过滤掉已经满足目标起始时间的 symbol，避免无意义的阶段 3 请求
+    pending_infos: dict[str, CandleInfo] = {}
+    for symbol, info in candle_infos.items():
+        if info.is_empty or info.first_begin_time is None:
+            continue
+        required_first_begin = _required_first_begin_for_symbol(
+            handle, trade_type, run_time, symbol in full_backfill_set
+        )
+        if info.first_begin_time > required_first_begin:
+            pending_infos[symbol] = info
 
     logger.info(
         f"{trade_type} 初始化历史 K线, 阶段 3, 补全 {handle.base_interval} K线根数, "
-        f"交易对数量={len(candle_infos)}, "
+        f"交易对数量={len(pending_infos)}/{len(candle_infos)}, "
+        f"全量自愈={len(full_backfill_set)}, "
         f"当前时间={now_time_str()}"
     )
+
+    if not pending_infos:
+        logger.ok(f"{trade_type} 初始化历史 K线, 阶段 3 无需补拉，当前时间={now_time_str()}")
+        return candle_infos
 
     t_start = time.perf_counter()
 
     async with create_aiohttp_session(handle.http_timeout_sec) as session:
-        fetcher = BinanceFetcher(binance_handle.api_type, session, handle.proxy)
-        downloader = HistoryDownloader(handle, binance_handle, fetcher, trade_type, run_time)
-        candle_infos = await downloader.run_download(candle_infos)
+        fetcher = create_fetcher(handle, trade_type, session)
+        _enable_fail_fast_on_rate_limit(fetcher)
+        downloader = HistoryDownloader(
+            handle, market_handle, fetcher, trade_type, run_time, full_backfill_symbols=full_backfill_set
+        )
+        updated = await downloader.run_download(pending_infos)
+        candle_infos.update(updated)
 
     time_elapsed = (time.perf_counter() - t_start) / 60
 
     logger.ok(
-        f"{trade_type} 初始化历史 K线, 阶段 3 已完成, " f"当前时间={now_time_str()}, " f"耗时={time_elapsed:.2f}分钟"
+        f"{trade_type} 初始化历史 K线, 阶段 3 已完成, "
+        f"当前时间={now_time_str()}, "
+        f"耗时={time_elapsed:.2f}分钟"
     )
 
     return candle_infos
 
 
 def verify_symbol_candle(
-    base_candle_dir: Path, trade_type: str, symbol: str, run_time: datetime, required_first_begin: datetime
+    base_candle_dir: Path,
+    trade_type: str,
+    symbol: str,
+    run_time: datetime,
+    required_first_begin: datetime,
 ) -> CandleInfo:
-    """
-    校验 trade_type 类型 symbol 交易对的历史 K 线
-    根据 required_first_begin 和 run_time 过滤过时数据
-    symbol -> CandleInfo
-    """
+    """校验 trade_type 类型 symbol 交易对的历史 K 线，并根据 required_first_begin 和 run_time 清理过时数据。"""
     symbol_dir = base_candle_dir / symbol
 
     empty_candle_info = CandleInfo(True, None, None)
@@ -306,10 +520,8 @@ def verify_symbol_candle(
 
     ts_mgr = TSManager(symbol_dir)
     try:
-        # 仅保留期望起始时间 required_first_begin 到当前运行时间 run_time 之间的 K线
         ts_mgr.trim(required_first_begin, run_time)
-    except Exception as ex:
-        # 修剪数据报错，移除 symbol 目录
+    except Exception:
         shutil.rmtree(symbol_dir)
         return empty_candle_info
 
@@ -318,31 +530,40 @@ def verify_symbol_candle(
         shutil.rmtree(symbol_dir)
         return empty_candle_info
 
-    # symbol 缺失数据超过 28 天（一个 monthly partition），认为已经损坏
     if df["candle_begin_time"].diff().max() > timedelta(days=28):
         logger.error(f"{trade_type} {symbol} 数据损坏，缺失数据超过 28 天")
         shutil.rmtree(symbol_dir)
         return empty_candle_info
 
-    candle_info = CandleInfo(False, df["candle_begin_time"].min(), df["candle_begin_time"].max())
-    return candle_info
+    return CandleInfo(False, df["candle_begin_time"].min(), df["candle_begin_time"].max())
 
 
-def verify_exist_history(handle: BmacHandle, trade_type: str, run_time: datetime, symbols: list[str]):
-    binance_handle = handle.get_binance_handle(trade_type)
-    base_candle_dir = binance_handle.base_candle_dir
-    base_delta = convert_interval_to_timedelta(handle.base_interval)
+def verify_exist_history(
+    handle: BmacHandle,
+    trade_type: str,
+    run_time: datetime,
+    symbols: list[str],
+    full_backfill_symbols: Optional[set[str]] = None,
+):
+    market_handle = _get_market_handle(handle, trade_type)
+    base_candle_dir = market_handle.base_candle_dir
+    full_backfill_set = set(full_backfill_symbols or ())
 
-    # 推算 base 周期(5m) K线起始和终止 candle_begin_time
-    required_first_begin = run_time - base_delta * handle.get_num_base_candles(trade_type)
-
-    logger.info(f"{trade_type} 初始化历史 K线, 阶段 1, 校验并清除过时数据, 当前时间={now_time_str()}")
+    logger.info(
+        f"{trade_type} 初始化历史 K线, 阶段 1, 校验并清除过时数据, "
+        f"全量自愈={len(full_backfill_set)}/{len(symbols)}, 当前时间={now_time_str()}"
+    )
 
     t_start = time.perf_counter()
 
-    candle_infos = dict()
+    candle_infos = {}
     for idx, symbol in enumerate(symbols, 1):
-        candle_infos[symbol] = verify_symbol_candle(base_candle_dir, trade_type, symbol, run_time, required_first_begin)
+        required_first_begin = _required_first_begin_for_symbol(
+            handle, trade_type, run_time, symbol in full_backfill_set
+        )
+        candle_infos[symbol] = verify_symbol_candle(
+            base_candle_dir, trade_type, symbol, run_time, required_first_begin
+        )
         if idx % 40 == 0:
             time_elapsed = (time.perf_counter() - t_start) / 60
             finish_pct = idx / len(symbols) * 100
@@ -356,12 +577,30 @@ def verify_exist_history(handle: BmacHandle, trade_type: str, run_time: datetime
     return candle_infos
 
 
-def init_history_candles(handle: BmacHandle, trade_type: str, run_time: datetime, symbols: list[str]):
-    # 阶段1: 校验已保存的 K线数据，并清除过时的 K线
-    candle_infos = verify_exist_history(handle, trade_type, run_time, symbols)
+def init_history_candles(
+    handle: BmacHandle,
+    trade_type: str,
+    run_time: datetime,
+    symbols: list[str],
+    full_backfill_symbols: Optional[set[str]] = None,
+) -> set[str]:
+    if full_backfill_symbols is None:
+        full_backfill_symbols = detect_full_backfill_symbols(handle, trade_type, symbols, run_time)
+    else:
+        full_backfill_symbols = set(full_backfill_symbols)
+
+    # 阶段1: 校验已保存的 K线数据，并清除过时的 K线（常规 symbol 裁回 30 天）
+    candle_infos = verify_exist_history(
+        handle, trade_type, run_time, symbols, full_backfill_symbols=full_backfill_symbols
+    )
 
     # 阶段2: 向现在补全最新的 K线, 直到 run_time
     candle_infos = asyncio.run(download_recent_until_runtime(handle, trade_type, run_time, candle_infos))
 
-    # 阶段3: 向过去补全 handle.num_base_candles 根 K线
-    asyncio.run(download_enough_history(handle, trade_type, run_time, candle_infos))
+    # 阶段3: 向过去补全基础 K 线（常规 30 天，自愈 symbol 按 effective_kline_count_1h 下满）
+    asyncio.run(
+        download_enough_history(
+            handle, trade_type, run_time, candle_infos, full_backfill_symbols=full_backfill_symbols
+        )
+    )
+    return full_backfill_symbols
