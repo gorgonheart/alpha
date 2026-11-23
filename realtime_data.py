@@ -33,6 +33,14 @@ if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
+def _fetch_wake_time(run_time: datetime) -> datetime:
+    """计算 REST 采集实际唤醒时间，逻辑 run_time 及闭合边界契约保持不变。"""
+    delay = getattr(config, 'rest_fetch_delay_seconds', 0.0)
+    if isinstance(delay, bool) or not isinstance(delay, (int, float)) or delay < 0:
+        raise ValueError(f'rest_fetch_delay_seconds must be a non-negative number, got {delay!r}')
+    return run_time + timedelta(seconds=float(delay)) if delay else run_time
+
+
 def update_all(handle: BmacHandle, run_time: datetime):
     if f"{run_time.minute}m" not in handle.enabled_hour_offsets:
         logger.info(f"Runtime={run_time} 未启用该 Offset，刷新市场信息与资金费后检查补算")
@@ -61,18 +69,19 @@ def update_all(handle: BmacHandle, run_time: datetime):
     is_binance_success, is_data_api_success = False, False
 
     workers = 1 + int(handle.data_api is not None) + int(handle.coin_cap_handle is not None)
+    fetch_wake_time = _fetch_wake_time(run_time)
     with ProcessPoolExecutor(max_workers=workers) as exe:
         # Occupy all workers until the target so spawn/import overlaps metadata I/O.
         # No market request runs before metadata succeeds and the target is reached.
-        logger.info(f'开始预热采集进程, run_time={run_time}, 当前时间={now_time_str()}')
-        warmups = [exe.submit(sleep_until_run_time, run_time) for _ in range(workers)]
+        logger.info(f'开始预热采集进程, run_time={run_time}, wake_time={fetch_wake_time}, 当前时间={now_time_str()}')
+        warmups = [exe.submit(sleep_until_run_time, fetch_wake_time) for _ in range(workers)]
         asyncio.run(update_binance_meta(handle, run_time))
         update_symbol_match(handle, run_time)
         logger.ok(f"Exchange Info 与实时资金费获取成功, 本地时间={now_time_str()}")
-        sleep_until_run_time(run_time)
+        sleep_until_run_time(fetch_wake_time)
         for warmup in warmups:
             warmup.result()
-        logger.info(f'采集进程预热就绪, run_time={run_time}, 当前时间={now_time_str()}')
+        logger.info(f'采集进程预热就绪, run_time={run_time}, wake_time={fetch_wake_time}, 当前时间={now_time_str()}')
 
         # 子进程：从币安 REST API 更新数据, 并且更新 Resample
         task_binance = exe.submit(fetch_update_binance_candles, handle, run_time)

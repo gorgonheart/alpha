@@ -81,3 +81,67 @@ def test_pool_is_started_before_metadata_and_fetch_waits_for_target(monkeypatch,
     assert sum(e[0]=='submit' for e in events[:meta_index]) == workers
     assert submissions[:workers] == [wait]*workers
     assert events[-1][0] == 'close'
+
+
+@pytest.mark.parametrize('delay_sec', [0.0, 3.0])
+def test_rest_fetch_delay_shifts_wake_time_without_changing_run_time_contract(monkeypatch, delay_sec):
+    stamp = pd.Timestamp('2026-11-23 10:25', tz='Asia/Hong_Kong').to_pydatetime()
+    now = [stamp - pd.Timedelta(seconds=20)]
+    seen_targets, seen_fetch_run_times, seen_meta_run_times = [], [], []
+    handle = SimpleNamespace(
+        base_interval='5m',
+        enabled_hour_offsets=('25m',),
+        data_api=None,
+        coin_cap_handle=None,
+        preprocess_handle=None,
+    )
+
+    def wait(target):
+        seen_targets.append(target)
+        now[0] = max(now[0], target)
+
+    monkeypatch.setattr(rt.config, 'rest_fetch_delay_seconds', delay_sec, raising=False)
+    monkeypatch.setattr(rt, 'sleep_until_run_time', wait)
+    monkeypatch.setattr(rt, 'divider', lambda *a, **kw: None)
+
+    class Job:
+        def __init__(self, fn, args):
+            self.fn, self.args = fn, args
+        def result(self):
+            return self.fn(*self.args)
+
+    class Pool:
+        def __init__(self, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def submit(self, fn, *args): return Job(fn, args)
+
+    monkeypatch.setattr(rt, 'ProcessPoolExecutor', Pool)
+    monkeypatch.setattr(rt, 'as_completed', lambda jobs: iter(jobs))
+
+    async def meta(_handle, run_time):
+        seen_meta_run_times.append(run_time)
+
+    def fetch(_handle, run_time):
+        seen_fetch_run_times.append((run_time, now[0]))
+        return {}, {}, {}, {}
+
+    monkeypatch.setattr(rt, 'update_binance_meta', meta)
+    monkeypatch.setattr(rt, 'update_symbol_match', lambda *a: None)
+    monkeypatch.setattr(rt, 'fetch_update_binance_candles', fetch)
+    monkeypatch.setattr(rt, 'update_binance_base_candles', lambda *a: None)
+
+    rt.update_all(handle, stamp)
+
+    expected_wake = stamp + pd.Timedelta(seconds=delay_sec)
+    assert seen_meta_run_times == [stamp]
+    assert seen_fetch_run_times == [(stamp, expected_wake)]
+    assert expected_wake in seen_targets
+
+
+@pytest.mark.parametrize('bad_delay', [-1, -0.5, True, '3'])
+def test_rest_fetch_delay_rejects_invalid_values(monkeypatch, bad_delay):
+    stamp = pd.Timestamp('2026-11-23 10:25', tz='Asia/Hong_Kong').to_pydatetime()
+    monkeypatch.setattr(rt.config, 'rest_fetch_delay_seconds', bad_delay, raising=False)
+    with pytest.raises(ValueError):
+        rt._fetch_wake_time(stamp)

@@ -96,6 +96,9 @@ arrow_demand_enabled = False
 # None preserves publish_kline_num for unregistered consumers (0 = full).
 # Set e.g. 5000 only after confirming ALL non-participating readers fit it.
 arrow_demand_min_rows = None
+# REST 实时采集相对 run_time 的延后秒数（避开币安跨 5m 边界瞬间未定稿的 K 线，
+# 减少下游交易端 preflight 每小时 2h 伪修订 replay）。0 表示准点立即抓取。
+rest_fetch_delay_seconds = 3.0
 
 # 如果有 json 配置，则使用 json 配置覆盖掉 config.py 中的配置
 json_file_config = get_file_path('config.json', as_path_type=True)
@@ -107,7 +110,8 @@ if json_file_config.exists():
         allowed_attrs = (
             'kline_count_1h_spot', 'kline_count_1h_swap', 'error_webhook_url', 'use_api', 'data_api_uuid', 'data_api_key',
             'enabled_hour_offsets', 'funding_rate', 'precompute_factor_configs', 'precompute_factor_workers',
-            'coin_cap_use_proxy', 'proxy', 'storage_path', 'publish_kline_num', 'arrow_snapshot_keep', 'arrow_demand_enabled', 'arrow_demand_min_rows')
+            'coin_cap_use_proxy', 'proxy', 'storage_path', 'publish_kline_num', 'arrow_snapshot_keep',
+            'arrow_demand_enabled', 'arrow_demand_min_rows', 'rest_fetch_delay_seconds')
 
         for _attr in allowed_attrs:
             if _attr in config_data:
@@ -118,5 +122,8 @@ if type(arrow_snapshot_keep) is not int or arrow_snapshot_keep < 1:
 
 if type(coin_cap_use_proxy) is not bool:
     raise ValueError('coin_cap_use_proxy must be a boolean')
+
+if isinstance(rest_fetch_delay_seconds, bool) or not isinstance(rest_fetch_delay_seconds, (int, float)) or rest_fetch_delay_seconds < 0:
+    raise ValueError('rest_fetch_delay_seconds must be a non-negative number')
 if coin_cap_use_proxy and not proxy:
     raise ValueError('coin_cap_use_proxy requires a configured proxy')
