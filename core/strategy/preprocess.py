@@ -787,6 +787,7 @@ def preprocess_type_data(handle: BmacHandle, run_time: datetime, trade_type: str
             batch_market_dict = dict(factor_map(calc_factors, batch_market_dict.items()))
         # Finding 1: keep the in-memory dict so publish never re-reads the batch pkl.
         market_dict.update(batch_market_dict)
+        del batch_market_dict
         idx += 1
 
         for col, pivot_name in year_pivot_name.items():

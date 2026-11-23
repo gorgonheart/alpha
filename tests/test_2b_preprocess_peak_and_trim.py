@@ -144,3 +144,65 @@ def test_gen_batch_data_incremental_applies_fixed_history_trim_ts(tmp_path):
     assert len(market_dict["BTCUSDT"]) == 15
     assert market_dict["BTCUSDT"]["candle_begin_time"].iloc[0] == trim_ts
     assert market_dict["BTCUSDT"]["first_candle_time"].iloc[0] == times[0]
+
+
+def test_preprocess_type_data_frees_last_batch_frames_before_pivot(tmp_path, monkeypatch):
+    """All market_dict DataFrames (including the final batch) must be GC'd before gen_pivot_incremental runs."""
+    import weakref
+    from core.storage.candle_manager import CandleFileManager
+    from core.strategy import preprocess as pp
+
+    times = pd.date_range("2026-11-23 00:25", periods=5, freq="h", tz="UTC")
+    base_df = pd.DataFrame({
+        "candle_begin_time": times, "open": 10.0, "high": 11.0, "low": 9.0, "close": 10.5,
+        "volume": 100.0, "quote_volume": 1050.0, "trade_num": 10,
+        "taker_buy_base_asset_volume": 50.0, "taker_buy_quote_asset_volume": 525.0,
+    })
+    res_dir = tmp_path / "spot_1h" / "25m"
+    pre_dir = tmp_path / "pre" / "25m"
+    exg_dir = tmp_path / "exg"
+    for d in (res_dir, pre_dir, exg_dir):
+        d.mkdir(parents=True)
+    run_time = times[-1]
+    res_mgr = CandleFileManager(res_dir, "pickle")
+    for sym in ("AAAUSDT", "ZZZUSDT"):
+        res_mgr.set_candle(sym, run_time, base_df.copy())
+    pre_mgr = CandleFileManager(pre_dir, "pickle")
+    exg_mgr = CandleFileManager(exg_dir, "pickle")
+    exg_mgr.set_candle("exginfo_spot", run_time, pd.DataFrame({"symbol": ["AAAUSDT", "ZZZUSDT"]}))
+    match = pd.DataFrame([
+        {"spot": sym, "swap": sym, "first_begin_time": times[0], "last_begin_time": times[-1]}
+        for sym in ("AAAUSDT", "ZZZUSDT")
+    ])
+    handle = SimpleNamespace(
+        resample_interval="1h",
+        history_trim_date=None,
+        history_trim_ts=lambda: None,
+        fetch_funding_rate=False,
+        funding_mgr=None,
+        data_api=None,
+        exg_mgr=exg_mgr,
+        get_market_handle=lambda _: SimpleNamespace(resample_mgr_map={"25m": res_mgr}),
+        get_binance_handle=lambda _: SimpleNamespace(resample_mgr_map={"25m": res_mgr}),
+        preprocess_handle=SimpleNamespace(num_batch=1, preprocess_mgr_map={"25m": pre_mgr}),
+    )
+
+    frame_refs: dict[str, weakref.ReferenceType] = {}
+    alive_at_pivot: dict[str, bool] = {}
+
+    def fake_publish(h, rt, tt, market_dict, publish_kline_num=None, *, history_trim_date=None):
+        for sym, df in market_dict.items():
+            frame_refs[sym] = weakref.ref(df)
+
+    def fake_pivot(h, rt, tt, year_pivot_names, *, funding_publication=None, year_pivot_data=None):
+        for sym, ref in frame_refs.items():
+            alive_at_pivot[sym] = ref() is not None
+
+    monkeypatch.setattr(pp, "publish_arrow_snapshot_for_type", fake_publish)
+    monkeypatch.setattr(pp, "gen_pivot_incremental", fake_pivot)
+
+    factor_spec = [(SimpleNamespace(signal_multi_params=lambda df, params: {"1": df["close"] * 2.0}), "Dummy", [1])]
+    pp.preprocess_type_data(handle, run_time, "spot", match, factor_modules_params=factor_spec, publish_kline_num=10)
+
+    assert set(frame_refs) == {"AAAUSDT", "ZZZUSDT"}
+    assert alive_at_pivot == {"AAAUSDT": False, "ZZZUSDT": False}
