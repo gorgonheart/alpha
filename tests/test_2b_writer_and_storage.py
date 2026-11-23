@@ -34,6 +34,11 @@ def test_writer_caps_flat_pkl_at_240_and_trims_all_old_partitions(tmp_path):
     flat = pd.read_pickle(base_dir / "BTCUSDT.pkl")
     assert len(flat) == 240
     assert flat["candle_begin_time"].dtype == "datetime64[ns, UTC]"
+    # All 300 pushed bars must be persisted in TSManager (not truncated by flat_pkl_max_bars)
+    ts_all = ts_mgr.read_all()
+    assert ts_all is not None
+    assert set(times).issubset(set(ts_all["candle_begin_time"]))
+    assert len(ts_all) == 301
     # 202504, 202505, 202610 must ALL be gone (upstream bug only trimmed partitions[0])
     remaining = ts_mgr.list_partitions()
     assert "202504" not in remaining and "202505" not in remaining and "202610" not in remaining

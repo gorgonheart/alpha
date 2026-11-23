@@ -262,11 +262,16 @@ class Writer:
         verbose = self._obs.log_handle_start(symbol, trade_type, source, df_new)
 
         df_merged = self._merge(base_dir, symbol, df_new, source)
-        self._obs.log_after_merge(verbose, symbol, df_merged)
+        if self.flat_pkl_max_bars is not None and len(df_merged) > self.flat_pkl_max_bars:
+            df_flat = df_merged.tail(self.flat_pkl_max_bars).reset_index(drop=True)
+        else:
+            df_flat = df_merged
+        self._obs.log_after_merge(verbose, symbol, df_flat)
 
-        self._write_pkl(base_dir, symbol, df_merged)
+        self._write_pkl(base_dir, symbol, df_flat)
         self._obs.log_after_pkl(verbose, symbol, self._pkl_path(base_dir, symbol))
 
+        # 从未裁剪的 df_merged 中提取本批次触碰的行写入月度分区，避免 >flat_pkl_max_bars 的批量补齐被截断
         df_for_partition = df_merged[
             df_merged["candle_begin_time"].isin(df_new["candle_begin_time"])
         ]
@@ -400,9 +405,6 @@ class Writer:
             .drop(columns="_prio")
             .reset_index(drop=True)
         )
-        # 仅保留小窗 flat_pkl_max_bars，避免 flat pkl 随历史放大拖慢热路径 IO。
-        if self.flat_pkl_max_bars is not None and len(df_combined) > self.flat_pkl_max_bars:
-            df_combined = df_combined.tail(self.flat_pkl_max_bars).reset_index(drop=True)
         return df_combined
 
     def _write_pkl(self, base_dir: Path, symbol: str, df: pd.DataFrame) -> None:
