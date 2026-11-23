@@ -1,5 +1,5 @@
-"""Shared CSV numeric contract; missing values keep pandas NA semantics."""
-COIN_CAP_DTYPES = {name: 'float64' for name in (
-    'usd_price', 'max_supply', 'circulating_supply', 'total_supply',
-    'max_mcap', 'circulating_mcap', 'total_mcap',
-)}
+"""Thin forwarding shim to core.ingest.coin_cap_schema."""
+import sys
+import core.ingest.coin_cap_schema as _impl
+
+sys.modules[__name__] = _impl

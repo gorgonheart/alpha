@@ -270,34 +270,35 @@ class BinanceFetcher:
         if self.trade_type == 'spot':
             raise RuntimeError('Cannot request funding rate for spot')
         data = await async_retry_getter(self.market_api.aioreq_premium_index)
-        # 如果 lastFundingRate 不能转换为浮点数，则转换为 nan
-        data = [{
-            'symbol': d['symbol'],
-            'funding_rate': pd.to_numeric(d['lastFundingRate'], errors='coerce'),
-            'next_funding_time': pd.to_datetime(d['nextFundingTime'], unit='ms', utc=True)
-        } for d in data]
-        df = pd.DataFrame.from_records(data)
-        return df
+        frame = pd.DataFrame.from_records(data, columns=['symbol', 'lastFundingRate', 'nextFundingTime'])
+        rates = pd.to_numeric(frame['lastFundingRate'], errors='coerce')
+        times = pd.to_datetime(pd.to_numeric(frame['nextFundingTime'], errors='coerce'),
+                               unit='ms', utc=True, errors='coerce')
+        result = pd.DataFrame(dict(symbol=frame['symbol'], funding_rate=rates, next_funding_time=times))
+        return result.loc[result.symbol.notna() & times.notna() & rates.abs().lt(float('inf'))]
 
-    async def get_hist_funding_rate(self, symbol, **kwargs):
-        '''
-        Parse historical funding rates from /fundingRate
-        '''
+    async def get_hist_funding_rate(self, symbol, *, _reserve_request=None, **kwargs):
+        """Return raw settlement timestamps; pagination precedes UTC-hour aggregation."""
         if self.trade_type == 'spot':
             raise RuntimeError('Cannot request funding rate for spot')
 
-        # funding rates 接口限制 500/5mins，失败后等待 75 秒
-        data = await async_retry_getter(self.market_api.aioreq_funding_rate, symbol=symbol, _sleep_seconds=75, **kwargs)
-        data = [{
-            'symbol': d['symbol'],
-            'funding_rate': pd.to_numeric(d['fundingRate'], errors='coerce'),
-            'candle_begin_time': pd.to_datetime(d['fundingTime'], unit='ms', utc=True)
-        } for d in data]
-        df = pd.DataFrame.from_records(data)
-        if df.empty:
-            return df
-        funding_ts = df['candle_begin_time'].astype(int) // (10**9) / 3600.0
-        funding_ts = funding_ts.round().astype(int) * 3600
-        df['candle_begin_time'] = pd.to_datetime(funding_ts, unit='s', utc=True)
-        df.sort_values('candle_begin_time', inplace=True)
-        return df
+        async def request(**params):
+            if _reserve_request is not None:
+                await _reserve_request()
+            return await self.market_api.aioreq_funding_rate(**params)
+
+        data = await async_retry_getter(request, symbol=symbol, _sleep_seconds=75, **kwargs)
+        if not isinstance(data, list):
+            raise ValueError('Invalid historical funding response')
+        frame = pd.DataFrame.from_records(data, columns=['symbol', 'fundingTime', 'fundingRate'])
+        if len(frame) > kwargs.get('limit', 1000):
+            raise ValueError('Oversized historical funding response')
+        millis = pd.to_numeric(frame['fundingTime'], errors='coerce')
+        times = pd.to_datetime(millis, unit='ms', utc=True, errors='coerce')
+        rates = pd.to_numeric(frame['fundingRate'], errors='coerce')
+        valid = (frame.symbol.eq(symbol) & times.notna() & millis.mod(1).eq(0) &
+                 millis.between(kwargs.get('startTime', 0), kwargs.get('endTime', float('inf'))) &
+                 rates.abs().lt(float('inf')))
+        if not valid.all():
+            raise ValueError(f'Invalid historical funding row for {symbol}')
+        return pd.DataFrame(dict(symbol=frame.symbol, candle_begin_time=times, funding_rate=rates))
