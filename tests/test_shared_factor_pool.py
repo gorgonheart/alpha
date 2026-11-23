@@ -115,18 +115,21 @@ def test_four_factor_workers_progress_across_both_markets(tmp_path, monkeypatch,
     monkeypatch.setattr(pp, 'bmac_config', SimpleNamespace(precompute_factor_workers=4, publish_kline_num=20))
     frame = _input()
     handle, _, _ = _make_full_handle(tmp_path, frame, frame.candle_begin_time.iloc[-1])
-    handle.preprocess_handle.num_batch = 2
-    stamp, begins = _feed(handle, frame, symbols=('AAAUSDT', 'BBBUSDT'))
-    barrier, lock, threads = Barrier(4), Lock(), set()
+    handle.preprocess_handle.num_batch = 4
+    stamp, begins = _feed(handle, frame, symbols=('AAAUSDT', 'BBBUSDT', 'CCCUSDT', 'DDDUSDT'))
+    barrier, lock, threads, markets = Barrier(4), Lock(), set(), []
     original = oracle_factor[0][0].signal_multi_params
     def synchronized(df, params):
         with lock:
             threads.add(get_ident())
+            markets.append(int(df.is_spot.iloc[0]))
         barrier.wait(timeout=10)
         return original(df, params)
     oracle_factor[0][0].signal_multi_params = synchronized
     pp.preprocess_offset_data(handle, stamp, begins, begins)
     assert len(threads) == 4
+    # Sequential spot -> swap: all 4 spot symbols finish before any swap symbol starts.
+    assert markets == [1, 1, 1, 1, 0, 0, 0, 0]
 
 
 def test_demand_depth_captured_once_for_both_markets(tmp_path, monkeypatch):

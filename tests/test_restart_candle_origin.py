@@ -26,7 +26,8 @@ def publish(handle, stamp, kind, frames):
     return read_arrow_snapshot(arrow), mgr.read_candle(f'market_pivot_{kind}_{stamp.year}')
 
 
-def restart_case(root, legacy_pkl=False, correction=None, kind='spot', add_listing=True, between_rounds=False):
+def restart_case(root, legacy_pkl=False, correction=None, kind='spot', add_listing=True,
+                 between_rounds=False, wipe_batches=False):
     times = pd.date_range('2026-01-01 00:25', periods=24*180+1, freq='h', tz='UTC')
     bars = pd.DataFrame({'candle_begin_time': times, 'open': 1., 'close': 2.})
     for column in ('high', 'low', 'volume', 'quote_volume', 'trade_num',
@@ -58,6 +59,9 @@ def restart_case(root, legacy_pkl=False, correction=None, kind='spot', add_listi
         (mgr.base_dir / f'{kind}_dict_{int(stamp.timestamp())}.arrow').unlink()
     init_dirs(handle)
     init_dirs(handle)  # restart again before any rebuilt output is ready
+    if wipe_batches:
+        for path in mgr.base_dir.glob(f'{kind}_dict_batch*'):
+            path.unlink()
     recent = bars.tail(170).copy()
     if correction == 'close':
         recent.loc[recent.index[-5], 'close'] = 3.
@@ -73,6 +77,22 @@ def restart_case(root, legacy_pkl=False, correction=None, kind='spot', add_listi
 @pytest.mark.parametrize('legacy_pkl', [False, True])
 def test_regular_restart_keeps_published_age_without_restoring_old_bars(tmp_path, legacy_pkl):
     mgr, times, (before, _), (after, _pivot) = restart_case(tmp_path, legacy_pkl)
+    assert before['BTCUSDT'].first_candle_time.eq(times[0]).all()
+    # Under non-destructive init_dirs (G3), Arrow publishes tail(170) with preserved origin
+    # while spot_dict_batch1.pkl intentionally retains full history across restarts.
+    assert after['BTCUSDT'].candle_begin_time.tolist() == list(times[-170:])
+    assert after['BTCUSDT'].first_candle_time.eq(times[0]).all()
+    assert after['NEW'].first_candle_time.tolist() == [times[-1]]
+
+    batch = mgr.read_candle('spot_dict_batch1')
+    assert batch['BTCUSDT'].candle_begin_time.tolist() == list(times)
+    assert batch['BTCUSDT'].first_candle_time.eq(times[0]).all()
+    assert batch['NEW'].first_candle_time.tolist() == [times[-1]]
+
+
+@pytest.mark.parametrize('legacy_pkl', [False, True])
+def test_cold_wiped_batch_recovery_restores_published_age_from_origins(tmp_path, legacy_pkl):
+    mgr, times, (before, _), (after, _pivot) = restart_case(tmp_path, legacy_pkl, wipe_batches=True)
     assert before['BTCUSDT'].first_candle_time.eq(times[0]).all()
     for frames in (after, mgr.read_candle('spot_dict_batch1')):
         assert frames['BTCUSDT'].candle_begin_time.tolist() == list(times[-170:])
