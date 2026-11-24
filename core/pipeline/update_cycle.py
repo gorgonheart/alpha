@@ -365,9 +365,36 @@ def _barrier_and_resample(
     }
 
 
-def _run_preprocess(handle: BmacHandle, run_time: datetime, spot_begin_ts, swap_begin_ts) -> None:
-    """在 worker 进程里跑 preprocess。"""
-    if handle.preprocess_handle is not None:
+def _run_preprocess(
+    handle: BmacHandle,
+    run_time: datetime,
+    spot_begin_ts,
+    swap_begin_ts,
+    *,
+    batch_executor=None,
+    resample_tails=None,
+) -> None:
+    """运行 preprocess：有常驻计算池时在当前协调线程直接分发各 batch，否则使用单 worker 子进程隔离。"""
+    if handle.preprocess_handle is None:
+        return
+    if batch_executor is not None:
+        pp_sig = inspect.signature(preprocess_offset_data)
+        accepts_kw = (
+            any(p.kind == inspect.Parameter.VAR_KEYWORD for p in pp_sig.parameters.values())
+            or ("batch_executor" in pp_sig.parameters and "resample_tails" in pp_sig.parameters)
+        )
+        if accepts_kw:
+            preprocess_offset_data(
+                handle,
+                run_time,
+                spot_begin_ts,
+                swap_begin_ts,
+                batch_executor=batch_executor,
+                resample_tails=resample_tails,
+            )
+        else:
+            preprocess_offset_data(handle, run_time, spot_begin_ts, swap_begin_ts)
+    else:
         with ProcessPoolExecutor(max_workers=1, mp_context=_SPAWN_CTX) as exe:
             exe.submit(preprocess_offset_data, handle, run_time, spot_begin_ts, swap_begin_ts).result()
 
@@ -429,6 +456,7 @@ def run_ws_cycle(handle: BmacHandle, run_time: datetime, supervisor: RuntimeSupe
                 if all(r["success"] == r["total"] and not r.get("has_gaps", False) for r in results):
                     rest_state["cancel"].set()
 
+            resample_tails: dict[str, dict] = {}
             for r in results:
                 if r["success"]:
                     result.is_binance_success = True
@@ -436,6 +464,14 @@ def run_ws_cycle(handle: BmacHandle, run_time: datetime, supervisor: RuntimeSupe
                     result.spot_begin_ts = r["begin_ts"]
                 else:
                     result.swap_begin_ts = r["begin_ts"]
+                r_tails = r.get("tail_dfs") or {}
+                r_begins = r.get("begin_ts") or {}
+                if r_tails and r_begins:
+                    resample_tails[r["trade_type"]] = {
+                        sym: (r_begins[sym][0], r_begins[sym][1], tdf)
+                        for sym, tdf in r_tails.items()
+                        if tdf is not None and sym in r_begins
+                    }
                 if r["skipped"]:
                     logger.warning(
                         f"barrier {r['trade_type']} timeout: {len(r['skipped'])}/{r['total']} "
@@ -452,6 +488,25 @@ def run_ws_cycle(handle: BmacHandle, run_time: datetime, supervisor: RuntimeSupe
             data_api_done = task_data_api is None
             data_api_result = None
             published = False
+
+            rp_sig = inspect.signature(_run_preprocess)
+            rp_supports_pool = (
+                any(p.kind == inspect.Parameter.VAR_KEYWORD for p in rp_sig.parameters.values())
+                or ("batch_executor" in rp_sig.parameters and "resample_tails" in rp_sig.parameters)
+            )
+
+            def _invoke_preprocess(pub_handle, sp_bt, sw_bt):
+                if rp_supports_pool:
+                    _run_preprocess(
+                        pub_handle,
+                        run_time,
+                        sp_bt,
+                        sw_bt,
+                        batch_executor=compute_pool,
+                        resample_tails=resample_tails or None,
+                    )
+                else:
+                    _run_preprocess(pub_handle, run_time, sp_bt, sw_bt)
 
             if handle.preprocess_handle is not None:
                 try:
@@ -473,7 +528,7 @@ def run_ws_cycle(handle: BmacHandle, run_time: datetime, supervisor: RuntimeSupe
                     sources, spot_begin_ts, swap_begin_ts = chosen
                     publication_handle = copy(handle)
                     publication_handle.publication_sources = sources
-                    _run_preprocess(publication_handle, run_time, spot_begin_ts, swap_begin_ts)
+                    _invoke_preprocess(publication_handle, spot_begin_ts, swap_begin_ts)
                     published = True
 
                 if not published and task_data_api is not None:
@@ -503,7 +558,7 @@ def run_ws_cycle(handle: BmacHandle, run_time: datetime, supervisor: RuntimeSupe
                         sources, spot_begin_ts, swap_begin_ts = chosen
                         publication_handle = copy(handle)
                         publication_handle.publication_sources = sources
-                        _run_preprocess(publication_handle, run_time, spot_begin_ts, swap_begin_ts)
+                        _invoke_preprocess(publication_handle, spot_begin_ts, swap_begin_ts)
                         published = True
 
             if task_coin_cap is not None:

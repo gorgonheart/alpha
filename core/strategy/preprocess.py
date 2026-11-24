@@ -1,9 +1,11 @@
 import ctypes
 import gc
 import importlib
+import inspect
 import os
 import sys
 import time
+import types
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
@@ -21,7 +23,12 @@ from core.storage.candle_manager import CandleFileReader
 from core.utils.log_kit import logger
 from core.utils.time import get_offset_from_runtime, now_time_str
 
-from .arrow_publish import cleanup_old_snapshots, publish_arrow_snapshot
+from .arrow_publish import (
+    cleanup_old_snapshots,
+    publish_arrow_ipc_batches,
+    publish_arrow_snapshot,
+    serialize_market_dict_to_ipc_batches,
+)
 from .candle_origins import extract_ready_origins, load_origins, remember_ready_origins
 from .funding_hours import normalize_funding_hours
 from .funding_publication import FundingPublication
@@ -245,17 +252,30 @@ def apply_symbol_match(frame, trade_type, symbol, row):
     New/changed partners are restricted to the currently proven overlap.
     """
     other = 'symbol_swap' if trade_type == 'spot' else 'symbol_spot'
-    frame[f'symbol_{trade_type}'] = symbol
-    previous = frame.get(other)
-    frame[other] = ''
+    self_col = f'symbol_{trade_type}'
+    if self_col not in frame.columns or not (len(frame) == 0 or (frame[self_col].iloc[0] == symbol and frame[self_col].iloc[-1] == symbol)):
+        frame[self_col] = symbol
+    if frame.empty:
+        frame[other] = ''
+        return
     if row is None or pd.isna(row.first_begin_time) or pd.isna(row.last_begin_time):
+        frame[other] = ''
         return
     partner = row.swap if trade_type == 'spot' else row.spot
     if pd.isna(partner):
+        frame[other] = ''
         return
-    mask = frame['candle_begin_time'].between(row.first_begin_time, row.last_begin_time)
+    cbt = frame['candle_begin_time']
+    # Fast path: entire sorted candle window lies inside proven [first_begin_time, last_begin_time]
+    if cbt.iloc[0] >= row.first_begin_time and cbt.iloc[-1] <= row.last_begin_time:
+        if other not in frame.columns or not (frame[other] == partner).all():
+            frame[other] = partner
+        return
+    previous = frame.get(other)
+    frame[other] = ''
+    mask = cbt.between(row.first_begin_time, row.last_begin_time)
     if previous is not None:
-        mask |= frame['candle_begin_time'].lt(row.first_begin_time) & previous.eq(partner)
+        mask |= cbt.lt(row.first_begin_time) & previous.eq(partner)
     frame.loc[mask, other] = partner
 
 
@@ -389,9 +409,98 @@ def gen_batch_data(handle: BmacHandle, run_time: datetime, trade_type: str, df_m
     return full_batch_name, year_pivot_name, market_dict
 
 
+_RAW_OHLCV_COMPARE_COLS = (
+    'open', 'high', 'low', 'close', 'volume', 'quote_volume',
+    'trade_num', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume',
+)
+_TAIL_FAST_OVERLAP_BARS = 16
+
+
+def _frames_ohlcv_equal(df_a: pd.DataFrame, df_b: pd.DataFrame) -> bool:
+    """Fast C/NumPy check that candle_begin_time and all present raw OHLCV columns match bit-for-bit."""
+    if len(df_a) != len(df_b):
+        return False
+    cbt_a = df_a['candle_begin_time']
+    cbt_b = df_b['candle_begin_time']
+    if cbt_a.dtype != cbt_b.dtype or not np.array_equal(cbt_a.array.asi8, cbt_b.array.asi8):
+        return False
+    for col in _RAW_OHLCV_COMPARE_COLS:
+        if (col in df_a.columns) != (col in df_b.columns):
+            return False
+        if col in df_a.columns:
+            arr_a = df_a[col].to_numpy(copy=False)
+            arr_b = df_b[col].to_numpy(copy=False)
+            if arr_a.dtype != arr_b.dtype:
+                return False
+            if pd.api.types.is_float_dtype(arr_a.dtype):
+                if not np.array_equal(arr_a, arr_b, equal_nan=True):
+                    return False
+            elif not np.array_equal(arr_a, arr_b):
+                return False
+    return True
+
+
+def _try_tail_enrich_merge(
+    df_old: pd.DataFrame,
+    df_candle_tail: pd.DataFrame,
+    anchor_pos: int,
+    trade_type: str,
+    symbol: str,
+    df_funding: Optional[pd.DataFrame],
+    prior_bounds,
+    min_ts: Optional[pd.Timestamp],
+) -> tuple[Optional[pd.DataFrame], set[int]]:
+    """对不变前缀 `df_old.iloc[:anchor_pos]` 执行零重复富集的尾部增量合并。"""
+    if anchor_pos <= 0 or anchor_pos >= len(df_old) or df_candle_tail.empty:
+        return None, set()
+    if min_ts is not None and df_old['candle_begin_time'].iloc[0] < min_ts:
+        return None, set()
+
+    prefix = df_old.iloc[:anchor_pos]
+    old_tail = df_old.iloc[anchor_pos:]
+    tail_incoming = add_additional_cols(
+        df_candle_tail.copy(), trade_type, symbol, df_funding, prior_bounds
+    )
+    rev_years = changed_price_years(old_tail, tail_incoming)
+
+    old_rates = old_tail.set_index('candle_begin_time')['funding_fee']
+    overlap = tail_incoming['candle_begin_time'].isin(old_rates.index)
+    if overlap.any():
+        tail_incoming.loc[overlap, 'funding_fee'] = (
+            tail_incoming.loc[overlap, 'candle_begin_time'].map(old_rates).to_numpy()
+        )
+
+    keep_old = ~old_tail['candle_begin_time'].isin(tail_incoming['candle_begin_time'])
+    if keep_old.any():
+        tail_merged = pd.concat([old_tail.loc[keep_old], tail_incoming], ignore_index=True)
+        tail_merged.sort_values('candle_begin_time', inplace=True, ignore_index=True)
+    else:
+        tail_merged = tail_incoming.reset_index(drop=True)
+
+    # 对齐 key_0 与 funding_fee dtype，避免 concat 产生列序或类型漂移
+    if 'key_0' in prefix.columns and 'key_0' not in tail_merged.columns:
+        tail_merged.insert(0, 'key_0', tail_merged['candle_begin_time'].dt.floor('h'))
+    elif 'key_0' in tail_merged.columns and 'key_0' not in prefix.columns:
+        prefix = prefix.copy()
+        prefix.insert(0, 'key_0', prefix['candle_begin_time'].dt.floor('h'))
+
+    if pd.api.types.is_float_dtype(prefix['funding_fee']) and not pd.api.types.is_float_dtype(tail_merged['funding_fee']):
+        tail_merged['funding_fee'] = tail_merged['funding_fee'].astype('float64')
+
+    if list(tail_merged.columns) != list(prefix.columns):
+        if set(tail_merged.columns) != set(prefix.columns):
+            return None, set()
+        tail_merged = tail_merged[list(prefix.columns)]
+
+    combined = pd.concat([prefix, tail_merged], ignore_index=True)
+    combined['first_candle_time'] = df_old['first_candle_time'].iloc[0]
+    combined['last_candle_time'] = combined['candle_begin_time'].iloc[-1]
+    return combined, rev_years
+
+
 def gen_batch_data_incremental(handle: BmacHandle, run_time: datetime, trade_type: str, df_match: pd.DataFrame,
                                symbol_list: list[str], batch_name: str, with_factors: bool = False, *,
-                               funding_publication=None, year_pivot_out=None):
+                               funding_publication=None, year_pivot_out=None, resample_tail_hints=None):
     shorthand = isinstance(run_time, str)
     if shorthand:
         trade_type, run_time = run_time, trade_type
@@ -447,11 +556,48 @@ def gen_batch_data_incremental(handle: BmacHandle, run_time: datetime, trade_typ
     revised_years = set()
     origins = None
     start_year, end_year = None, None
+    hints_map = resample_tail_hints or {}
 
     for symbol in symbol_list:
         choices = getattr(handle, 'publication_sources', {}).get(trade_type)
-        result = read_candle_data(binance_mgr, data_api_mgr, symbol, run_time,
-                                  source=None if choices is None else choices.get(symbol, 'absent'))
+        src_choice = None if choices is None else choices.get(symbol, 'absent')
+        df_old = old_market_dict.get(symbol)
+        df_funding = fundings.get(symbol, None) if fundings is not None else None
+        if origins is None:
+            origins = load_origins(preprocess_mgr.base_dir, trade_type)
+
+        # Fast Path 1: 内存重采样尾部直传（校验头部时间与锚点 K 线一致后免除 1.5 万行 1h pkl 读盘）
+        hint = hints_map.get(symbol)
+        if (
+            hint is not None
+            and src_choice in (None, 'binance')
+            and df_old is not None
+            and len(df_old) > 2
+            and binance_mgr.check_ready(symbol, run_time)
+        ):
+            hint_first, _hint_last, df_hint_tail = hint
+            if (
+                df_hint_tail is not None
+                and len(df_hint_tail) >= 2
+                and hint_first == df_old['candle_begin_time'].iloc[0]
+            ):
+                anchor_ts = df_hint_tail['candle_begin_time'].iloc[0]
+                anchor_pos = int(df_old['candle_begin_time'].searchsorted(anchor_ts))
+                if (
+                    0 < anchor_pos < len(df_old)
+                    and _frames_ohlcv_equal(df_old.iloc[anchor_pos:anchor_pos + 1], df_hint_tail.iloc[:1])
+                ):
+                    fast_comb, fast_rev = _try_tail_enrich_merge(
+                        df_old, df_hint_tail, anchor_pos, trade_type, symbol,
+                        df_funding, origins.get(symbol), min_ts,
+                    )
+                    if fast_comb is not None:
+                        revised_years.update(fast_rev)
+                        new_market_dict[symbol] = fast_comb
+                        price_updates.append(symbol)
+                        continue
+
+        result = read_candle_data(binance_mgr, data_api_mgr, symbol, run_time, source=src_choice)
         if result is None:
             if symbol in old_market_dict:
                 retained = _apply_history_trim(old_market_dict[symbol], min_ts)
@@ -463,10 +609,24 @@ def gen_batch_data_incremental(handle: BmacHandle, run_time: datetime, trade_typ
         if df_candle_full.empty:
             continue
 
-        df_old = old_market_dict.get(symbol)
-        df_funding = fundings.get(symbol, None) if fundings is not None else None
-        if origins is None:
-            origins = load_origins(preprocess_mgr.base_dir, trade_type)
+        # Fast Path 2: 已读入磁盘 1h 全表，前缀 NumPy 快速校验一致时仅对尾部 ~16 根做 pandas 富集
+        if (
+            df_old is not None
+            and len(df_old) > _TAIL_FAST_OVERLAP_BARS + 2
+            and len(df_candle_full) >= len(df_old) - _TAIL_FAST_OVERLAP_BARS
+        ):
+            anchor_pos = len(df_old) - _TAIL_FAST_OVERLAP_BARS
+            if _frames_ohlcv_equal(df_old.iloc[:anchor_pos], df_candle_full.iloc[:anchor_pos]):
+                fast_comb, fast_rev = _try_tail_enrich_merge(
+                    df_old, df_candle_full.iloc[anchor_pos:], anchor_pos, trade_type, symbol,
+                    df_funding, origins.get(symbol), min_ts,
+                )
+                if fast_comb is not None:
+                    revised_years.update(fast_rev)
+                    new_market_dict[symbol] = fast_comb
+                    price_updates.append(symbol)
+                    continue
+
         incoming = add_additional_cols(df_candle_full, trade_type, symbol, df_funding, origins.get(symbol))
         revised_years.update(changed_price_years(df_old, incoming))
         if df_old is not None and not df_old.empty:
@@ -825,8 +985,85 @@ def publish_arrow_snapshot_for_type(handle: BmacHandle, run_time: datetime, trad
         logger.error(f'Arrow 发布 {trade_type} 失败（不影响 pkl 路径）: {exc!r}')
 
 
+_WORKER_FACTOR_MOD_CACHE: dict[str, types.ModuleType] = {}
+
+
+def _can_offload_factors_to_process_pool(factor_modules_params) -> bool:
+    for mod, factor_name, _ in (factor_modules_params or ()):
+        if not isinstance(mod, types.ModuleType):
+            return False
+        if getattr(mod, '__name__', None) != f'factors.{factor_name}':
+            return False
+    return True
+
+
+def _run_batch_worker_task(
+    handle: BmacHandle,
+    run_time: datetime,
+    trade_type: str,
+    df_match: pd.DataFrame,
+    batch_symbols: list[str],
+    batch_name: str,
+    factor_specs: list[tuple[str, list]],
+    publish_kline_num: int,
+    resample_tail_hints: Optional[dict] = None,
+):
+    """常驻子进程内的单 Batch 全链路任务：
+    增量合并 + 持久化无因子 Raw Batch + 全历史 C 因子计算 + 裁切 .tail(publish_kline_num) 序列化 Arrow IPC + 立即释放大表。
+    """
+    resample_interval = getattr(handle, 'resample_interval', '1h')
+    offset_str = get_offset_from_runtime(run_time, resample_interval)
+    preprocess_mgr = handle.preprocess_handle.preprocess_mgr_map[offset_str]
+    funding_publication = (
+        FundingPublication(preprocess_mgr.base_dir, run_time)
+        if trade_type == 'swap' and handle.fetch_funding_rate
+        else None
+    )
+    year_pivot_slice: dict[int, dict[str, pd.DataFrame]] = {}
+
+    _fb, year_pivot_name, batch_market_dict = gen_batch_data_incremental(
+        handle, run_time, trade_type, df_match, batch_symbols, batch_name,
+        with_factors=False,
+        funding_publication=funding_publication,
+        year_pivot_out=year_pivot_slice,
+        resample_tail_hints=resample_tail_hints,
+    )
+
+    if factor_specs:
+        worker_fmp = []
+        for factor_name, param_list in factor_specs:
+            mod = _WORKER_FACTOR_MOD_CACHE.get(factor_name)
+            if mod is None:
+                mod = importlib.import_module(f'factors.{factor_name}')
+                _WORKER_FACTOR_MOD_CACHE[factor_name] = mod
+            worker_fmp.append((mod, factor_name, param_list))
+        batch_market_dict = {
+            sym: apply_precomputed_factors(df, worker_fmp)
+            for sym, df in batch_market_dict.items()
+        }
+
+    has_non_empty = any(not frame.empty for frame in batch_market_dict.values())
+    batch_origins = extract_ready_origins(batch_market_dict)
+    pub_depth = int(publish_kline_num or 0)
+    schema_bytes, ipc_items = serialize_market_dict_to_ipc_batches(batch_market_dict, pub_depth)
+    fpub_by_year = dict(funding_publication.by_year) if funding_publication is not None else {}
+
+    del batch_market_dict
+    _release_memory()
+    return (
+        year_pivot_name,
+        year_pivot_slice,
+        fpub_by_year,
+        batch_origins,
+        schema_bytes,
+        ipc_items,
+        has_non_empty,
+    )
+
+
 def preprocess_type_data(handle: BmacHandle, run_time: datetime, trade_type: str, df_match: pd.DataFrame,
-                         *, factor_executor=None, factor_modules_params=None, publish_kline_num=None):
+                         *, factor_executor=None, factor_modules_params=None, publish_kline_num=None,
+                         batch_executor=None, resample_tail_hints=None):
     num_batch = handle.preprocess_handle.num_batch
     exg_mgr = handle.exg_mgr
     exginfo_name = f'exginfo_{trade_type}'
@@ -846,66 +1083,153 @@ def preprocess_type_data(handle: BmacHandle, run_time: datetime, trade_type: str
     symbol_list = sorted(df_exginfo['symbol'].to_list())
     if factor_modules_params is None:
         factor_modules_params = _load_factor_modules_params()
-    calc_factors = partial(_calc_symbol_factors, factor_modules_params=factor_modules_params)
 
     logger.info(f'开始预处理 {trade_type}, 当前时间={now_time_str()}')
 
+    batches: list[tuple[int, list[str]]] = []
     idx = 1
-    year_pivot_names = defaultdict(list)
-    year_pivot_data: dict[int, dict[str, pd.DataFrame]] = {}
-    t_start = time.perf_counter()
-    market_dict: dict[str, pd.DataFrame] = {}
-    funding_publication = (FundingPublication(preprocess_mgr.base_dir, run_time)
-                           if trade_type == 'swap' and handle.fetch_funding_rate else None)
-    while symbol_list:
-        if len(symbol_list) > num_batch:
-            batch, symbol_list = symbol_list[:num_batch], symbol_list[num_batch:]
+    rem = symbol_list
+    while rem:
+        if len(rem) > num_batch:
+            batch, rem = rem[:num_batch], rem[num_batch:]
         else:
-            batch, symbol_list = symbol_list, []
-
-        # Persist raw batches first; compute full-history factors only in memory.
-        # Pass year_pivot_out so pivot slices stay in memory instead of round-tripping
-        # through temporary *_for_pivot_batch*_{year}.pkl files on disk.
-        _full_batch_name, year_pivot_name, batch_market_dict = gen_batch_data_incremental(
-            handle, run_time, trade_type, df_match, batch, f'batch{idx}', with_factors=False,
-            funding_publication=funding_publication, year_pivot_out=year_pivot_data)
-        if factor_modules_params:
-            # Ordered consumption propagates failures before this market is published.
-            # Finish this batch before submitting another, bounding queued frame references.
-            factor_map = factor_executor.map if factor_executor is not None else map
-            batch_market_dict = dict(factor_map(calc_factors, batch_market_dict.items()))
-        # Finding 1: keep the in-memory dict so publish never re-reads the batch pkl.
-        market_dict.update(batch_market_dict)
-        del batch_market_dict
+            batch, rem = rem, []
+        batches.append((idx, batch))
         idx += 1
 
-        for col, pivot_name in year_pivot_name.items():
-            year_pivot_names[col].append(pivot_name)
-
-    market_dict_elapsed = time.perf_counter() - t_start
-    logger.ok(f'预处理 Market Dict (含因子) {trade_type} 完成, 当前时间={now_time_str()}, 耗时 {market_dict_elapsed:.1f} 秒')
-
-    if not market_dict or not any(not frame.empty for frame in market_dict.values()):
-        raise ValueError('No current market candles; public ready withheld')
-
-    # §3.4 Arrow 发布：原子写出消费者 mmap 读取的快照（每 symbol 一 batch + manifest）。
-    t_publish = time.perf_counter()
-    publish_arrow_snapshot_for_type(
-        handle,
-        run_time,
-        trade_type,
-        market_dict,
-        publish_kline_num,
-        history_trim_date=getattr(handle, 'history_trim_date', None),
+    use_batch_pool = (
+        batch_executor is not None
+        and _can_offload_factors_to_process_pool(factor_modules_params)
     )
-    publish_elapsed = time.perf_counter() - t_publish
 
-    # 暗雷 5 峰值治理：Arrow 落盘后立刻提取轻量 origins 并释放全历史含因子 market_dict，
-    # 避免在建 Pivot 期间与 market_dict 同时常驻内存。
-    ready_origins = extract_ready_origins(market_dict)
-    symbol_count = len(market_dict)
-    del market_dict
-    _release_memory()
+    year_pivot_names = defaultdict(list)
+    year_pivot_data: dict[int, dict[str, pd.DataFrame]] = {}
+    funding_publication = (FundingPublication(preprocess_mgr.base_dir, run_time)
+                           if trade_type == 'swap' and handle.fetch_funding_rate else None)
+
+    if use_batch_pool:
+        t_start = time.perf_counter()
+        pub_depth = (
+            publish_kline_num
+            if publish_kline_num is not None
+            else getattr(bmac_config, 'publish_kline_num', getattr(handle, 'publish_kline_num', 5000))
+        )
+        factor_specs = [(fn, pl) for _, fn, pl in (factor_modules_params or ())]
+        futures = []
+        for b_idx, b_syms in batches:
+            b_hints = (
+                {s: resample_tail_hints[s] for s in b_syms if s in resample_tail_hints}
+                if resample_tail_hints
+                else None
+            )
+            futures.append(
+                batch_executor.submit(
+                    _run_batch_worker_task,
+                    handle,
+                    run_time,
+                    trade_type,
+                    df_match,
+                    b_syms,
+                    f'batch{b_idx}',
+                    factor_specs,
+                    int(pub_depth or 0),
+                    b_hints,
+                )
+            )
+
+        ipc_chunks: list[tuple[bytes, list[tuple[str, bytes]]]] = []
+        ready_origins: dict = {}
+        symbol_count = 0
+        any_non_empty = False
+        for fut in futures:
+            (
+                yp_name,
+                yp_slice,
+                fpub_by_year,
+                b_origins,
+                schema_bytes,
+                ipc_items,
+                has_non_empty,
+            ) = fut.result()
+            for col, pname in yp_name.items():
+                year_pivot_names[col].append(pname)
+            for yr, ydict in yp_slice.items():
+                year_pivot_data.setdefault(yr, {}).update(ydict)
+            if funding_publication is not None and fpub_by_year:
+                for yr, cells_map in fpub_by_year.items():
+                    funding_publication.by_year[yr].update(cells_map)
+            ready_origins.update(b_origins)
+            if schema_bytes is not None and ipc_items:
+                ipc_chunks.append((schema_bytes, ipc_items))
+                symbol_count += len(ipc_items)
+            if has_non_empty:
+                any_non_empty = True
+
+        market_dict_elapsed = time.perf_counter() - t_start
+        logger.ok(f'预处理 Market Dict (含因子) {trade_type} 完成, 当前时间={now_time_str()}, 耗时 {market_dict_elapsed:.1f} 秒')
+
+        if not ipc_chunks or not any_non_empty:
+            raise ValueError('No current market candles; public ready withheld')
+
+        t_publish = time.perf_counter()
+        epoch = int(run_time.timestamp())
+        out_path = Path(preprocess_mgr.base_dir) / f'{trade_type}_dict_{epoch}.arrow'
+        history_trim_date = getattr(handle, 'history_trim_date', None)
+        try:
+            publish_arrow_ipc_batches(
+                ipc_chunks,
+                out_path,
+                int(pub_depth or 0),
+                write_ready=False,
+                history_trim_date=history_trim_date,
+            )
+            keep = getattr(bmac_config, 'arrow_snapshot_keep', getattr(handle, 'arrow_snapshot_keep', 1))
+            cleanup_old_snapshots(preprocess_mgr.base_dir, trade_type, keep=keep, current_epoch=epoch)
+        except Exception as exc:
+            logger.error(f'Arrow 发布 {trade_type} 失败（不影响 pkl 路径）: {exc!r}')
+        publish_elapsed = time.perf_counter() - t_publish
+        del ipc_chunks
+        _release_memory()
+    else:
+        calc_factors = partial(_calc_symbol_factors, factor_modules_params=factor_modules_params)
+        t_start = time.perf_counter()
+        market_dict: dict[str, pd.DataFrame] = {}
+        for b_idx, batch in batches:
+            # Persist raw batches first; compute full-history factors only in memory.
+            _full_batch_name, year_pivot_name, batch_market_dict = gen_batch_data_incremental(
+                handle, run_time, trade_type, df_match, batch, f'batch{b_idx}', with_factors=False,
+                funding_publication=funding_publication, year_pivot_out=year_pivot_data,
+                resample_tail_hints=resample_tail_hints)
+            if factor_modules_params:
+                factor_map = factor_executor.map if factor_executor is not None else map
+                batch_market_dict = dict(factor_map(calc_factors, batch_market_dict.items()))
+            market_dict.update(batch_market_dict)
+            del batch_market_dict
+
+            for col, pivot_name in year_pivot_name.items():
+                year_pivot_names[col].append(pivot_name)
+
+        market_dict_elapsed = time.perf_counter() - t_start
+        logger.ok(f'预处理 Market Dict (含因子) {trade_type} 完成, 当前时间={now_time_str()}, 耗时 {market_dict_elapsed:.1f} 秒')
+
+        if not market_dict or not any(not frame.empty for frame in market_dict.values()):
+            raise ValueError('No current market candles; public ready withheld')
+
+        t_publish = time.perf_counter()
+        publish_arrow_snapshot_for_type(
+            handle,
+            run_time,
+            trade_type,
+            market_dict,
+            publish_kline_num,
+            history_trim_date=getattr(handle, 'history_trim_date', None),
+        )
+        publish_elapsed = time.perf_counter() - t_publish
+
+        ready_origins = extract_ready_origins(market_dict)
+        symbol_count = len(market_dict)
+        del market_dict
+        _release_memory()
 
     t_start = time.perf_counter()
     gen_pivot_incremental(handle, run_time, trade_type, year_pivot_names,
@@ -916,16 +1240,15 @@ def preprocess_type_data(handle: BmacHandle, run_time: datetime, trade_type: str
     pivot_elapsed = time.perf_counter() - t_start
     logger.ok(f'预处理 Pivot Table {trade_type} 完成, 当前时间={now_time_str()}, 耗时 {pivot_elapsed:.1f} 秒')
 
-    # Lever 1 决策依据：单轮各阶段墙钟分解（grep [io-stat] phase）。market_dict 阶段含
-    # 批次读回+富集+因子计算+原始批次写盘；逐文件读写明细见上方 [io-stat] read/write 行。
-    n_batches = idx - 1
+    n_batches = len(batches)
     logger.info(f'[io-stat] phase {trade_type} symbols={symbol_count} batches={n_batches} '
                 f'market_dict={market_dict_elapsed:.1f}s publish={publish_elapsed:.1f}s '
                 f'pivot={pivot_elapsed:.1f}s')
 
 
 def preprocess_offset_data(handle: BmacHandle, run_time: datetime,
-                           symbol_begin_time_spot=None, symbol_begin_time_swap=None):
+                           symbol_begin_time_spot=None, symbol_begin_time_swap=None,
+                           *, batch_executor=None, resample_tails=None):
     df_match = preprocess_match_symbols(handle, run_time, symbol_begin_time_spot, symbol_begin_time_swap)
 
     if df_match is None:
@@ -945,15 +1268,43 @@ def preprocess_offset_data(handle: BmacHandle, run_time: datetime,
         logger.info(f'Arrow publication offset={offset} rows={depth} (0=full)')
     factor_modules_params = _load_factor_modules_params()
     workers = getattr(bmac_config, 'precompute_factor_workers', getattr(handle, 'precompute_factor_workers', 0))
-    # 暗雷 5 峰值治理：严格顺序执行 spot -> 释放内存 -> swap，避免双市场全历史因子同时驻留。
-    factor_pool = (ThreadPoolExecutor(max_workers=workers, thread_name_prefix='factors')
-                   if workers > 0 and factor_modules_params else nullcontext(None))
+
+    need_thread_factor_pool = (
+        workers > 0
+        and factor_modules_params
+        and not (batch_executor is not None and _can_offload_factors_to_process_pool(factor_modules_params))
+    )
+    factor_pool = (
+        ThreadPoolExecutor(max_workers=workers, thread_name_prefix='factors')
+        if need_thread_factor_pool
+        else nullcontext(None)
+    )
+
+    sig = inspect.signature(preprocess_type_data)
+    accepts_extra = (
+        any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        or ('batch_executor' in sig.parameters and 'resample_tail_hints' in sig.parameters)
+    )
+    tails_map = resample_tails or {}
+
     with factor_pool as factor_executor:
-        kwargs = dict(factor_executor=factor_executor, factor_modules_params=factor_modules_params,
-                      publish_kline_num=depth)
-        preprocess_type_data(handle, run_time, 'spot', df_match, **kwargs)
-        _release_memory()
-        preprocess_type_data(handle, run_time, 'swap', df_match, **kwargs)
+        def _invoke_market(tt: str):
+            kw = dict(
+                factor_executor=factor_executor,
+                factor_modules_params=factor_modules_params,
+                publish_kline_num=depth,
+            )
+            if accepts_extra:
+                kw['batch_executor'] = batch_executor
+                kw['resample_tail_hints'] = tails_map.get(tt)
+            return preprocess_type_data(handle, run_time, tt, df_match, **kw)
+
+        # 双市场并发调度：swap 体量更大优先投递，避免尾部空等；spot 收齐即刻先发 spot_dict.ready。
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix='preprocess_mkt') as mkt_pool:
+            fut_swap = mkt_pool.submit(_invoke_market, 'swap')
+            fut_spot = mkt_pool.submit(_invoke_market, 'spot')
+            fut_spot.result()
+            fut_swap.result()
         _release_memory()
 
 

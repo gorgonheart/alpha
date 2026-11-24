@@ -208,7 +208,14 @@ def update_resample_candle(
     last_begin_time = df_total['candle_begin_time'].iloc[-1]
 
     if return_tail_bars > 0:
-        return first_begin_time, last_begin_time, _extract_tail_frame(df_total, return_tail_bars)
+        # 仅在首次无历史文件（冷启动）或总长不超过 tail 窗口时返回内存尾部；
+        # 若已有历史文件却退回全量重算（如重叠修订、48h 拆分过滤），返回 None 让下游重读完整 1h 文件。
+        tail_out = (
+            _extract_tail_frame(df_total, return_tail_bars)
+            if (df_old is None or len(df_total) <= return_tail_bars)
+            else None
+        )
+        return first_begin_time, last_begin_time, tail_out
     return first_begin_time, last_begin_time
 
 
@@ -301,7 +308,12 @@ def update_resample_candle_incremental(
     first_begin_time = df_total['candle_begin_time'].iloc[0]
     last_begin_time = df_total['candle_begin_time'].iloc[-1]
     if return_tail_bars > 0:
-        return first_begin_time, last_begin_time, _extract_tail_frame(df_total, return_tail_bars)
+        tail_out = (
+            _extract_tail_frame(df_total, return_tail_bars)
+            if len(work_df) <= return_tail_bars
+            else None
+        )
+        return first_begin_time, last_begin_time, tail_out
     return first_begin_time, last_begin_time
 
 

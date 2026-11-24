@@ -23,14 +23,19 @@ def test_arrow_publish_writes_and_omits_history_trim_date_metadata(tmp_path):
         assert meta.get(b"history_trim_date") == b"2025-06-01"
 
 
-def test_preprocess_offset_data_runs_spot_then_swap_sequentially(monkeypatch, tmp_path):
+def test_preprocess_offset_data_schedules_swap_and_spot_concurrently(monkeypatch, tmp_path):
+    from threading import Barrier, Lock
     from core.strategy import preprocess as pp
 
-    order = []
+    barrier = Barrier(2)
+    lock = Lock()
+    started = []
 
     def fake_type_data(handle, run_time, trade_type, *a, **kw):
-        order.append(("start", trade_type))
-        order.append(("end", trade_type))
+        with lock:
+            started.append(trade_type)
+        # Proves both markets execute concurrently in mkt_pool without serial blocking
+        barrier.wait(timeout=5.0)
 
     monkeypatch.setattr(pp, "preprocess_type_data", fake_type_data)
     monkeypatch.setattr(pp, "load_factor_modules_params", lambda *a, **kw: [])
@@ -42,7 +47,7 @@ def test_preprocess_offset_data_runs_spot_then_swap_sequentially(monkeypatch, tm
         arrow_demand_enabled=False, arrow_demand_min_rows=5000,
     )
     pp.preprocess_offset_data(h, pd.Timestamp("2026-11-23 01:25", tz="UTC"))
-    assert order == [("start", "spot"), ("end", "spot"), ("start", "swap"), ("end", "swap")]
+    assert set(started) == {"swap", "spot"}
 
 
 def test_gen_pivot_fallback_preserves_delisted_columns_on_existing_year_file(tmp_path):

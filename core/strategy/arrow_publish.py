@@ -101,6 +101,86 @@ def publish_arrow_snapshot(
     return out_path
 
 
+def serialize_market_dict_to_ipc_batches(
+    market_dict: dict[str, pd.DataFrame],
+    publish_kline_num: int = 5000,
+) -> tuple[Optional[bytes], list[tuple[str, bytes]]]:
+    """在 Worker 进程内将 `{symbol: DataFrame}` 裁切尾部并序列化为 IPC RecordBatch 字节流。"""
+    if not market_dict:
+        return None, []
+    if publish_kline_num < 0:
+        raise ValueError('publish_kline_num must be >= 0 (0 means full retained history)')
+
+    symbols = list(market_dict.keys())
+
+    def _to_batch(sym: str, schema=None) -> pa.RecordBatch:
+        df = market_dict[sym]
+        if publish_kline_num:
+            df = df.tail(publish_kline_num)
+        return pa.RecordBatch.from_pandas(df, schema=schema, preserve_index=False)
+
+    first_rb = _to_batch(symbols[0])
+    ref_schema = first_rb.schema
+    schema_bytes = ref_schema.serialize().to_pybytes()
+    items: list[tuple[str, bytes]] = [(symbols[0], first_rb.serialize().to_pybytes())]
+    del first_rb
+    for sym in symbols[1:]:
+        rb = _to_batch(sym, ref_schema)
+        items.append((sym, rb.serialize().to_pybytes()))
+    return schema_bytes, items
+
+
+def publish_arrow_ipc_batches(
+    batch_chunks: list[tuple[bytes, list[tuple[str, bytes]]]],
+    out_path,
+    publish_kline_num: int = 5000,
+    write_ready: bool = False,
+    *,
+    history_trim_date: Optional[str] = None,
+) -> Optional[Path]:
+    """将多个 Batch Worker 返回的预序列化 RecordBatch IPC 字节流零拷贝组装并原子落盘为单个 .arrow 文件。"""
+    non_empty_chunks = [(sb, items) for sb, items in batch_chunks if sb is not None and items]
+    if not non_empty_chunks:
+        return None
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    symbols = [sym for _, items in non_empty_chunks for sym, _ in items]
+    ref_schema = pa.ipc.read_schema(pa.py_buffer(non_empty_chunks[0][0]))
+    metadata = dict(ref_schema.metadata or {})
+    metadata[_MANIFEST_KEY] = json.dumps(symbols).encode("utf-8")
+    metadata[b'full_history'] = b'1' if publish_kline_num == 0 else b'0'
+    if history_trim_date is not None:
+        metadata[_HISTORY_TRIM_DATE_KEY] = str(history_trim_date).encode("utf-8")
+    schema_with_manifest = ref_schema.with_metadata(metadata)
+
+    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+    try:
+        with open(tmp_path, "wb") as fout:
+            with pa.ipc.new_file(fout, schema_with_manifest) as writer:
+                for schema_bytes, items in non_empty_chunks:
+                    chunk_schema = pa.ipc.read_schema(pa.py_buffer(schema_bytes))
+                    same_schema = chunk_schema.equals(ref_schema)
+                    for _, rb_bytes in items:
+                        rb = pa.ipc.read_record_batch(pa.py_buffer(rb_bytes), chunk_schema)
+                        if not same_schema:
+                            rb = pa.Table.from_batches([rb]).cast(ref_schema).to_batches()[0]
+                        writer.write_batch(rb)
+            fout.flush()
+            os.fsync(fout.fileno())
+        os.replace(tmp_path, out_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    if write_ready:
+        ready_path = out_path.with_suffix(".ready")
+        with open(ready_path, "w") as fready:
+            fready.write(str(pd.Timestamp.now().timestamp()))
+
+    return out_path
+
+
 def cleanup_old_snapshots(base_dir, trade_type: str, keep: int = 1, *, current_epoch: int | None = None) -> None:
     """删除某 trade_type 过期的 ``{trade_type}_dict_{epoch}.arrow`` 快照（设计文档 Finding 2）。
 

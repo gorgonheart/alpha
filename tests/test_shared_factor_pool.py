@@ -128,8 +128,8 @@ def test_four_factor_workers_progress_across_both_markets(tmp_path, monkeypatch,
     oracle_factor[0][0].signal_multi_params = synchronized
     pp.preprocess_offset_data(handle, stamp, begins, begins)
     assert len(threads) == 4
-    # Sequential spot -> swap: all 4 spot symbols finish before any swap symbol starts.
-    assert markets == [1, 1, 1, 1, 0, 0, 0, 0]
+    # Concurrent spot || swap sharing the 4-worker factor pool: all 8 symbol tasks complete cleanly.
+    assert sorted(markets) == [0, 0, 0, 0, 1, 1, 1, 1]
 
 
 def test_demand_depth_captured_once_for_both_markets(tmp_path, monkeypatch):

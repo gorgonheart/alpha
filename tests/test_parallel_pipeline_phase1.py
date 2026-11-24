@@ -616,3 +616,378 @@ def test_update_pivot_rows_vectorized_is_at_least_5x_faster_than_loc_oracle():
     assert t_fast * 5.0 < t_oracle, (
         f"Expected >=5x speedup over .loc oracle, got fast={t_fast:.4f}s vs oracle={t_oracle:.4f}s"
     )
+
+
+# ============================================================================
+# Task 4: Prefix-Verified Tail Enrich, 8-Batch Multi-Process Pool & Direct Arrow IPC
+# ============================================================================
+
+
+def test_gen_batch_data_incremental_tail_fast_path_skips_disk_read_and_matches_oracle(tmp_path, monkeypatch):
+    import numpy as np
+    from core.storage.candle_manager import CandleFileManager
+    from core.strategy.preprocess import gen_batch_data, gen_batch_data_incremental
+
+    times = pd.date_range("2026-10-01 00:25", periods=80, freq="h", tz="UTC")
+    t_old = times[:-1]
+    rt_old = t_old[-1].to_pydatetime()
+    rt_new = times[-1].to_pydatetime()
+
+    syms = ["NORMUSDT", "DEEPREVUSDT", "MATCHCHGUSDT"]
+    rng = np.random.default_rng(7)
+    raw_frames = {}
+    for i, sym in enumerate(syms):
+        p = 20.0 + i * 5.0 + np.cumsum(rng.standard_normal(len(times)) * 0.1)
+        raw_frames[sym] = pd.DataFrame({
+            "candle_begin_time": times,
+            "open": p, "high": p + 0.2, "low": p - 0.2, "close": p + 0.05,
+            "volume": 100.0 + i, "quote_volume": (100.0 + i) * p,
+            "trade_num": pd.Series([15] * len(times), dtype="int64"),
+            "taker_buy_base_asset_volume": 50.0,
+            "taker_buy_quote_asset_volume": 50.0 * p,
+        })
+
+    def _setup_env(root: Path):
+        res_dir = root / "swap_1h" / "25m"
+        pre_dir = root / "pre" / "25m"
+        exg_dir = root / "exg"
+        fun_dir = root / "funding"
+        for d in (res_dir, pre_dir, exg_dir, fun_dir):
+            d.mkdir(parents=True)
+        res_mgr = CandleFileManager(res_dir, "pickle")
+        pre_mgr = CandleFileManager(pre_dir, "pickle")
+        exg_mgr = CandleFileManager(exg_dir, "pickle")
+        fun_mgr = CandleFileManager(fun_dir, "pickle")
+        exg_mgr.set_candle("exginfo_swap", rt_new, pd.DataFrame({"symbol": syms}))
+        for sym in syms:
+            fdf = pd.DataFrame({
+                "candle_begin_time": times.floor("h"),
+                "funding_rate": np.linspace(-0.0002, 0.0003, len(times)),
+            }).drop_duplicates("candle_begin_time")
+            fun_mgr.set_candle(sym, rt_new, fdf)
+        h = SimpleNamespace(
+            resample_interval="1h",
+            history_trim_ts=lambda: None,
+            fetch_funding_rate=True,
+            funding_mgr=fun_mgr,
+            data_api=None,
+            exg_mgr=exg_mgr,
+            get_market_handle=lambda _: SimpleNamespace(resample_mgr_map={"25m": res_mgr}),
+            get_binance_handle=lambda _: SimpleNamespace(resample_mgr_map={"25m": res_mgr}),
+            preprocess_handle=SimpleNamespace(num_batch=10, preprocess_mgr_map={"25m": pre_mgr}),
+        )
+        return h, res_mgr, pre_mgr
+
+    # Round 1 on incremental env: MATCHCHGUSDT initially unmatched, others matched
+    h_inc, res_inc, pre_inc = _setup_env(tmp_path / "inc")
+    for sym in syms:
+        res_inc.set_candle(sym, rt_old, raw_frames[sym].iloc[:-1].reset_index(drop=True))
+    match_r1 = pd.DataFrame([
+        {"spot": "NORMUSDT", "swap": "NORMUSDT", "first_begin_time": t_old[0], "last_begin_time": t_old[-1]},
+        {"spot": "DEEPREVUSDT", "swap": "DEEPREVUSDT", "first_begin_time": t_old[0], "last_begin_time": t_old[-1]},
+        {"spot": None, "swap": "MATCHCHGUSDT", "first_begin_time": t_old[0], "last_begin_time": t_old[-1]},
+    ])
+    gen_batch_data_incremental(h_inc, rt_old, "swap", match_r1, syms, "batch1")
+    pre_inc.save_ready("market_pivot_swap", rt_old)
+
+    # Round 2:
+    # - NORMUSDT: pure 1-bar append, passed via resample_tail_hints (must NOT call res_inc.read_candle!)
+    # - DEEPREVUSDT: deep historical revision at bar 5 (no tail hint -> reads disk & falls back to full frame)
+    # - MATCHCHGUSDT: now matched with spot across entire history!
+    rev_df = raw_frames["DEEPREVUSDT"].copy()
+    rev_df.loc[5, "close"] += 12.34
+    res_inc.set_candle("NORMUSDT", rt_new, raw_frames["NORMUSDT"].copy())
+    res_inc.set_candle("DEEPREVUSDT", rt_new, rev_df.copy())
+    res_inc.set_candle("MATCHCHGUSDT", rt_new, raw_frames["MATCHCHGUSDT"].copy())
+
+    match_r2 = pd.DataFrame([
+        {"spot": sym, "swap": sym, "first_begin_time": times[0], "last_begin_time": times[-1]}
+        for sym in syms
+    ])
+
+    orig_read = res_inc.read_candle
+
+    def guarded_read(sym):
+        if sym == "NORMUSDT":
+            raise AssertionError("NORMUSDT should use in-memory resample_tail_hints without reading 1h pkl!")
+        return orig_read(sym)
+
+    monkeypatch.setattr(res_inc, "read_candle", guarded_read)
+    tail_hints = {
+        "NORMUSDT": (times[0], times[-1], raw_frames["NORMUSDT"].tail(12).reset_index(drop=True)),
+        "MATCHCHGUSDT": (times[0], times[-1], raw_frames["MATCHCHGUSDT"].tail(12).reset_index(drop=True)),
+    }
+    yp_inc = {}
+    gen_batch_data_incremental(
+        h_inc, rt_new, "swap", match_r2, syms, "batch1",
+        year_pivot_out=yp_inc, resample_tail_hints=tail_hints,
+    )
+
+    # Oracle env: run R1 -> R2 via baseline path (no resample_tail_hints, full validation)
+    h_ora, res_ora, pre_ora = _setup_env(tmp_path / "ora")
+    for sym in syms:
+        res_ora.set_candle(sym, rt_old, raw_frames[sym].iloc[:-1].reset_index(drop=True))
+    gen_batch_data(h_ora, rt_old, "swap", match_r1, syms, "batch1")
+    pre_ora.save_ready("market_pivot_swap", rt_old)
+    res_ora.set_candle("NORMUSDT", rt_new, raw_frames["NORMUSDT"].copy())
+    res_ora.set_candle("DEEPREVUSDT", rt_new, rev_df.copy())
+    res_ora.set_candle("MATCHCHGUSDT", rt_new, raw_frames["MATCHCHGUSDT"].copy())
+    # Force full path by disabling tail hints and comparing against gen_batch_data + FundingPublication
+    from core.strategy.funding_publication import FundingPublication
+    fpub_ora = FundingPublication(pre_ora.base_dir, rt_new)
+    gen_batch_data(h_ora, rt_new, "swap", match_r2, syms, "batch1", funding_publication=fpub_ora)
+
+    actual_batch = pre_inc.read_candle("swap_dict_batch1")
+    expected_batch = pre_ora.read_candle("swap_dict_batch1")
+    for sym in syms:
+        pd.testing.assert_frame_equal(actual_batch[sym], expected_batch[sym], check_exact=True)
+
+
+def test_multiprocess_8_batch_preprocess_matches_serial_oracle_exact(tmp_path, monkeypatch):
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor
+    import numpy as np
+    from core.handle import create_bmac_handle_from_config
+    from core.strategy import preprocess as pp
+    from core.strategy.arrow_publish import read_arrow_snapshot
+    from core.strategy.candle_origins import load_origins
+    from core.utils.file_system import init_dirs
+
+    factor_cfgs = {
+        "动量210401_双项异常隔离V2": [200],
+        "ILLQStdBbi45208": [24, 48],
+        "CciV3": [24],
+    }
+
+    def _build_side(sub: str, workers: int):
+        root = tmp_path / sub
+        cfg = SimpleNamespace(
+            storage_path=str(root / "data"),
+            base_interval="5m",
+            resample_interval="1h",
+            kline_count_1h_spot=200,
+            kline_count_1h_swap=200,
+            use_api={"kline": False, "coin_cap": False},
+            data_api_uuid="",
+            data_api_key="",
+            proxy=None,
+            coin_cap_use_proxy=False,
+            enabled_hour_offsets=("25m",),
+            funding_rate=True,
+            preprocess=True,
+            preprocess_num_batch=2,  # 6 symbols -> 3 batches per market = 6 batches total
+            preprocess_num_recent=3,
+            precompute_factor_configs=factor_cfgs,
+            precompute_factor_workers=workers,
+            publish_kline_num=40,
+            arrow_snapshot_keep=1,
+            arrow_demand_enabled=False,
+            arrow_demand_min_rows=None,
+            use_websocket=True,
+            rest_fetch_delay_seconds=3.0,
+            num_writers=2,
+            ws_wait_sec=14.0,
+            ws_flat_pkl_bars=240,
+            base_5m_retention_days=30,
+            min_history_start_date="2025-03-25",
+            history_trim_date=None,
+        )
+        h = create_bmac_handle_from_config(cfg)
+        init_dirs(h)
+        return h
+
+    times = pd.date_range("2026-11-10 00:25", periods=220, freq="h", tz="UTC")
+    rt1 = times[-2].to_pydatetime()
+    rt2 = times[-1].to_pydatetime()
+    syms = [f"SYM{i}USDT" for i in range(6)]
+    rng = np.random.default_rng(123)
+    frames_spot = {}
+    frames_swap = {}
+    for i, s in enumerate(syms):
+        for store, bias in ((frames_spot, 10.0), (frames_swap, 10.2)):
+            p = bias + i * 3.0 + np.cumsum(rng.standard_normal(len(times)) * 0.08)
+            p = np.maximum(p, 1.0)
+            store[s] = pd.DataFrame({
+                "candle_begin_time": times,
+                "open": p, "high": p * 1.01, "low": p * 0.99, "close": p * 1.002,
+                "volume": 500.0 + i * 10, "quote_volume": (500.0 + i * 10) * p,
+                "trade_num": pd.Series([20 + i] * len(times), dtype="int64"),
+                "taker_buy_base_asset_volume": 250.0,
+                "taker_buy_quote_asset_volume": 250.0 * p,
+            })
+
+    def _seed_round(h, upto_idx: int, rt):
+        begins_spot, begins_swap = {}, {}
+        tails_spot, tails_swap = {}, {}
+        for s in syms:
+            sp_df = frames_spot[s].iloc[:upto_idx].reset_index(drop=True)
+            sw_df = frames_swap[s].iloc[:upto_idx].reset_index(drop=True)
+            h.spot.resample_mgr_map["25m"].set_candle(s, rt, sp_df)
+            h.swap.resample_mgr_map["25m"].set_candle(s, rt, sw_df)
+            begins_spot[s] = (sp_df["candle_begin_time"].iloc[0], sp_df["candle_begin_time"].iloc[-1])
+            begins_swap[s] = (sw_df["candle_begin_time"].iloc[0], sw_df["candle_begin_time"].iloc[-1])
+            tails_spot[s] = (begins_spot[s][0], begins_spot[s][1], sp_df.tail(12).reset_index(drop=True))
+            tails_swap[s] = (begins_swap[s][0], begins_swap[s][1], sw_df.tail(12).reset_index(drop=True))
+            fdf = pd.DataFrame({
+                "candle_begin_time": sw_df["candle_begin_time"].dt.floor("h"),
+                "funding_rate": np.linspace(-0.0001, 0.0002, len(sw_df)),
+            }).drop_duplicates("candle_begin_time")
+            h.funding_mgr.set_candle(s, rt, fdf)
+        for tt in ("spot", "swap"):
+            h.exg_mgr.set_candle(f"exginfo_{tt}", rt, pd.DataFrame({"symbol": syms}))
+        h.exg_mgr.set_candle("spot_swap_matches", rt, pd.DataFrame({"spot": syms, "swap": syms}))
+        return begins_spot, begins_swap, {"spot": tails_spot, "swap": tails_swap}
+
+    monkeypatch.setattr(pp.bmac_config, "precompute_factor_configs", factor_cfgs)
+    monkeypatch.setattr(pp.bmac_config, "publish_kline_num", 40)
+
+    # 1) Serial in-process Oracle (R1 cold -> R2 incremental)
+    h_ora = _build_side("ora", workers=0)
+    monkeypatch.setattr(pp.bmac_config, "precompute_factor_workers", 0)
+    bs1, bw1, _ = _seed_round(h_ora, len(times) - 1, rt1)
+    pp.preprocess_offset_data(h_ora, rt1, bs1, bw1)
+    bs2, bw2, _ = _seed_round(h_ora, len(times), rt2)
+    pp.preprocess_offset_data(h_ora, rt2, bs2, bw2)
+
+    # 2) Multi-process 6-batch parallel pipeline with resample_tails (R1 cold -> R2 incremental)
+    h_par = _build_side("par", workers=2)
+    monkeypatch.setattr(pp.bmac_config, "precompute_factor_workers", 2)
+    with ProcessPoolExecutor(max_workers=2, mp_context=mp.get_context("spawn")) as pool:
+        ps1, pw1, tails1 = _seed_round(h_par, len(times) - 1, rt1)
+        pp.preprocess_offset_data(h_par, rt1, ps1, pw1, batch_executor=pool, resample_tails=tails1)
+        ps2, pw2, tails2 = _seed_round(h_par, len(times), rt2)
+        pp.preprocess_offset_data(h_par, rt2, ps2, pw2, batch_executor=pool, resample_tails=tails2)
+
+    epoch = int(rt2.timestamp())
+    ora_mgr = h_ora.preprocess_handle.preprocess_mgr_map["25m"]
+    par_mgr = h_par.preprocess_handle.preprocess_mgr_map["25m"]
+
+    for tt in ("spot", "swap"):
+        assert par_mgr.check_ready(f"{tt}_dict", rt2)
+        assert par_mgr.check_ready(f"market_pivot_{tt}", rt2)
+
+        # Contract #3: raw batch PKLs contain NO factor columns and match oracle bit-for-bit
+        for b_idx in (1, 2, 3):
+            b_par = par_mgr.read_candle(f"{tt}_dict_batch{b_idx}")
+            b_ora = ora_mgr.read_candle(f"{tt}_dict_batch{b_idx}")
+            for sym in b_ora:
+                assert not any(col.startswith(("ILLQ", "CciV3", "动量210401")) for col in b_par[sym].columns)
+                pd.testing.assert_frame_equal(b_par[sym], b_ora[sym], check_exact=True)
+
+        # Contract #2 & #4: Arrow 40-row snapshots match oracle bit-for-bit (including C factors)
+        arr_par = read_arrow_snapshot(par_mgr.base_dir / f"{tt}_dict_{epoch}.arrow")
+        arr_ora = read_arrow_snapshot(ora_mgr.base_dir / f"{tt}_dict_{epoch}.arrow")
+        assert list(arr_par.keys()) == list(arr_ora.keys()) == syms
+        for sym in syms:
+            pd.testing.assert_frame_equal(arr_par[sym], arr_ora[sym], check_exact=True)
+
+        # Contract #1: Yearly Pivots match oracle bit-for-bit
+        piv_par = par_mgr.read_candle(f"market_pivot_{tt}_2026")
+        piv_ora = ora_mgr.read_candle(f"market_pivot_{tt}_2026")
+        for pk in piv_ora:
+            pd.testing.assert_frame_equal(piv_par[pk], piv_ora[pk], check_exact=True)
+
+        # Contract #5: Candle origins match oracle
+        assert load_origins(par_mgr.base_dir, tt) == load_origins(ora_mgr.base_dir, tt)
+
+
+def test_multiprocess_batch_failure_withholds_ready_and_compute_pool_recovers_next_round(tmp_path, monkeypatch):
+    from core.handle import create_bmac_handle_from_config
+    from core.pipeline import update_cycle as uc
+    from core.pipeline.runtime_supervisor import RuntimeSupervisor
+    from core.storage.writer import Writer
+    from core.strategy import preprocess as pp
+    from core.strategy.arrow_publish import read_arrow_snapshot
+    from core.utils.file_system import init_dirs
+
+    cfg = SimpleNamespace(
+        storage_path=str(tmp_path / "data"),
+        base_interval="5m",
+        resample_interval="1h",
+        kline_count_1h_spot=200,
+        kline_count_1h_swap=200,
+        use_api={"kline": False, "coin_cap": False},
+        data_api_uuid="",
+        data_api_key="",
+        proxy=None,
+        coin_cap_use_proxy=False,
+        enabled_hour_offsets=("25m",),
+        funding_rate=False,
+        preprocess=True,
+        preprocess_num_batch=1,  # 2 symbols -> 2 batches per market
+        preprocess_num_recent=3,
+        precompute_factor_configs={"CciV3": [24]},
+        precompute_factor_workers=2,
+        publish_kline_num=30,
+        arrow_snapshot_keep=1,
+        arrow_demand_enabled=False,
+        arrow_demand_min_rows=None,
+        use_websocket=True,
+        rest_fetch_delay_seconds=3.0,
+        num_writers=2,
+        ws_wait_sec=0.2,
+        ws_flat_pkl_bars=240,
+        base_5m_retention_days=30,
+        min_history_start_date="2025-03-25",
+        history_trim_date=None,
+    )
+    h = create_bmac_handle_from_config(cfg)
+    init_dirs(h)
+    monkeypatch.setattr(pp.bmac_config, "precompute_factor_configs", {"CciV3": [24]})
+    monkeypatch.setattr(pp.bmac_config, "publish_kline_num", 30)
+
+    syms = ["AAAUSDT", "BBBUSDT"]
+    rt1 = datetime(2026, 11, 24, 5, 25, tzinfo=timezone.utc)
+    rt2 = datetime(2026, 11, 24, 6, 25, tzinfo=timezone.utc)
+
+    def _write_5m_round(rt):
+        t5 = pd.date_range(end=rt - timedelta(minutes=5), periods=180, freq="5min", tz="UTC")
+        writer = Writer(
+            base_candle_dirs={"spot": h.spot.base_candle_dir, "swap": h.swap.base_candle_dir},
+            flat_pkl_max_bars=240,
+        )
+        for tt in ("spot", "swap"):
+            h.exg_mgr.set_candle(f"exginfo_{tt}", rt, pd.DataFrame({"symbol": syms}))
+            for i, s in enumerate(syms):
+                df = pd.DataFrame({
+                    "candle_begin_time": t5,
+                    "open": 20.0 + i, "high": 21.0 + i, "low": 19.0 + i, "close": 20.5 + i,
+                    "volume": 50.0, "quote_volume": 1025.0,
+                    "trade_num": pd.Series([8] * len(t5), dtype="int64"),
+                    "taker_buy_base_asset_volume": 25.0, "taker_buy_quote_asset_volume": 512.5,
+                })
+                writer.process_one({"symbol": s, "trade_type": tt, "df": df, "source": "ws", "run_time": rt})
+        h.exg_mgr.set_candle("spot_swap_matches", rt, pd.DataFrame({"spot": syms, "swap": syms}))
+
+    sup = RuntimeSupervisor(h, alert_webhook_url="", num_writers=1, compute_workers=2)
+    pre_mgr = h.preprocess_handle.preprocess_mgr_map["25m"]
+    try:
+        # Round 1: inject an invalid factor name so batch worker raises ModuleNotFoundError in swap/spot
+        _write_5m_round(rt1)
+        monkeypatch.setattr(pp.bmac_config, "precompute_factor_configs", {"NonExistentFactorXYZ": [10]})
+        with pytest.raises(ModuleNotFoundError):
+            uc.run_ws_cycle(h, rt1, sup)
+
+        # Failed round MUST withhold .ready gates
+        assert not pre_mgr.check_ready("spot_dict", rt1)
+        assert not pre_mgr.check_ready("swap_dict", rt1)
+
+        # Simulate an abrupt worker crash (_broken=True) and verify supervisor recovers on Round 2
+        pool1 = sup.get_compute_pool()
+        pool1._broken = True
+
+        _write_5m_round(rt2)
+        monkeypatch.setattr(pp.bmac_config, "precompute_factor_configs", {"CciV3": [24]})
+        res2 = uc.run_ws_cycle(h, rt2, sup)
+        assert res2.is_binance_success is True
+        assert sup.get_compute_pool() is not pool1
+
+        epoch2 = int(rt2.timestamp())
+        for tt in ("spot", "swap"):
+            assert pre_mgr.check_ready(f"{tt}_dict", rt2)
+            assert pre_mgr.check_ready(f"market_pivot_{tt}", rt2)
+            snap = read_arrow_snapshot(pre_mgr.base_dir / f"{tt}_dict_{epoch2}.arrow")
+            assert list(snap.keys()) == syms
+            assert "CciV3_24" in snap["AAAUSDT"].columns
+    finally:
+        sup.shutdown(timeout_sec=5.0)
