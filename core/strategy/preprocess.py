@@ -12,6 +12,7 @@ from functools import partial
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 
 import config as bmac_config
@@ -622,37 +623,125 @@ def update_pivot_rows(pivot, market_dict, trade_type):
 
     Called even after a failed publication already saved its raw batch. The source
     rows, not the latest batch diff, are authoritative for retrying a partial write.
+    Vectorized 2D NumPy implementation: computes each symbol's time/column indexer
+    once and updates dense float64 matrices without per-symbol pandas .loc overhead.
     """
-    frames = {s: f.set_index('candle_begin_time') for s, f in market_dict.items() if not f.empty}
-    if not frames:
+    non_empty = [(s, f) for s, f in market_dict.items() if not f.empty]
+    if not non_empty:
         return False
-    index = pivot['open'].index
-    for frame in frames.values():
-        index = index.union(frame.index)
-    index = index.sort_values()
-    symbols = set(pivot['open'].columns) | set(frames)
-    columns = pivot['open'].columns
+
+    base_index = pivot['open'].index
+    base_i64 = base_index.asi8
+    n_base = len(base_i64)
+
+    cleaned_frames: list[tuple[str, pd.DataFrame, np.ndarray]] = []
+    extra_i64: list[np.ndarray] = []
+    for sym, frame in non_empty:
+        cbt = frame['candle_begin_time']
+        if cbt.duplicated().any():
+            frame = frame.drop_duplicates(subset='candle_begin_time', keep='last')
+            cbt = frame['candle_begin_time']
+        if cbt.dtype == base_index.dtype:
+            f_i64 = cbt.array.asi8
+        else:
+            f_i64 = pd.DatetimeIndex(cbt).tz_convert(base_index.tz).as_unit(base_index.unit).asi8
+        cleaned_frames.append((sym, frame, f_i64))
+
+        n_f = len(f_i64)
+        if n_base > 0 and n_f > 0 and f_i64[0] >= base_i64[0]:
+            p0 = int(np.searchsorted(base_i64, f_i64[0]))
+            if p0 < n_base:
+                overlap = min(n_f, n_base - p0)
+                if np.array_equal(base_i64[p0:p0 + overlap], f_i64[:overlap]):
+                    if overlap < n_f:
+                        extra_i64.append(f_i64[overlap:])
+                    continue
+        extra_i64.append(f_i64)
+
+    if extra_i64:
+        extra_unique = np.unique(np.concatenate(extra_i64))
+        extra_dt = pd.DatetimeIndex(
+            pd.to_datetime(extra_unique, unit=base_index.unit, utc=(base_index.tz is not None)),
+            name=base_index.name,
+        )
+        if base_index.tz is not None and str(extra_dt.tz) != str(base_index.tz):
+            extra_dt = extra_dt.tz_convert(base_index.tz)
+        index = base_index.union(extra_dt).sort_values()
+        idx_i64 = index.asi8
+    else:
+        sample_dt = pd.DatetimeIndex(cleaned_frames[0][1]['candle_begin_time'])
+        index = base_index.union(sample_dt).sort_values()
+        idx_i64 = index.asi8
+
+    old_cols = pivot['open'].columns
+    symbols = set(old_cols) | {s for s, _, _ in cleaned_frames}
+    columns = old_cols
     if set(columns) != symbols:
         columns = pd.CategoricalIndex(sorted(symbols), name='symbol')
+
+    col_map = {sym: pos for pos, sym in enumerate(columns)}
+    n_idx = len(idx_i64)
+    n_cols = len(columns)
+
+    placements: list[tuple[int, slice | np.ndarray, pd.DataFrame]] = []
+    for sym, frame, f_i64 in cleaned_frames:
+        n_f = len(f_i64)
+        p0 = int(np.searchsorted(idx_i64, f_i64[0]))
+        if p0 + n_f <= n_idx and idx_i64[p0 + n_f - 1] == f_i64[-1] and (
+            n_f <= 2 or np.array_equal(idx_i64[p0:p0 + n_f], f_i64)
+        ):
+            row_sel: slice | np.ndarray = slice(p0, p0 + n_f)
+        else:
+            row_sel = np.searchsorted(idx_i64, f_i64)
+        placements.append((col_map[sym], row_sel, frame))
+
     fields = {'open': 'open', 'close': 'close', 'vwap1m': 'avg_price_1m'}
     if trade_type == 'swap':
         fields['funding_rate'] = 'funding_fee'
+
     changed = False
     for key, column in fields.items():
         table = pivot[key]
-        if not table.index.equals(index) or not table.columns.equals(columns):
-            table = table.reindex(index=index, columns=columns)
-            pivot[key] = table
+        same_index = table.index.equals(index)
+        same_cols = table.columns.equals(columns)
+        need_reindex = not (same_index and same_cols)
+
+        if not need_reindex:
+            mat = np.array(table.to_numpy(dtype=np.float64, copy=False), dtype=np.float64, copy=True)
+        else:
+            mat = np.full((n_idx, n_cols), np.nan, dtype=np.float64)
+            if not table.empty:
+                t_vals = table.to_numpy(dtype=np.float64, copy=False)
+                t_i64 = table.index.asi8
+                if len(t_i64) <= n_idx and np.array_equal(idx_i64[:len(t_i64)], t_i64):
+                    old_r: slice | np.ndarray = slice(0, len(t_i64))
+                else:
+                    old_r = np.searchsorted(idx_i64, t_i64)
+                if same_cols:
+                    mat[old_r, :] = t_vals
+                else:
+                    old_c = np.fromiter((col_map[c] for c in table.columns), dtype=np.intp, count=len(table.columns))
+                    mat[np.ix_(np.arange(len(t_i64)) if isinstance(old_r, slice) else old_r, old_c)] = t_vals
             changed = True
-        for symbol, frame in frames.items():
-            values = frame[column]
-            current = table.loc[frame.index, symbol]
-            different = ~(current.eq(values) | (current.isna() & values.isna()))
-            if different.any():
-                table.loc[values.index[different], symbol] = values[different].to_numpy()
-                changed = True
+
+        field_changed = need_reindex
+        for col_pos, row_sel, frame in placements:
+            vals = frame[column].to_numpy(dtype=np.float64, copy=False)
+            cur = mat[row_sel, col_pos]
+            if not np.array_equal(cur, vals, equal_nan=True):
+                mat[row_sel, col_pos] = vals
+                field_changed = True
+
         if key == 'funding_rate':
-            table.fillna(0, inplace=True)
+            nan_mask = np.isnan(mat)
+            if nan_mask.any():
+                mat[nan_mask] = 0.0
+                field_changed = True
+
+        if field_changed:
+            pivot[key] = pd.DataFrame(mat, index=index, columns=columns)
+            changed = True
+
     return changed
 
 

@@ -469,3 +469,150 @@ def test_supervisor_persistent_compute_pool_reused_and_resample_returns_tail_bar
     finally:
         sup.shutdown()
     assert sup._compute_pool is None
+
+
+# ============================================================================
+# Task 3: NumPy 2D Vectorized update_pivot_rows vs Independent .loc Oracle
+# ============================================================================
+
+
+def _oracle_update_pivot_rows(pivot: dict, market_dict: dict, trade_type: str) -> bool:
+    """Independent reference oracle preserving the original per-symbol .loc semantics."""
+    frames = {s: f.set_index("candle_begin_time") for s, f in market_dict.items() if not f.empty}
+    if not frames:
+        return False
+    index = pivot["open"].index
+    for frame in frames.values():
+        index = index.union(frame.index)
+    index = index.sort_values()
+    symbols = set(pivot["open"].columns) | set(frames)
+    columns = pivot["open"].columns
+    if set(columns) != symbols:
+        columns = pd.CategoricalIndex(sorted(symbols), name="symbol")
+    fields = {"open": "open", "close": "close", "vwap1m": "avg_price_1m"}
+    if trade_type == "swap":
+        fields["funding_rate"] = "funding_fee"
+    changed = False
+    for key, column in fields.items():
+        table = pivot[key]
+        if not table.index.equals(index) or not table.columns.equals(columns):
+            table = table.reindex(index=index, columns=columns)
+            pivot[key] = table
+            changed = True
+        for symbol, frame in frames.items():
+            values = frame[column]
+            current = table.loc[frame.index, symbol]
+            different = ~(current.eq(values) | (current.isna() & values.isna()))
+            if different.any():
+                table.loc[values.index[different], symbol] = values[different].to_numpy()
+                changed = True
+        if key == "funding_rate":
+            table.fillna(0, inplace=True)
+    return changed
+
+
+def test_update_pivot_rows_matches_independent_loc_oracle_across_edge_cases():
+    import numpy as np
+    from core.strategy.preprocess import make_market_pivot, update_pivot_rows
+
+    base_idx = pd.date_range("2026-06-01 00:25", periods=20, freq="h", tz="UTC")
+
+    def _mk_df(sym: str, ts_idx, offset: float, with_nan: bool = False):
+        n = len(ts_idx)
+        op = np.linspace(10.0 + offset, 20.0 + offset, n)
+        cl = op + 0.5
+        if with_nan and n >= 3:
+            op[1] = np.nan
+        return pd.DataFrame({
+            "candle_begin_time": ts_idx,
+            "symbol": sym,
+            "open": op,
+            "close": cl,
+            "avg_price_1m": op + 0.1,
+            "funding_fee": np.linspace(-0.0005, 0.0005, n),
+        })
+
+    # Seed initial pivot with BTCUSDT, DELISTEDUSDT, GAPUSDT
+    seed_dict = {
+        "BTCUSDT": _mk_df("BTCUSDT", base_idx[:15], 1.0),
+        "DELISTEDUSDT": _mk_df("DELISTEDUSDT", base_idx[:15], 2.0),
+        "GAPUSDT": _mk_df("GAPUSDT", base_idx[:15], 3.0),
+    }
+    piv_oracle = make_market_pivot(seed_dict, "swap")
+    piv_fast = {k: v.copy(deep=True) for k, v in piv_oracle.items()}
+
+    # Incoming update:
+    # - BTCUSDT contiguous 0..20 with revised row 10 and NaN at row 1
+    # - GAPUSDT non-contiguous subset [2, 5, 14, 18, 19]
+    # - NEWLISTUSDT newly listed at rows 16..20 (triggers CategoricalIndex expansion)
+    # - DELISTEDUSDT omitted (must retain columns & old values, NaN on new price rows, 0.0 on funding_rate)
+    # - EMPTYUSDT empty DataFrame (must be ignored)
+    upd_dict = {
+        "BTCUSDT": _mk_df("BTCUSDT", base_idx, 1.0, with_nan=True),
+        "GAPUSDT": _mk_df("GAPUSDT", base_idx[[2, 5, 14, 18, 19]], 3.5),
+        "NEWLISTUSDT": _mk_df("NEWLISTUSDT", base_idx[16:], 9.0),
+        "EMPTYUSDT": _mk_df("EMPTYUSDT", base_idx[:0], 0.0),
+    }
+    upd_dict["BTCUSDT"].loc[10, "close"] = 999.25
+
+    chg_oracle = _oracle_update_pivot_rows(piv_oracle, upd_dict, "swap")
+    chg_fast = update_pivot_rows(piv_fast, upd_dict, "swap")
+    assert chg_fast is chg_oracle is True
+
+    for key in piv_oracle:
+        pd.testing.assert_frame_equal(piv_fast[key], piv_oracle[key], check_exact=True)
+        assert piv_fast[key].columns.equals(piv_oracle[key].columns)
+        assert piv_fast[key].index.equals(piv_oracle[key].index)
+
+    # Idempotent second call with identical data -> changed must be False!
+    chg_oracle_2 = _oracle_update_pivot_rows(piv_oracle, upd_dict, "swap")
+    chg_fast_2 = update_pivot_rows(piv_fast, upd_dict, "swap")
+    assert chg_fast_2 is chg_oracle_2 is False
+    for key in piv_oracle:
+        pd.testing.assert_frame_equal(piv_fast[key], piv_oracle[key], check_exact=True)
+
+
+def test_update_pivot_rows_vectorized_is_at_least_5x_faster_than_loc_oracle():
+    import numpy as np
+    from core.strategy.preprocess import make_market_pivot, update_pivot_rows
+
+    n_syms = 250
+    n_old = 1500
+    n_total = 1502
+    idx_all = pd.date_range("2026-01-01 00:25", periods=n_total, freq="h", tz="UTC")
+    rng = np.random.default_rng(42)
+
+    seed = {}
+    incoming = {}
+    for i in range(n_syms):
+        sym = f"SYM{i:03d}USDT"
+        base_p = 10.0 + i * 0.1 + rng.standard_normal(n_total) * 0.01
+        df_all = pd.DataFrame({
+            "candle_begin_time": idx_all,
+            "symbol": sym,
+            "open": base_p,
+            "close": base_p + 0.05,
+            "avg_price_1m": base_p + 0.02,
+            "funding_fee": rng.standard_normal(n_total) * 1e-4,
+        })
+        seed[sym] = df_all.iloc[:n_old].reset_index(drop=True)
+        incoming[sym] = df_all
+
+    piv_base = make_market_pivot(seed, "swap")
+    piv_o = {k: v.copy(deep=True) for k, v in piv_base.items()}
+    piv_f = {k: v.copy(deep=True) for k, v in piv_base.items()}
+
+    t0 = time.perf_counter()
+    chg_o = _oracle_update_pivot_rows(piv_o, incoming, "swap")
+    t_oracle = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    chg_f = update_pivot_rows(piv_f, incoming, "swap")
+    t_fast = time.perf_counter() - t0
+
+    assert chg_f == chg_o
+    for key in piv_o:
+        pd.testing.assert_frame_equal(piv_f[key], piv_o[key], check_exact=True)
+    assert t_fast * 5.0 < t_oracle, (
+        f"Expected >=5x speedup over .loc oracle, got fast={t_fast:.4f}s vs oracle={t_oracle:.4f}s"
+    )
