@@ -297,6 +297,9 @@ def _barrier_and_resample(
     trade_type: str,
     run_time: datetime,
     rest_state: Optional[dict] = None,
+    *,
+    compute_pool=None,
+    return_tail_bars: int = 0,
 ) -> dict:
     """等该 trade_type 的 symbol 落盘（ready-file barrier），通过即从 base 存储 resample。"""
     bh = _get_market_handle(handle, trade_type)
@@ -338,8 +341,19 @@ def _barrier_and_resample(
             f"不计入 timeout: {sorted(no_data)[:10]}"
         )
     begin_ts: dict = {}
+    tail_dfs: dict = {}
     if success:
-        begin_ts = update_resample_from_base(handle, trade_type, run_time)
+        sig = inspect.signature(update_resample_from_base)
+        if "executor" in sig.parameters and "return_tail_bars" in sig.parameters:
+            res_out = update_resample_from_base(
+                handle, trade_type, run_time, executor=compute_pool, return_tail_bars=return_tail_bars
+            )
+            if return_tail_bars > 0:
+                begin_ts, tail_dfs = res_out
+            else:
+                begin_ts = res_out
+        else:
+            begin_ts = update_resample_from_base(handle, trade_type, run_time)
     return {
         "trade_type": trade_type,
         "success": len(success),
@@ -347,6 +361,7 @@ def _barrier_and_resample(
         "skipped": sorted(skipped - no_data),
         "has_gaps": has_gaps,
         "begin_ts": begin_ts,
+        "tail_dfs": tail_dfs,
     }
 
 
@@ -373,6 +388,11 @@ def run_ws_cycle(handle: BmacHandle, run_time: datetime, supervisor: RuntimeSupe
     result = CycleResult()
     router = supervisor.router
 
+    compute_pool = (
+        supervisor.get_compute_pool()
+        if callable(getattr(supervisor, "get_compute_pool", None))
+        else None
+    )
     rest_thread, rest_state = _start_rest_fallback(handle, run_time, router)
     try:
         with ProcessPoolExecutor(max_workers=2, mp_context=_SPAWN_CTX) as aux_exe:
@@ -387,10 +407,20 @@ def run_ws_cycle(handle: BmacHandle, run_time: datetime, supervisor: RuntimeSupe
                 else None
             )
 
+            br_sig = inspect.signature(_barrier_and_resample)
+            supports_pool_kw = "compute_pool" in br_sig.parameters
             with ThreadPoolExecutor(max_workers=2) as br_exe:
                 results = list(
                     br_exe.map(
-                        lambda tt: _barrier_and_resample(handle, tt, run_time, rest_state),
+                        lambda tt: (
+                            _barrier_and_resample(
+                                handle, tt, run_time, rest_state,
+                                compute_pool=compute_pool,
+                                return_tail_bars=12 if compute_pool is not None else 0,
+                            )
+                            if supports_pool_kw
+                            else _barrier_and_resample(handle, tt, run_time, rest_state)
+                        ),
                         ("spot", "swap"),
                     )
                 )

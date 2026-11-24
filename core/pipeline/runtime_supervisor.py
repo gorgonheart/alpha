@@ -13,10 +13,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import multiprocessing as mp
+import os
 import signal
 import sys
+import threading
 import time
 import zlib
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from datetime import timedelta
 from logging.handlers import TimedRotatingFileHandler
@@ -188,6 +191,7 @@ class RuntimeSupervisor:
     SHUTDOWN_JOIN_TIMEOUT_SEC = 30.0
     # 默认 writer 进程数：4 核并行落盘消除 1000+ symbol barrier 队列积压（可通过 handle.num_writers 覆盖）
     NUM_WRITERS = 4
+    COMPUTE_WORKERS = 4
     WS_RESTART_COOLDOWN_SEC = 60.0
     WS_RESTART_JOIN_TIMEOUT_SEC = 10.0
 
@@ -197,6 +201,7 @@ class RuntimeSupervisor:
         alert_webhook_url: str,
         protocol: Optional[ExchangeProtocol] = None,
         num_writers: Optional[int] = None,
+        compute_workers: Optional[int] = None,
     ):
         ctx = mp.get_context("spawn")
         self.ctx = ctx
@@ -208,6 +213,15 @@ class RuntimeSupervisor:
         if resolved_writers < 1:
             raise ValueError(f"num_writers must be >= 1, got {resolved_writers}")
         self.num_writers: int = resolved_writers
+
+        if compute_workers is not None:
+            resolved_compute = int(compute_workers)
+        else:
+            cfg_workers = int(getattr(handle, "precompute_factor_workers", 0) or 0)
+            resolved_compute = cfg_workers if cfg_workers > 0 else min(self.COMPUTE_WORKERS, max(1, os.cpu_count() or 4))
+        self.compute_workers: int = max(1, resolved_compute)
+        self._compute_pool: Optional[ProcessPoolExecutor] = None
+        self._compute_pool_lock = threading.Lock()
 
         self.queues: list = [
             ctx.Queue(maxsize=self.QUEUE_MAXSIZE)
@@ -401,9 +415,33 @@ class RuntimeSupervisor:
                     except Exception:  # pragma: no cover - defensive
                         pass
 
+    def get_compute_pool(self) -> ProcessPoolExecutor:
+        """获取跨周期常驻的多进程计算池（用于 Resample 与 Preprocess Batch 并行，消除每轮 spawn 冷启动）。"""
+        with self._compute_pool_lock:
+            broken = getattr(self._compute_pool, "_broken", False) if self._compute_pool is not None else False
+            if self._compute_pool is not None and broken:
+                try:
+                    self._compute_pool.shutdown(wait=False, cancel_futures=True)
+                except Exception:
+                    pass
+                self._compute_pool = None
+            if self._compute_pool is None:
+                self._compute_pool = ProcessPoolExecutor(
+                    max_workers=self.compute_workers,
+                    mp_context=self.ctx,
+                )
+            return self._compute_pool
+
     def shutdown(self, timeout_sec: Optional[float] = None) -> None:
-        """通知 WS 退出，再按现有等待预算关闭 writer。"""
+        """通知 WS 退出，关闭常驻计算池与 writer。"""
         timeout = timeout_sec if timeout_sec is not None else self.SHUTDOWN_JOIN_TIMEOUT_SEC
+        with self._compute_pool_lock:
+            if self._compute_pool is not None:
+                try:
+                    self._compute_pool.shutdown(wait=True, cancel_futures=True)
+                except Exception:
+                    pass
+                self._compute_pool = None
         ws_all = [p for procs in self.ws_procs.values() for p in procs]
         for stop_event in self._ws_stop_events.values():
             stop_event.set()

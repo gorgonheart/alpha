@@ -277,3 +277,195 @@ def test_rest_fallback_uses_small_limit_for_single_bar_miss_and_full_limit_for_g
     thread.join(timeout=5.0)
     assert state["done"].is_set()
     assert captured_params == {"SINGLEMISS": 5, "GAPSYM": 99}
+
+
+# ============================================================================
+# Task 2: flat_pkl-First Resample, Persistent Compute Pool, In-Memory Tail Bars
+# ============================================================================
+
+
+def test_resample_prefers_flat_pkl_without_reading_tsmanager_when_window_sufficient(tmp_path, monkeypatch):
+    from core.pipeline import resample as res_mod
+    from core.storage.candle_manager import CandleFileManager
+    from core.storage.ts_manager import TSManager
+    from core.storage.writer import Writer
+
+    run_time = datetime(2026, 11, 24, 2, 25, tzinfo=timezone.utc)
+    times = pd.date_range(end=run_time - timedelta(minutes=5), periods=300, freq="5min", tz="UTC")
+    df_5m = pd.DataFrame({
+        "candle_begin_time": times,
+        "open": [100.0 + i * 0.1 for i in range(300)],
+        "high": [101.0 + i * 0.1 for i in range(300)],
+        "low": [99.0 + i * 0.1 for i in range(300)],
+        "close": [100.5 + i * 0.1 for i in range(300)],
+        "volume": [10.0 + i for i in range(300)],
+        "quote_volume": [1000.0 + i * 10 for i in range(300)],
+        "trade_num": pd.Series([5 + i for i in range(300)], dtype="int64"),
+        "taker_buy_base_asset_volume": [5.0 + i * 0.5 for i in range(300)],
+        "taker_buy_quote_asset_volume": [500.0 + i * 5 for i in range(300)],
+    })
+
+    # Oracle dir: TSManager only (no flat_pkl)
+    oracle_5m = tmp_path / "oracle_5m"
+    oracle_1h = tmp_path / "oracle_1h" / "25m"
+    oracle_1h.mkdir(parents=True)
+    TSManager(oracle_5m / "BTCUSDT").update(df_5m.copy())
+    oracle_mgr = CandleFileManager(oracle_1h, "pickle")
+
+    # Fast dir: populated by Writer (flat_pkl=240 bars + TSManager=300 bars)
+    fast_5m = tmp_path / "fast_5m"
+    fast_1h = tmp_path / "fast_1h" / "25m"
+    fast_5m.mkdir(parents=True)
+    fast_1h.mkdir(parents=True)
+    Writer(base_candle_dirs={"spot": fast_5m}, flat_pkl_max_bars=240).process_one({
+        "symbol": "BTCUSDT", "trade_type": "spot", "df": df_5m.copy(),
+        "source": "ws", "run_time": run_time,
+    })
+    fast_mgr = CandleFileManager(fast_1h, "pickle")
+
+    exg_dir = tmp_path / "exg"
+    exg_dir.mkdir()
+    exg_mgr = CandleFileManager(exg_dir, "pickle")
+    exg_mgr.save_data_file("exginfo_spot", pd.DataFrame({"symbol": ["BTCUSDT"]}))
+
+    def make_h(bdir, rmgr):
+        return SimpleNamespace(
+            base_interval="5m", resample_interval="1h", enabled_hour_offsets=("25m",),
+            history_trim_ts=lambda: None, effective_kline_count_1h=lambda tt, rt: 15000,
+            exg_mgr=exg_mgr,
+            get_market_handle=lambda _: SimpleNamespace(
+                base_candle_dir=bdir, resample_mgr_map={"25m": rmgr}, once_update_candles=99,
+            ),
+        )
+
+    # Run oracle first (uses TSManager)
+    res_mod.update_resample_from_base(make_h(oracle_5m, oracle_mgr), "spot", run_time)
+    expected_1h = oracle_mgr.read_candle("BTCUSDT")
+
+    # Now forbid TSManager.read_partition during fast path (240 >= 99 closed bars in flat_pkl!)
+    monkeypatch.setattr(
+        TSManager, "read_partition",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("TSManager partition read should be skipped!")),
+    )
+    res_mod.update_resample_from_base(make_h(fast_5m, fast_mgr), "spot", run_time)
+    actual_1h = fast_mgr.read_candle("BTCUSDT")
+
+    pd.testing.assert_frame_equal(actual_1h, expected_1h, check_exact=True)
+
+
+def test_resample_falls_back_to_tsmanager_when_flat_pkl_shorter_than_window(tmp_path):
+    from core.pipeline import resample as res_mod
+    from core.storage.candle_manager import CandleFileManager
+    from core.storage.ts_manager import TSManager
+
+    run_time = datetime(2026, 11, 24, 3, 25, tzinfo=timezone.utc)
+    times_150 = pd.date_range(end=run_time - timedelta(minutes=5), periods=150, freq="5min", tz="UTC")
+    df_150 = pd.DataFrame({
+        "candle_begin_time": times_150,
+        "open": 50.0, "high": 51.0, "low": 49.0, "close": 50.5,
+        "volume": 10.0, "quote_volume": 505.0,
+        "trade_num": pd.Series([3] * 150, dtype="int64"),
+        "taker_buy_base_asset_volume": 5.0, "taker_buy_quote_asset_volume": 252.5,
+    })
+
+    base_dir = tmp_path / "swap_5m"
+    res_dir = tmp_path / "swap_1h" / "25m"
+    base_dir.mkdir(parents=True)
+    res_dir.mkdir(parents=True)
+
+    # TSManager has 150 bars (covers full 99-bar window), while flat_pkl only has last 24 bars (< 99)
+    TSManager(base_dir / "SOLUSDT").update(df_150.copy())
+    df_150.tail(24).reset_index(drop=True).to_pickle(base_dir / "SOLUSDT.pkl")
+
+    exg_dir = tmp_path / "exg"
+    exg_dir.mkdir()
+    exg_mgr = CandleFileManager(exg_dir, "pickle")
+    exg_mgr.save_data_file("exginfo_swap", pd.DataFrame({"symbol": ["SOLUSDT"]}))
+    res_mgr = CandleFileManager(res_dir, "pickle")
+
+    h = SimpleNamespace(
+        base_interval="5m", resample_interval="1h", enabled_hour_offsets=("25m",),
+        history_trim_ts=lambda: None, effective_kline_count_1h=lambda tt, rt: 15000,
+        exg_mgr=exg_mgr,
+        get_market_handle=lambda _: SimpleNamespace(
+            base_candle_dir=base_dir, resample_mgr_map={"25m": res_mgr}, once_update_candles=99,
+        ),
+    )
+    res_mod.update_resample_from_base(h, "swap", run_time)
+    out = res_mgr.read_candle("SOLUSDT")
+    # With 99 5m bars (8h15m) dropping truncated head, must produce >= 7 full 1h bars (not just 1 bar from 24-bar flat_pkl!)
+    assert len(out) >= 7
+
+
+def test_supervisor_persistent_compute_pool_reused_and_resample_returns_tail_bars(tmp_path):
+    from core.handle import create_bmac_handle_from_config
+    from core.pipeline.resample import update_resample_from_base
+    from core.pipeline.runtime_supervisor import RuntimeSupervisor
+    from core.storage.writer import Writer
+    from core.utils.file_system import init_dirs
+
+    cfg = SimpleNamespace(
+        storage_path=str(tmp_path / "data"),
+        base_interval="5m",
+        resample_interval="1h",
+        kline_count_1h_spot=500,
+        kline_count_1h_swap=500,
+        use_api={"kline": False, "coin_cap": False},
+        data_api_uuid="",
+        data_api_key="",
+        proxy=None,
+        coin_cap_use_proxy=False,
+        enabled_hour_offsets=("25m",),
+        funding_rate=False,
+        preprocess=True,
+        preprocess_num_batch=10,
+        preprocess_num_recent=3,
+        precompute_factor_configs={},
+        precompute_factor_workers=2,
+        arrow_demand_enabled=False,
+        arrow_demand_min_rows=None,
+        use_websocket=True,
+        rest_fetch_delay_seconds=3.0,
+        num_writers=2,
+        ws_wait_sec=14.0,
+        ws_flat_pkl_bars=240,
+        base_5m_retention_days=30,
+        min_history_start_date="2025-03-25",
+        history_trim_date=None,
+    )
+    h = create_bmac_handle_from_config(cfg)
+    init_dirs(h)
+    run_time = datetime(2026, 11, 24, 4, 25, tzinfo=timezone.utc)
+    syms = [f"COIN{i}USDT" for i in range(6)]
+    h.exg_mgr.save_data_file("exginfo_swap", pd.DataFrame({"symbol": syms}))
+
+    times = pd.date_range(end=run_time - timedelta(minutes=5), periods=180, freq="5min", tz="UTC")
+    writer = Writer(base_candle_dirs={"swap": h.swap.base_candle_dir}, flat_pkl_max_bars=240)
+    for i, sym in enumerate(syms):
+        df = pd.DataFrame({
+            "candle_begin_time": times,
+            "open": 10.0 + i, "high": 11.0 + i, "low": 9.0 + i, "close": 10.5 + i,
+            "volume": 100.0, "quote_volume": 1050.0,
+            "trade_num": pd.Series([10] * 180, dtype="int64"),
+            "taker_buy_base_asset_volume": 50.0, "taker_buy_quote_asset_volume": 525.0,
+        })
+        writer.process_one({"symbol": sym, "trade_type": "swap", "df": df, "source": "ws", "run_time": run_time})
+
+    sup = RuntimeSupervisor(handle=h, alert_webhook_url="", compute_workers=2)
+    try:
+        pool1 = sup.get_compute_pool()
+        pool2 = sup.get_compute_pool()
+        assert pool1 is pool2
+
+        begin_ts, tail_dfs = update_resample_from_base(
+            h, "swap", run_time, executor=pool1, return_tail_bars=5
+        )
+        assert set(begin_ts) == set(syms)
+        assert set(tail_dfs) == set(syms)
+        res_mgr = h.swap.resample_mgr_map["25m"]
+        for sym in syms:
+            disk_df = res_mgr.read_candle(sym).tail(5).reset_index(drop=True)
+            pd.testing.assert_frame_equal(tail_dfs[sym].reset_index(drop=True), disk_df, check_exact=True)
+    finally:
+        sup.shutdown()
+    assert sup._compute_pool is None

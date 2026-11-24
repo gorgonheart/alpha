@@ -146,6 +146,13 @@ def filter_gaps(df: pd.DataFrame, gap_hours_thres=48, price_change_thres=0.1):
     return df
 
 
+def _extract_tail_frame(df_total: pd.DataFrame, return_tail_bars: int) -> pd.DataFrame:
+    tail = df_total.tail(return_tail_bars)
+    if isinstance(tail.index, pd.DatetimeIndex):
+        return tail.reset_index(drop=True)
+    return tail.reset_index(drop=True)
+
+
 def update_resample_candle(
     candle_mgr: CandleFileManager,
     symbol: str,
@@ -155,6 +162,7 @@ def update_resample_candle(
     resample_delta: timedelta,
     *,
     min_ts: Optional[pd.Timestamp] = None,
+    return_tail_bars: int = 0,
 ):
     # 读取历史数据，不存在为 None
     df_old = None
@@ -170,7 +178,7 @@ def update_resample_candle(
 
     if df_total.empty:
         candle_mgr.set_candle(symbol, run_time, df_total)
-        return None, None
+        return (None, None, None) if return_tail_bars > 0 else (None, None)
 
     # 去重
     df_total.drop_duplicates(subset='candle_begin_time', keep='last', inplace=True)
@@ -194,11 +202,13 @@ def update_resample_candle(
     candle_mgr.set_candle(symbol, run_time, df_total)
 
     if df_total.empty:
-        return None, None
+        return (None, None, None) if return_tail_bars > 0 else (None, None)
 
     first_begin_time = df_total['candle_begin_time'].iloc[0]
     last_begin_time = df_total['candle_begin_time'].iloc[-1]
 
+    if return_tail_bars > 0:
+        return first_begin_time, last_begin_time, _extract_tail_frame(df_total, return_tail_bars)
     return first_begin_time, last_begin_time
 
 
@@ -211,34 +221,40 @@ def update_resample_candle_incremental(
     resample_delta: timedelta,
     *,
     min_ts: Optional[pd.Timestamp] = None,
+    return_tail_bars: int = 0,
 ):
     if not candle_mgr.has_symbol(symbol):
         return update_resample_candle(
-            candle_mgr, symbol, df_resample, num_candles, run_time, resample_delta, min_ts=min_ts
+            candle_mgr, symbol, df_resample, num_candles, run_time, resample_delta,
+            min_ts=min_ts, return_tail_bars=return_tail_bars,
         )
 
     df_old = candle_mgr.read_candle(symbol)
     if df_old.empty or df_resample.empty:
         return update_resample_candle(
-            candle_mgr, symbol, df_resample, num_candles, run_time, resample_delta, min_ts=min_ts
+            candle_mgr, symbol, df_resample, num_candles, run_time, resample_delta,
+            min_ts=min_ts, return_tail_bars=return_tail_bars,
         )
 
     old_times = df_old['candle_begin_time']
     new_times = df_resample['candle_begin_time']
     if old_times.duplicated().any() or new_times.duplicated().any():
         return update_resample_candle(
-            candle_mgr, symbol, df_resample, num_candles, run_time, resample_delta, min_ts=min_ts
+            candle_mgr, symbol, df_resample, num_candles, run_time, resample_delta,
+            min_ts=min_ts, return_tail_bars=return_tail_bars,
         )
     if not old_times.is_monotonic_increasing or not new_times.is_monotonic_increasing:
         return update_resample_candle(
-            candle_mgr, symbol, df_resample, num_candles, run_time, resample_delta, min_ts=min_ts
+            candle_mgr, symbol, df_resample, num_candles, run_time, resample_delta,
+            min_ts=min_ts, return_tail_bars=return_tail_bars,
         )
 
     last_old_time = old_times.iloc[-1]
     first_new_time = new_times.iloc[0]
     if first_new_time <= last_old_time:
         return update_resample_candle(
-            candle_mgr, symbol, df_resample, num_candles, run_time, resample_delta, min_ts=min_ts
+            candle_mgr, symbol, df_resample, num_candles, run_time, resample_delta,
+            min_ts=min_ts, return_tail_bars=return_tail_bars,
         )
 
     time_gap = new_times.diff().fillna(first_new_time - last_old_time)
@@ -248,7 +264,8 @@ def update_resample_candle_incremental(
     has_large_gap = ((time_gap > timedelta(hours=48)) & (price_change.abs() > 0.1)).any()
     if has_large_gap:
         return update_resample_candle(
-            candle_mgr, symbol, df_resample, num_candles, run_time, resample_delta, min_ts=min_ts
+            candle_mgr, symbol, df_resample, num_candles, run_time, resample_delta,
+            min_ts=min_ts, return_tail_bars=return_tail_bars,
         )
 
     if (time_gap == resample_delta).all():
@@ -256,9 +273,11 @@ def update_resample_candle_incremental(
         df_total = _apply_history_bound(df_total, num_candles, min_ts)
         candle_mgr.set_candle(symbol, run_time, df_total)
         if df_total.empty:
-            return None, None
+            return (None, None, None) if return_tail_bars > 0 else (None, None)
         first_begin_time = df_total['candle_begin_time'].iloc[0]
         last_begin_time = df_total['candle_begin_time'].iloc[-1]
+        if return_tail_bars > 0:
+            return first_begin_time, last_begin_time, _extract_tail_frame(df_total, return_tail_bars)
         return first_begin_time, last_begin_time
 
     prefix = df_old.iloc[:-1].copy(deep=True)
@@ -277,10 +296,12 @@ def update_resample_candle_incremental(
 
     candle_mgr.set_candle(symbol, run_time, df_total)
     if df_total.empty:
-        return None, None
+        return (None, None, None) if return_tail_bars > 0 else (None, None)
 
     first_begin_time = df_total['candle_begin_time'].iloc[0]
     last_begin_time = df_total['candle_begin_time'].iloc[-1]
+    if return_tail_bars > 0:
+        return first_begin_time, last_begin_time, _extract_tail_frame(df_total, return_tail_bars)
     return first_begin_time, last_begin_time
 
 
@@ -429,6 +450,42 @@ def _read_base_tail(
     return df
 
 
+def _load_closed_base_window(
+    base_dir: Path,
+    symbol: str,
+    run_time: datetime,
+    once_update_candles: int,
+) -> pd.DataFrame | None:
+    """优先从轻量 flat_pkl（默认 240 根）读取闭合 5m 窗口；当 flat_pkl 缺失或闭合根数不足
+    once_update_candles 时回退读取 TSManager 月分区，并取闭合历史更完整者。
+    """
+    df_flat_closed: pd.DataFrame | None = None
+    flat_pkl = base_dir / f'{symbol}.pkl'
+    if flat_pkl.exists():
+        try:
+            df_flat = pd.read_pickle(flat_pkl)
+        except Exception:
+            df_flat = None
+        if df_flat is not None and not df_flat.empty and 'candle_begin_time' in df_flat.columns:
+            df_flat = df_flat[df_flat['candle_begin_time'] < run_time]
+            if '_source' in df_flat.columns:
+                df_flat = df_flat.drop(columns=['_source'])
+            if not df_flat.empty:
+                df_flat_closed = df_flat
+                if len(df_flat_closed) >= once_update_candles:
+                    return df_flat_closed
+
+    df_part = _read_base_tail(base_dir, symbol, run_time, once_update_candles)
+    if df_part is not None and not df_part.empty:
+        df_part = df_part[df_part['candle_begin_time'] < run_time]
+        if '_source' in df_part.columns:
+            df_part = df_part.drop(columns=['_source'])
+        if not df_part.empty:
+            if df_flat_closed is None or len(df_part) >= len(df_flat_closed):
+                return df_part
+    return df_flat_closed
+
+
 def _resample_one_symbol(
     symbol: str,
     base_dir: Path,
@@ -440,24 +497,13 @@ def _resample_one_symbol(
     once_update_candles: int,
     resample_delta: timedelta,
     min_ts: Optional[pd.Timestamp] = None,
+    return_tail_bars: int = 0,
 ):
-    """对单个 symbol：读 base 闭合 K（分区 tail 优先，flat pkl 回退）→ resample → 增量合并写入 resample_mgr。"""
-    df_base = _read_base_tail(base_dir, symbol, run_time, once_update_candles)
+    """对单个 symbol：读 base 闭合 K（轻量 flat_pkl 优先，月分区回退）→ resample → 增量合并写入 resample_mgr。"""
+    df_base = _load_closed_base_window(base_dir, symbol, run_time, once_update_candles)
     if df_base is None or df_base.empty:
-        flat_pkl = base_dir / f'{symbol}.pkl'
-        if not flat_pkl.exists():
-            return None
-        try:
-            df_base = pd.read_pickle(flat_pkl)
-        except Exception:
-            return None
-        if df_base is None or df_base.empty:
-            return None
+        return None
 
-    # 只取闭合 K（candle_begin_time < run_time），丢弃 writer 内部 _source 列
-    df_base = df_base[df_base['candle_begin_time'] < run_time]
-    if '_source' in df_base.columns:
-        df_base = df_base.drop(columns=['_source'])
     window_truncated = len(df_base) >= once_update_candles
     df_base = df_base.tail(once_update_candles)
     if df_base.empty:
@@ -467,7 +513,7 @@ def _resample_one_symbol(
     if window_truncated and resample_mgr.has_symbol(symbol) and len(df_resample) > 1:
         df_resample = df_resample.iloc[1:]
 
-    first_begin_time, last_begin_time = update_resample_candle_incremental(
+    res = update_resample_candle_incremental(
         resample_mgr,
         symbol,
         df_resample,
@@ -475,9 +521,10 @@ def _resample_one_symbol(
         run_time,
         resample_delta,
         min_ts=min_ts,
+        return_tail_bars=return_tail_bars,
     )
-    if first_begin_time is not None and last_begin_time is not None:
-        return first_begin_time, last_begin_time
+    if res[0] is not None and res[1] is not None:
+        return res
     return None
 
 
@@ -486,7 +533,8 @@ def _resample_chunk_worker(
     trade_type: str,
     run_time: datetime,
     symbols_chunk: list[str],
-) -> dict:
+    return_tail_bars: int = 0,
+):
     resample_interval = handle.resample_interval
     resample_delta = convert_interval_to_timedelta(resample_interval)
     offset_str = get_offset_from_runtime(run_time, resample_interval)
@@ -498,7 +546,8 @@ def _resample_chunk_worker(
     theoretical_start = run_time - kline_count_1h * resample_delta
     min_ts = _resolve_history_trim_ts(handle)
 
-    out: dict = {}
+    out_begins: dict = {}
+    out_tails: dict = {}
     for symbol in symbols_chunk:
         res = _resample_one_symbol(
             symbol,
@@ -511,34 +560,83 @@ def _resample_chunk_worker(
             once_update_candles,
             resample_delta,
             min_ts=min_ts,
+            return_tail_bars=return_tail_bars,
         )
         if res is not None:
-            out[symbol] = res
-    return out
+            out_begins[symbol] = (res[0], res[1])
+            if return_tail_bars > 0 and len(res) > 2 and res[2] is not None:
+                out_tails[symbol] = res[2]
+    if return_tail_bars > 0:
+        return out_begins, out_tails
+    return out_begins
 
 
-def update_resample_from_base(handle: BmacHandle, trade_type: str, run_time: datetime) -> dict:
-    """从 base 5m 存储增量重采样到 resample_1h（ThreadPoolExecutor(max_workers=2)，零 spawn 子进程）。"""
+def update_resample_from_base(
+    handle: BmacHandle,
+    trade_type: str,
+    run_time: datetime,
+    *,
+    executor=None,
+    return_tail_bars: int = 0,
+):
+    """从 base 5m 存储增量重采样到 resample_1h。
+
+    - 传入共享常驻 `executor`（如 RuntimeSupervisor.get_compute_pool()）时，切分为多块跨进程池真并行；
+    - 未传 `executor` 时回退进程内 `ThreadPoolExecutor(max_workers=2)` 保证单测零额外进程开销；
+    - `return_tail_bars > 0` 时返回 `(symbol_begin_time, symbol_tail_dfs)` 供下游免读盘增量拼接。
+    """
     df_exginfo = handle.exg_mgr.read_candle(f'exginfo_{trade_type}')
     symbols_trading = df_exginfo['symbol'].to_list() if df_exginfo is not None else []
     if not symbols_trading:
         logger.ok(f'Resample {trade_type} 从 base 存储完成: 0/0 symbol, 当前时间={now_time_str()}')
-        return {}
+        return ({}, {}) if return_tail_bars > 0 else {}
 
-    n_workers = 2
-    if len(symbols_trading) <= 1:
-        symbol_begin_time = _resample_chunk_worker(handle, trade_type, run_time, symbols_trading)
+    symbol_begin_time: dict = {}
+    symbol_tail_dfs: dict = {}
+
+    if executor is not None:
+        pool_workers = int(getattr(executor, '_max_workers', 4) or 4)
+        n_chunks = min(len(symbols_trading), max(4, pool_workers * 2))
+        chunk_size = (len(symbols_trading) + n_chunks - 1) // n_chunks
+        chunks = [symbols_trading[i:i + chunk_size] for i in range(0, len(symbols_trading), chunk_size)]
+        futures = [
+            executor.submit(_resample_chunk_worker, handle, trade_type, run_time, ch, return_tail_bars)
+            for ch in chunks
+        ]
+        for fut in futures:
+            chunk_res = fut.result()
+            if return_tail_bars > 0:
+                symbol_begin_time.update(chunk_res[0])
+                symbol_tail_dfs.update(chunk_res[1])
+            else:
+                symbol_begin_time.update(chunk_res)
+    elif len(symbols_trading) <= 1:
+        chunk_res = _resample_chunk_worker(handle, trade_type, run_time, symbols_trading, return_tail_bars)
+        if return_tail_bars > 0:
+            symbol_begin_time, symbol_tail_dfs = chunk_res
+        else:
+            symbol_begin_time = chunk_res
     else:
+        n_workers = 2
         chunk_size = (len(symbols_trading) + n_workers - 1) // n_workers
         chunks = [symbols_trading[i:i + chunk_size] for i in range(0, len(symbols_trading), chunk_size)]
-        symbol_begin_time = {}
         with ThreadPoolExecutor(max_workers=n_workers) as exe:
-            futures = [exe.submit(_resample_chunk_worker, handle, trade_type, run_time, ch) for ch in chunks]
+            futures = [
+                exe.submit(_resample_chunk_worker, handle, trade_type, run_time, ch, return_tail_bars)
+                for ch in chunks
+            ]
             for fut in futures:
-                symbol_begin_time.update(fut.result())
+                chunk_res = fut.result()
+                if return_tail_bars > 0:
+                    symbol_begin_time.update(chunk_res[0])
+                    symbol_tail_dfs.update(chunk_res[1])
+                else:
+                    symbol_begin_time.update(chunk_res)
 
     logger.ok(
         f'Resample {trade_type} 从 base 存储完成: {len(symbol_begin_time)}/{len(symbols_trading)} symbol, '
         f'当前时间={now_time_str()}'
     )
+    if return_tail_bars > 0:
+        return symbol_begin_time, symbol_tail_dfs
     return symbol_begin_time
