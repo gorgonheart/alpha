@@ -41,29 +41,24 @@ def _kline_to_writer_item(
     kline: dict,
     base_delta: timedelta,
 ) -> dict:
-    """把归一化的缓存结构 K 线 dict 转成 writer 队列 item。
-
-    关键约定：writer 期望长形式的 binance 列名（taker_buy_base_asset_volume, ...），
-    而缓存用短形式。本函数是唯一的转换边界。
-    """
+    """把归一化的缓存结构 K 线 dict 转成轻量 writer 队列 item（不在 WS 进程内构造 DataFrame）。"""
     begin_dt = pd.Timestamp(kline["begin_time_ms"], unit="ms", tz="UTC")
-    df = pd.DataFrame([{
-        "candle_begin_time": begin_dt,
-        "open": float(kline["open"]),
-        "high": float(kline["high"]),
-        "low": float(kline["low"]),
-        "close": float(kline["close"]),
-        "volume": float(kline["volume"]),
-        "quote_volume": float(kline["quote_volume"]),
-        "trade_num": int(kline["trade_num"]),
-        "taker_buy_base_asset_volume": float(kline["taker_buy_base"]),
-        "taker_buy_quote_asset_volume": float(kline["taker_buy_quote"]),
-    }])
     run_time = (begin_dt + pd.Timedelta(base_delta)).to_pydatetime()
     return {
         "symbol": symbol,
         "trade_type": trade_type,
-        "df": df,
+        "kline": {
+            "begin_time_ms": int(kline["begin_time_ms"]),
+            "open": float(kline["open"]),
+            "high": float(kline["high"]),
+            "low": float(kline["low"]),
+            "close": float(kline["close"]),
+            "volume": float(kline["volume"]),
+            "quote_volume": float(kline["quote_volume"]),
+            "trade_num": int(kline["trade_num"]),
+            "taker_buy_base": float(kline["taker_buy_base"]),
+            "taker_buy_quote": float(kline["taker_buy_quote"]),
+        },
         "source": "ws",
         "run_time": run_time,
     }

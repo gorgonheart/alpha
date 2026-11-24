@@ -196,7 +196,8 @@ class BmacHandle:
     # 2B WebSocket 与存储保留配置
     use_websocket: bool = True
     rest_fetch_delay_seconds: float = 3.0
-    num_writers: int = 2
+    num_writers: int = 4
+    ws_wait_sec: float = 14.0
     ws_flat_pkl_bars: int = 240
     base_5m_retention_days: int = 30
     min_history_start_date: Optional[str] = '2025-03-25'
@@ -556,7 +557,8 @@ def _build_handle(cfg, *, exchange, spot_handle, swap_handle, data_root, fetch_f
         arrow_demand_min_rows=getattr(cfg, 'arrow_demand_min_rows', None),
         use_websocket=getattr(cfg, 'use_websocket', True),
         rest_fetch_delay_seconds=getattr(cfg, 'rest_fetch_delay_seconds', 3.0),
-        num_writers=getattr(cfg, 'num_writers', 2),
+        num_writers=getattr(cfg, 'num_writers', 4),
+        ws_wait_sec=float(getattr(cfg, 'ws_wait_sec', 14.0)),
         ws_flat_pkl_bars=getattr(cfg, 'ws_flat_pkl_bars', 240),
         base_5m_retention_days=getattr(cfg, 'base_5m_retention_days', 30),
         min_history_start_date=getattr(cfg, 'min_history_start_date', '2025-03-25'),

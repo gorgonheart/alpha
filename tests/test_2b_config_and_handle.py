@@ -20,7 +20,8 @@ def _load_cfg(tmp_path, monkeypatch, overrides):
 def test_2b_config_defaults_and_single_kline_count_fallback(tmp_path, monkeypatch):
     cfg = _load_cfg(tmp_path, monkeypatch, {"kline_count_1h": 14400})
     assert cfg.use_websocket is True
-    assert cfg.num_writers == 2
+    assert cfg.num_writers == 4
+    assert cfg.ws_wait_sec == 14.0
     assert cfg.ws_flat_pkl_bars == 240
     assert cfg.base_5m_retention_days == 30
     assert cfg.min_history_start_date == "2025-03-25"

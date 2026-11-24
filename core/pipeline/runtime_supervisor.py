@@ -186,8 +186,8 @@ class RuntimeSupervisor:
     GRACE_WAIT_SEC = 2
     WS_QUEUE_PUT_TIMEOUT_SEC = 5.0
     SHUTDOWN_JOIN_TIMEOUT_SEC = 30.0
-    # 瘦身后的默认 writer 进程数（可通过 handle.num_writers 或 num_writers 参数覆盖）
-    NUM_WRITERS = 2
+    # 默认 writer 进程数：4 核并行落盘消除 1000+ symbol barrier 队列积压（可通过 handle.num_writers 覆盖）
+    NUM_WRITERS = 4
     WS_RESTART_COOLDOWN_SEC = 60.0
     WS_RESTART_JOIN_TIMEOUT_SEC = 10.0
 

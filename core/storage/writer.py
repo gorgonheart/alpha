@@ -36,6 +36,23 @@ _SOURCE_PRIO: Dict[str, int] = {
 _UNSET = object()
 
 
+def _kline_dict_to_df(kline: dict) -> pd.DataFrame:
+    """将轻量 WS kline 字典转换为标准 UTC ns 单行 DataFrame。"""
+    begin_dt = pd.Timestamp(int(kline["begin_time_ms"]), unit="ms", tz="UTC").as_unit("ns")
+    return pd.DataFrame({
+        "candle_begin_time": pd.Series([begin_dt], dtype="datetime64[ns, UTC]"),
+        "open": [float(kline["open"])],
+        "high": [float(kline["high"])],
+        "low": [float(kline["low"])],
+        "close": [float(kline["close"])],
+        "volume": [float(kline["volume"])],
+        "quote_volume": [float(kline["quote_volume"])],
+        "trade_num": pd.Series([int(kline["trade_num"])], dtype="int64"),
+        "taker_buy_base_asset_volume": [float(kline["taker_buy_base"])],
+        "taker_buy_quote_asset_volume": [float(kline["taker_buy_quote"])],
+    })
+
+
 def _normalize_candle_begin_time(df: pd.DataFrame) -> pd.DataFrame:
     """将 df["candle_begin_time"] 统一转为 tz-aware UTC 的 datetime64[ns, UTC]。
 
@@ -85,10 +102,11 @@ class _WriterObservability:
 
         if not self._first_logged_per_source.get(src):
             self._first_logged_per_source[src] = True
+            n_rows = len(item["df"]) if "df" in item and item["df"] is not None else (1 if "kline" in item else 0)
             log.info(
                 "writer: FIRST handled source=%s tt=%s sym=%s rows=%d -> "
                 "pkl=%s (exists=%s size=%d) ready=%s (exists=%s)",
-                src, tt, sym, len(item.get("df", [])),
+                src, tt, sym, n_rows,
                 pkl_path, pkl_exists, pkl_size,
                 ready_path_str, ready_exists,
             )
@@ -238,25 +256,29 @@ class Writer:
 
     def handle_item(self, item: dict) -> None:
         symbol = item["symbol"]
-        df_new = item["df"]
         source = item["source"]
         run_time: datetime = item["run_time"]
         trade_type = item.get("trade_type")
 
         if source not in _SOURCE_PRIO:
             raise ValueError(f"unknown source {source!r}, expected one of {list(_SOURCE_PRIO)}")
-        if df_new is None or df_new.empty:
+        if "df" in item:
+            df_new = item["df"]
+            if df_new is None or df_new.empty:
+                return
+            # writer 入口类型断言：candle_begin_time 必须是 tz-aware 的 UTC。
+            cbt = df_new["candle_begin_time"]
+            cbt_tz = getattr(cbt.dt, "tz", None) if hasattr(cbt, "dt") else None
+            if cbt_tz is None:
+                raise TypeError(
+                    f"writer.handle_item: candle_begin_time must be tz-aware (UTC); "
+                    f"got tz-naive series for symbol={symbol!r}"
+                )
+            df_new = _normalize_candle_begin_time(df_new)
+        elif "kline" in item and item["kline"] is not None:
+            df_new = _kline_dict_to_df(item["kline"])
+        else:
             return
-
-        # writer 入口类型断言：candle_begin_time 必须是 tz-aware 的 UTC。
-        cbt = df_new["candle_begin_time"]
-        cbt_tz = getattr(cbt.dt, "tz", None) if hasattr(cbt, "dt") else None
-        if cbt_tz is None:
-            raise TypeError(
-                f"writer.handle_item: candle_begin_time must be tz-aware (UTC); "
-                f"got tz-naive series for symbol={symbol!r}"
-            )
-        df_new = _normalize_candle_begin_time(df_new)
 
         base_dir, cfm = self._route(trade_type, symbol)
         verbose = self._obs.log_handle_start(symbol, trade_type, source, df_new)
@@ -271,13 +293,6 @@ class Writer:
         self._write_pkl(base_dir, symbol, df_flat)
         self._obs.log_after_pkl(verbose, symbol, self._pkl_path(base_dir, symbol))
 
-        # 从未裁剪的 df_merged 中提取本批次触碰的行写入月度分区，避免 >flat_pkl_max_bars 的批量补齐被截断
-        df_for_partition = df_merged[
-            df_merged["candle_begin_time"].isin(df_new["candle_begin_time"])
-        ]
-        self._update_tsmanager(base_dir, symbol, df_for_partition, run_time)
-        self._obs.log_after_ts(verbose, symbol, base_dir / symbol)
-
         try:
             self._update_gap_marker(cfm, trade_type, symbol, df_merged, df_new, source)
         except Exception:
@@ -286,10 +301,25 @@ class Writer:
                 trade_type, symbol, source,
             )
 
+        # flat_pkl 与 .gap 均已原子落盘后立即发布 .ready / .ws_ready 放行下游屏障，
+        # 不让 ~7000 行月度分区的读写阻塞重采样启动。
         cfm.save_ready(symbol, run_time)
         if source == "ws":
             cfm.save_ws_ready(symbol, run_time)
         self._obs.log_after_ready(verbose, symbol, trade_type, source, cfm, run_time)
+
+        # 从未裁剪的 df_merged 中提取本批次触碰的行写入月度分区，避免 >flat_pkl_max_bars 的批量补齐被截断
+        df_for_partition = df_merged[
+            df_merged["candle_begin_time"].isin(df_new["candle_begin_time"])
+        ]
+        try:
+            self._update_tsmanager(base_dir, symbol, df_for_partition, run_time)
+            self._obs.log_after_ts(verbose, symbol, base_dir / symbol)
+        except Exception:
+            log.exception(
+                "writer: 更新月度分区失败 sym=%s/%s source=%s（flat_pkl 与 ready 已落盘）",
+                trade_type, symbol, source,
+            )
 
     def _route(self, trade_type: Optional[str], symbol: str) -> tuple[Path, CandleFileManager]:
         if self._single_dir_mode:

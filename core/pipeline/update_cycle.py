@@ -36,14 +36,22 @@ from core.strategy.preprocess import preprocess_offset_data
 from core.utils.log_kit import logger
 from core.utils.time import convert_interval_to_timedelta, next_run_time, now_time_str, sleep_until_run_time
 
-# REST 兜底 grace 窗口：复用 barrier 的 ws_wait_sec（同一个值）。
-_REST_FALLBACK_GRACE_SEC: float = (
-    inspect.signature(wait_for_ready_barrier).parameters["ws_wait_sec"].default
-)
+# 默认 WS 等待/REST 兜底 grace 秒数（显式配置，避免 inspect 默认值隐式耦合；可通过 handle.ws_wait_sec 覆盖）
+_DEFAULT_WS_WAIT_SEC: float = 14.0
+_REST_FALLBACK_GRACE_SEC: float = _DEFAULT_WS_WAIT_SEC
+# 无 .gap 历史断档、仅本轮单根 WS 漏推时的轻量 REST 拉取根数
+_SINGLE_BAR_FALLBACK_LIMIT: int = 5
 # barrier 软截止：超过它仍在等，说明在等 REST 兜底落盘（见 wait_for_ready_barrier）
 _BARRIER_SOFT_TIMEOUT_SEC: float = (
     inspect.signature(wait_for_ready_barrier).parameters["timeout_sec"].default
 )
+
+
+def _resolve_ws_wait_sec(handle: BmacHandle) -> float:
+    val = getattr(handle, "ws_wait_sec", None)
+    if val is None or isinstance(val, bool):
+        return _REST_FALLBACK_GRACE_SEC
+    return float(val)
 
 # WS 周期主进程是多线程的（mp.Queue feeder + REST 兜底线程）。
 # 在多线程进程里 fork 子进程会继承到无主锁导致死锁，故 preprocess / 辅助任务
@@ -87,11 +95,10 @@ def _universe(handle: BmacHandle, trade_type: str) -> list:
     return df_exg["symbol"].to_list() if df_exg is not None else []
 
 
-def _compute_missed_symbols(handle: BmacHandle, trade_type: str, run_time: datetime) -> set:
-    """计算该 trade_type 下需要 REST 兜底的 symbol。
-
-    missed = {sym ∈ universe | 无本轮 .ws_ready  或  有 .gap 断档标记}。
-    """
+def _compute_missed_and_gaps(
+    handle: BmacHandle, trade_type: str, run_time: datetime
+) -> tuple[set[str], set[str]]:
+    """计算该 trade_type 下需要 REST 兜底的 symbol 集合及其中带历史 .gap 标记的子集。"""
     universe = _universe(handle, trade_type)
     bh = _get_market_handle(handle, trade_type)
     reader = CandleFileManager(bh.base_candle_dir, "pickle")
@@ -106,10 +113,20 @@ def _compute_missed_symbols(handle: BmacHandle, trade_type: str, run_time: datet
             f"REST 兜底[{trade_type}]: {len(gap_symbols)} 个 symbol 有历史断档标记, "
             f"sample={sorted(gap_symbols)[:10]}"
         )
-    return {
+    missed = {
         sym for sym in universe
         if sym in gap_symbols or not reader.check_ws_ready(sym, run_time)
     }
+    return missed, gap_symbols
+
+
+def _compute_missed_symbols(handle: BmacHandle, trade_type: str, run_time: datetime) -> set:
+    """计算该 trade_type 下需要 REST 兜底的 symbol。
+
+    missed = {sym ∈ universe | 无本轮 .ws_ready  或  有 .gap 断档标记}。
+    """
+    missed, _ = _compute_missed_and_gaps(handle, trade_type, run_time)
+    return missed
 
 
 def _submit_rest_dfs(
@@ -179,24 +196,47 @@ def run_startup_catchup(handle: BmacHandle, router, settle_sec: float = 5.0) -> 
 
 
 def _rest_fallback_worker(handle: BmacHandle, run_time: datetime, router, state: dict) -> None:
-    """后台线程：先睡 grace 让 WS 落盘，再 REST 只补 WS 漏掉的 symbol，以 source='rest' 投递 router。"""
+    """后台线程：先等待可取消 grace 窗口让 WS 落盘；若屏障已 100% 放行则立即退出，否则按缺口分级 REST 兜底。"""
     missed_per_type = {"spot": set(), "swap": set()}
     try:
-        time.sleep(_REST_FALLBACK_GRACE_SEC)
-        missed_per_type = {
-            "spot": _compute_missed_symbols(handle, "spot", run_time),
-            "swap": _compute_missed_symbols(handle, "swap", run_time),
-        }
-        n_spot, n_swap = len(missed_per_type["spot"]), len(missed_per_type["swap"])
+        grace_sec = _resolve_ws_wait_sec(handle)
+        cancel_ev = state.get("cancel")
+        if cancel_ev is not None:
+            if cancel_ev.wait(timeout=grace_sec):
+                state["ok"] = True
+                return
+        else:
+            time.sleep(grace_sec)
+
+        spot_missed, spot_gaps = _compute_missed_and_gaps(handle, "spot", run_time)
+        swap_missed, swap_gaps = _compute_missed_and_gaps(handle, "swap", run_time)
+        missed_per_type = {"spot": spot_missed, "swap": swap_missed}
+        n_spot, n_swap = len(spot_missed), len(swap_missed)
         logger.info(
-            f"REST 兜底 grace({_REST_FALLBACK_GRACE_SEC}s) 后计算 missed: "
+            f"REST 兜底 grace({grace_sec}s) 后计算 missed: "
             f"spot={n_spot} swap={n_swap} (run_time={run_time})"
         )
         if n_spot == 0 and n_swap == 0:
             state["ok"] = True
             return
+
+        symbol_limits: dict[str, dict[str, int]] = {"spot": {}, "swap": {}}
+        for tt, m_set, g_set in (("spot", spot_missed, spot_gaps), ("swap", swap_missed, swap_gaps)):
+            mh = _get_market_handle(handle, tt)
+            full_lim = int(getattr(mh, "once_update_candles", 99))
+            single_lim = min(_SINGLE_BAR_FALLBACK_LIMIT, full_lim)
+            symbol_limits[tt] = {
+                sym: (full_lim if sym in g_set else single_lim)
+                for sym in m_set
+            }
+
+        call_kwargs = {}
+        sig = inspect.signature(fetch_update_binance_candles)
+        if "symbol_limits" in sig.parameters:
+            call_kwargs["symbol_limits"] = symbol_limits
+
         result = fetch_update_binance_candles(
-            handle, run_time, resample_inline=False, symbols_subset=missed_per_type
+            handle, run_time, resample_inline=False, symbols_subset=missed_per_type, **call_kwargs
         )
         if result is not None:
             spot_dfs, swap_dfs, _, _ = result
@@ -229,6 +269,7 @@ def _start_rest_fallback(handle: BmacHandle, run_time: datetime, router):
     state:
       - ok: 是否成功
       - done: 线程结束事件
+      - cancel: 屏障 100% 完成且无断档时提前取消等待事件
       - submitted: {trade_type: 已投递 REST 数据的 symbol}
       - confirmed_empty: {trade_type: REST 明确返回空 DataFrame 的 symbol}
       - failed: {trade_type: REST 拉取失败的 symbol}
@@ -236,6 +277,7 @@ def _start_rest_fallback(handle: BmacHandle, run_time: datetime, router):
     state = {
         "ok": False,
         "done": threading.Event(),
+        "cancel": threading.Event(),
         "submitted": {"spot": set(), "swap": set()},
         "confirmed_empty": {"spot": set(), "swap": set()},
         "failed": {"spot": set(), "swap": set()},
@@ -267,10 +309,12 @@ def _barrier_and_resample(
     rest_confirmed_empty = (
         rest_state.get("confirmed_empty", {}).get(trade_type) if rest_done is not None else None
     )
+    ws_wait_sec = _resolve_ws_wait_sec(handle)
     success, skipped = wait_for_ready_barrier(
         symbols=symbols,
         base_5m_dir=bh.base_candle_dir,
         run_time=run_time,
+        ws_wait_sec=ws_wait_sec,
         rest_done=rest_done,
         rest_submitted=rest_submitted,
         rest_confirmed_empty=rest_confirmed_empty,
@@ -286,6 +330,7 @@ def _barrier_and_resample(
             f"（多等 {elapsed - _BARRIER_SOFT_TIMEOUT_SEC:.1f}s）"
         )
     reader = CandleFileReader(Path(bh.base_candle_dir), "pickle")
+    has_gaps = bool(reader.list_gap_marker_symbols())
     no_data = {s for s in skipped if not reader.has_symbol(s)}
     if no_data:
         logger.info(
@@ -300,6 +345,7 @@ def _barrier_and_resample(
         "success": len(success),
         "total": len(symbols),
         "skipped": sorted(skipped - no_data),
+        "has_gaps": has_gaps,
         "begin_ts": begin_ts,
     }
 
@@ -348,6 +394,10 @@ def run_ws_cycle(handle: BmacHandle, run_time: datetime, supervisor: RuntimeSupe
                         ("spot", "swap"),
                     )
                 )
+
+            if rest_state and "cancel" in rest_state:
+                if all(r["success"] == r["total"] and not r.get("has_gaps", False) for r in results):
+                    rest_state["cancel"].set()
 
             for r in results:
                 if r["success"]:

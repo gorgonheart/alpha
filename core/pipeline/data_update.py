@@ -2,6 +2,7 @@ import asyncio
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
+from typing import Optional
 
 import pandas as pd
 
@@ -267,6 +268,7 @@ async def fetch_update_resample(
     run_time,
     resample_inline: bool = True,
     symbols_subset=None,
+    symbol_limits: Optional[dict[str, int]] = None,
 ):
     base_interval = handle.base_interval
     resample_interval = handle.resample_interval
@@ -284,11 +286,18 @@ async def fetch_update_resample(
         symbols_trading = [s for s in symbols_trading if s in symbols_subset]
 
     num_symbols = len(symbols_trading)
+    if num_symbols == 0:
+        return dict(), dict()
+
     name = exchange_display_name(getattr(handle, 'exchange', 'binance'))
     start_time = time.perf_counter()
     logger.info(f'开始更新{name} {trade_type} K 线, 交易对数量={num_symbols}, 当前时间={now_time_str()}')
 
-    params_list = [{'symbol': s, 'interval': base_interval, 'limit': once_update_candles} for s in symbols_trading]
+    limits_map = symbol_limits or {}
+    params_list = [
+        {'symbol': s, 'interval': base_interval, 'limit': int(limits_map.get(s, once_update_candles))}
+        for s in symbols_trading
+    ]
     base_klines_list = await fetcher.batch_get_candle(params_list)
 
     symbol_base_df = dict()
@@ -299,8 +308,10 @@ async def fetch_update_resample(
     bound_num_candles = None if hasattr(handle, 'history_trim_ts') else kline_count_1h
 
     for symbol, df_base in zip(symbols_trading, base_klines_list):
-        window_truncated = len(df_base) >= once_update_candles
-        df_base = df_base[df_base['candle_begin_time'] < run_time]
+        req_limit = int(limits_map.get(symbol, once_update_candles))
+        window_truncated = len(df_base) >= req_limit
+        if not df_base.empty and 'candle_begin_time' in df_base.columns:
+            df_base = df_base[df_base['candle_begin_time'] < run_time]
         symbol_base_df[symbol] = df_base
 
         if not resample_inline:
@@ -351,7 +362,11 @@ async def async_fetch_update_resample_candles(
     trade_type,
     resample_inline: bool = True,
     symbols_subset=None,
+    symbol_limits: Optional[dict[str, int]] = None,
 ):
+    if symbols_subset is not None and len(symbols_subset) == 0:
+        return dict(), dict()
+
     market_handle: MarketHandle = _get_market_handle(handle, trade_type)
 
     try:
@@ -365,6 +380,7 @@ async def async_fetch_update_resample_candles(
                 run_time,
                 resample_inline,
                 symbols_subset=symbols_subset,
+                symbol_limits=symbol_limits,
             )
     except Exception:
         logger.exception(f'{exchange_display_name(getattr(handle, "exchange", "binance"))} API 更新数据失败')
@@ -378,17 +394,26 @@ def fetch_update_binance_candles(
     run_time: datetime,
     resample_inline: bool = True,
     symbols_subset=None,
+    symbol_limits: Optional[dict[str, dict[str, int]]] = None,
 ):
     spot_subset = symbols_subset.get('spot') if symbols_subset is not None else None
     swap_subset = symbols_subset.get('swap') if symbols_subset is not None else None
+    spot_limits = symbol_limits.get('spot') if symbol_limits is not None else None
+    swap_limits = symbol_limits.get('swap') if symbol_limits is not None else None
     with ThreadPoolExecutor(max_workers=4) as exe:
         bn_spot = exe.submit(
             asyncio.run,
-            async_fetch_update_resample_candles(handle, run_time, 'spot', resample_inline, symbols_subset=spot_subset),
+            async_fetch_update_resample_candles(
+                handle, run_time, 'spot', resample_inline,
+                symbols_subset=spot_subset, symbol_limits=spot_limits,
+            ),
         )
         bn_swap = exe.submit(
             asyncio.run,
-            async_fetch_update_resample_candles(handle, run_time, 'swap', resample_inline, symbols_subset=swap_subset),
+            async_fetch_update_resample_candles(
+                handle, run_time, 'swap', resample_inline,
+                symbols_subset=swap_subset, symbol_limits=swap_limits,
+            ),
         )
         spot_result = bn_spot.result()
         swap_result = bn_swap.result()

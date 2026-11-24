@@ -101,7 +101,8 @@ arrow_demand_min_rows = None
 rest_fetch_delay_seconds = 3.0
 # v2.0.2 / 2B WebSocket 与存储保留配置
 use_websocket = True
-num_writers = 2
+num_writers = 4
+ws_wait_sec = 14.0
 ws_flat_pkl_bars = 240
 base_5m_retention_days = 30
 min_history_start_date = '2025-03-25'
@@ -120,7 +121,7 @@ if json_file_config.exists():
             'enabled_hour_offsets', 'funding_rate', 'precompute_factor_configs', 'precompute_factor_workers',
             'coin_cap_use_proxy', 'proxy', 'storage_path', 'publish_kline_num', 'arrow_snapshot_keep',
             'arrow_demand_enabled', 'arrow_demand_min_rows', 'rest_fetch_delay_seconds',
-            'use_websocket', 'num_writers', 'ws_flat_pkl_bars', 'base_5m_retention_days',
+            'use_websocket', 'num_writers', 'ws_wait_sec', 'ws_flat_pkl_bars', 'base_5m_retention_days',
             'min_history_start_date', 'history_trim_date',
         )
 
@@ -156,5 +157,7 @@ if type(base_5m_retention_days) is not int or base_5m_retention_days < 7:
 
 if isinstance(rest_fetch_delay_seconds, bool) or not isinstance(rest_fetch_delay_seconds, (int, float)) or rest_fetch_delay_seconds < 0:
     raise ValueError('rest_fetch_delay_seconds must be a non-negative number')
+if isinstance(ws_wait_sec, bool) or not isinstance(ws_wait_sec, (int, float)) or ws_wait_sec < 0:
+    raise ValueError('ws_wait_sec must be a non-negative number')
 if coin_cap_use_proxy and not proxy:
     raise ValueError('coin_cap_use_proxy requires a configured proxy')
