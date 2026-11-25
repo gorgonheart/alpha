@@ -671,3 +671,78 @@ def test_release_memory_releases_pyarrow_unused_pool(monkeypatch):
     assert called == [True]
 
 
+def test_writer_atomic_replace_retries_transient_permission_error(tmp_path, monkeypatch):
+    import os
+    from core.storage.writer import Writer
+
+    b5 = tmp_path / "spot_5m"
+    b5.mkdir()
+    w = Writer(base_candle_dirs={"spot": b5}, flat_pkl_max_bars=240)
+    df = pd.DataFrame({"candle_begin_time": pd.date_range("2026-11-25", periods=3, freq="5min", tz="UTC"), "close": [1.0, 2.0, 3.0]})
+
+    orig_replace = os.replace
+    attempts = []
+
+    def flaky_replace(src, dst):
+        attempts.append(1)
+        if len(attempts) <= 2:
+            raise PermissionError("simulated transient Windows reader lock")
+        return orig_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", flaky_replace)
+    w._write_pkl(b5, "BTCUSDT", df)
+    assert len(attempts) == 3
+    pd.testing.assert_frame_equal(pd.read_pickle(b5 / "BTCUSDT.pkl"), df, check_exact=True)
+
+
+def test_deferred_1h_on_demand_flush_when_anchor_revised(tmp_path):
+    from core.pipeline.resample import _record_resample_bounds
+    from core.storage.candle_manager import CandleFileManager
+    from core.strategy import preprocess as pp
+
+    times = pd.date_range("2026-11-20 00:25", periods=30, freq="h", tz="UTC")
+    rt1 = times[-2].to_pydatetime()
+    rt2 = times[-1].to_pydatetime()
+
+    res_mgr = CandleFileManager(tmp_path / "res" / "25m", "pickle")
+    pre_mgr = CandleFileManager(tmp_path / "pre" / "25m", "pickle")
+    res_mgr.base_dir.mkdir(parents=True)
+    pre_mgr.base_dir.mkdir(parents=True)
+
+    df_full = pd.DataFrame({
+        "candle_begin_time": times,
+        "open": 10.0, "high": 11.0, "low": 9.0, "close": 10.5,
+        "volume": 100.0, "quote_volume": 1050.0,
+        "trade_num": pd.Series([5] * len(times), dtype="int64"),
+        "taker_buy_base_asset_volume": 50.0, "taker_buy_quote_asset_volume": 525.0,
+    })
+    res_mgr.set_candle("REVUSDT", rt1, df_full.iloc[:-1].reset_index(drop=True))
+    _record_resample_bounds(res_mgr, "REVUSDT", times[0], times[-2])
+
+    h = SimpleNamespace(
+        resample_interval="1h",
+        fetch_funding_rate=False,
+        data_api=None,
+        history_trim_ts=lambda: None,
+        preprocess_handle=SimpleNamespace(preprocess_mgr_map={"25m": pre_mgr}),
+        get_market_handle=lambda _: SimpleNamespace(resample_mgr_map={"25m": res_mgr}),
+    )
+    m1 = pd.DataFrame([{"spot": "REVUSDT", "swap": "REVUSDT", "first_begin_time": times[0], "last_begin_time": times[-2]}])
+    pp.gen_batch_data_incremental(h, rt1, "spot", m1, ["REVUSDT"], "batch1")
+
+    # Round 2: simulate anchor bar revision while 1h_resample has NOT yet been flushed to disk!
+    df_tail_rev = df_full.tail(6).reset_index(drop=True).copy()
+    df_tail_rev.loc[0, "close"] = 99.9  # Anchor mismatch -> misses Fast Path 1 -> flushes df_tail_rev on demand!
+    assert not res_mgr.check_ready("REVUSDT", rt2)
+
+    m2 = pd.DataFrame([{"spot": "REVUSDT", "swap": "REVUSDT", "first_begin_time": times[0], "last_begin_time": times[-1]}])
+    hints = {"REVUSDT": (times[0], times[-1], df_tail_rev, df_tail_rev)}
+    pp.gen_batch_data_incremental(h, rt2, "spot", m2, ["REVUSDT"], "batch1", resample_tail_hints=hints)
+
+    assert res_mgr.check_ready("REVUSDT", rt2)
+    out_df = pre_mgr.read_candle("spot_dict_batch1")["REVUSDT"]
+    assert len(out_df) == len(times)
+    assert out_df.loc[len(times) - 6, "close"] == 99.9
+
+
+

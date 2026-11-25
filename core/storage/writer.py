@@ -438,11 +438,22 @@ class Writer:
         return df_combined
 
     def _write_pkl(self, base_dir: Path, symbol: str, df: pd.DataFrame) -> None:
-        """原子写：先写 <path>.tmp，再 os.replace -> 最终路径。"""
+        """原子写：先写独立 <path>.<pid>.<tid>.tmp，再 os.replace -> 最终路径（兼容 Windows 并发读重试）。"""
+        import threading
+        import time as _time
+
         p = self._pkl_path(base_dir, symbol)
-        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp = p.with_name(f"{p.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         df.to_pickle(tmp)
-        os.replace(tmp, p)
+        for attempt in range(6):
+            try:
+                os.replace(tmp, p)
+                return
+            except PermissionError:
+                if attempt == 5:
+                    tmp.unlink(missing_ok=True)
+                    raise
+                _time.sleep(0.005 * (attempt + 1))
 
     def _update_tsmanager(
         self,

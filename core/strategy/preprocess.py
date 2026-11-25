@@ -593,7 +593,8 @@ def gen_batch_data_incremental(handle: BmacHandle, run_time: datetime, trade_typ
 
         # Fast Path 1: 内存重采样尾部直传（校验头部时间与锚点 K 线一致后免除 1.5 万行 1h pkl 读盘）
         hint = hints_map.get(symbol)
-        is_deferred_1h = bool(hint is not None and len(hint) >= 4 and hint[3])
+        deferred_arg = hint[3] if (hint is not None and len(hint) >= 4) else None
+        is_deferred_1h = isinstance(deferred_arg, pd.DataFrame) or bool(deferred_arg)
         if (
             hint is not None
             and src_choice in (None, 'binance')
@@ -625,9 +626,17 @@ def gen_batch_data_incremental(handle: BmacHandle, run_time: datetime, trade_typ
                         continue
 
         if is_deferred_1h and src_choice in (None, 'binance') and not binance_mgr.check_ready(symbol, run_time):
-            wait_deadline = time.monotonic() + 30.0
-            while not binance_mgr.check_ready(symbol, run_time) and time.monotonic() < wait_deadline:
-                time.sleep(0.02)
+            if isinstance(deferred_arg, pd.DataFrame) and not deferred_arg.empty:
+                from core.pipeline.resample import update_resample_candle_incremental
+                from core.utils.time import convert_interval_to_timedelta
+                update_resample_candle_incremental(
+                    binance_mgr, symbol, deferred_arg, None, run_time,
+                    convert_interval_to_timedelta(resample_interval), min_ts=min_ts,
+                )
+            else:
+                wait_deadline = time.monotonic() + 30.0
+                while not binance_mgr.check_ready(symbol, run_time) and time.monotonic() < wait_deadline:
+                    time.sleep(0.02)
 
         result = read_candle_data(binance_mgr, data_api_mgr, symbol, run_time, source=src_choice)
         if result is None:

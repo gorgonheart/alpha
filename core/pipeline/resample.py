@@ -757,16 +757,14 @@ def _resample_chunk_worker(
     return out_begins
 
 
-def _compute_first_resample(
+def _compute_first_chunk_worker(
     handle: BmacHandle,
     trade_type: str,
     run_time: datetime,
-    symbols_trading: list[str],
+    symbols_chunk: list[str],
     return_tail_bars: int,
-) -> tuple[dict, dict, Callable[[], None]]:
-    """计算优先重采样：直接内存合成最新 1h 切片供下游 Preprocess 立即开算，
-    将 1,287 个 14,700 行 1h_resample/*.pkl 的磁盘合并写入封装为可并行调用的 `flush_fn`。
-    """
+    cached_bounds_map: dict,
+):
     resample_interval = handle.resample_interval
     resample_delta = convert_interval_to_timedelta(resample_interval)
     offset_str = get_offset_from_runtime(run_time, resample_interval)
@@ -777,21 +775,18 @@ def _compute_first_resample(
     kline_count_1h = _resolve_kline_count_1h(handle, trade_type, run_time)
     theoretical_start = run_time - kline_count_1h * resample_delta
     min_ts = _resolve_history_trim_ts(handle)
-    ws_windows = _load_ws_windows_for_chunk(handle, trade_type, run_time, symbols_trading, once_update_candles)
+    ws_windows = _load_ws_windows_for_chunk(handle, trade_type, run_time, symbols_chunk, once_update_candles)
 
-    symbol_begin_time: dict = {}
-    symbol_tail_dfs: dict = {}
-    deferred_writes: list[tuple[str, pd.DataFrame]] = []
-    deferred_lock = threading.Lock()
-
-    def _fast_one(symbol: str):
+    out_items = []
+    out_synced_meta = {}
+    for symbol in symbols_chunk:
         df_res = _prepare_df_resample_from_base(
             symbol, base_dir, resample_mgr, resample_interval, offset_str,
             theoretical_start, run_time, once_update_candles, ws_df=ws_windows.get(symbol),
         )
         if df_res is None:
-            return None
-        cached = _get_cached_resample_bounds(resample_mgr, symbol)
+            continue
+        cached = cached_bounds_map.get(symbol)
         if cached is not None:
             _, first_ts, last_old_ts = cached
             cbt = df_res['candle_begin_time']
@@ -807,33 +802,101 @@ def _compute_first_resample(
                 if not ((t_gap > timedelta(hours=48)) & (p_chg.abs() > 0.1)).any():
                     tail_filled = fill_gaps(df_res, resample_delta).reset_index(drop=True)
                     new_last_ts = max(last_old_ts, tail_filled['candle_begin_time'].iloc[-1])
-                    return ('deferred', symbol, (first_ts, new_last_ts), tail_filled, df_res)
+                    t_slice = tail_filled.tail(return_tail_bars).reset_index(drop=True) if return_tail_bars > 0 else None
+                    out_items.append(('deferred', symbol, (first_ts, new_last_ts), t_slice, df_res))
+                    continue
 
-        # 冷缓存 / 新上币 / 长缺口 / 疑似拆分：同步完成一次完整 1h 落盘并预热缓存
         res = update_resample_candle_incremental(
             resample_mgr, symbol, df_res, None, run_time, resample_delta,
             min_ts=min_ts, return_tail_bars=max(return_tail_bars, 12),
         )
         if res[0] is not None and res[1] is not None:
-            return ('synced', symbol, (res[0], res[1]), res[2], None)
-        return None
+            t_slice = res[2].tail(return_tail_bars).reset_index(drop=True) if (return_tail_bars > 0 and res[2] is not None) else None
+            out_items.append(('synced', symbol, (res[0], res[1]), t_slice, None))
+            entry = _get_cached_resample_bounds(resample_mgr, symbol)
+            if entry is not None:
+                out_synced_meta[symbol] = entry
+    return out_items, out_synced_meta
 
-    if len(symbols_trading) <= 4:
-        items = [_fast_one(s) for s in symbols_trading]
+
+def _compute_first_resample(
+    handle: BmacHandle,
+    trade_type: str,
+    run_time: datetime,
+    symbols_trading: list[str],
+    return_tail_bars: int,
+    executor=None,
+) -> tuple[dict, dict, Callable[[], None]]:
+    """计算优先重采样：直接内存合成最新 1h 切片供下游 Preprocess 立即开算，
+    将 1,287 个 14,700 行 1h_resample/*.pkl 的磁盘合并写入封装为可延后调用的 `flush_fn`。
+    """
+    resample_interval = handle.resample_interval
+    resample_delta = convert_interval_to_timedelta(resample_interval)
+    offset_str = get_offset_from_runtime(run_time, resample_interval)
+    market_handle = _get_market_handle(handle, trade_type)
+    resample_mgr = market_handle.resample_mgr_map[offset_str]
+    min_ts = _resolve_history_trim_ts(handle)
+
+    symbol_begin_time: dict = {}
+    symbol_tail_dfs: dict = {}
+    deferred_writes: list[tuple[str, pd.DataFrame]] = []
+    deferred_lock = threading.Lock()
+
+    cached_all = {}
+    for sym in symbols_trading:
+        c = _get_cached_resample_bounds(resample_mgr, sym)
+        if c is not None:
+            cached_all[sym] = c
+
+    items = []
+    if executor is not None and len(symbols_trading) > 4:
+        pool_workers = int(getattr(executor, '_max_workers', 4) or 4)
+        n_chunks = min(len(symbols_trading), max(4, pool_workers * 2))
+        chunk_size = (len(symbols_trading) + n_chunks - 1) // n_chunks
+        chunks = [symbols_trading[i:i + chunk_size] for i in range(0, len(symbols_trading), chunk_size)]
+        futs = [
+            executor.submit(
+                _compute_first_chunk_worker,
+                handle, trade_type, run_time, ch, return_tail_bars,
+                {s: cached_all[s] for s in ch if s in cached_all},
+            )
+            for ch in chunks
+        ]
+        base_key = str(resample_mgr.base_dir)
+        for fut in futs:
+            c_items, synced_meta = fut.result()
+            items.extend(c_items)
+            if synced_meta:
+                with _RESAMPLE_BOUNDS_LOCK:
+                    for sym, entry in synced_meta.items():
+                        _RESAMPLE_BOUNDS_CACHE[(base_key, sym)] = entry
+    elif len(symbols_trading) <= 4:
+        items, _ = _compute_first_chunk_worker(
+            handle, trade_type, run_time, symbols_trading, return_tail_bars, cached_all
+        )
     else:
-        with ThreadPoolExecutor(max_workers=4, thread_name_prefix=f'fast_res_{trade_type}') as pool:
-            items = list(pool.map(_fast_one, symbols_trading))
+        n_workers = 4
+        chunk_size = (len(symbols_trading) + n_workers - 1) // n_workers
+        chunks = [symbols_trading[i:i + chunk_size] for i in range(0, len(symbols_trading), chunk_size)]
+        with ThreadPoolExecutor(max_workers=n_workers, thread_name_prefix=f'fast_res_{trade_type}') as pool:
+            for c_items, _ in pool.map(
+                lambda ch: _compute_first_chunk_worker(
+                    handle, trade_type, run_time, ch, return_tail_bars,
+                    {s: cached_all[s] for s in ch if s in cached_all},
+                ),
+                chunks,
+            ):
+                items.extend(c_items)
 
     for item in items:
-        if item is None:
-            continue
         mode, sym, bounds, tail_df, df_res_raw = item
         symbol_begin_time[sym] = bounds
         if return_tail_bars > 0 and tail_df is not None:
-            symbol_tail_dfs[sym] = tail_df.tail(return_tail_bars).reset_index(drop=True)
+            symbol_tail_dfs[sym] = tail_df
         if mode == 'deferred' and df_res_raw is not None:
             deferred_writes.append((sym, df_res_raw))
 
+    raw_map = dict(deferred_writes)
     flushed = False
 
     def _flush_to_disk() -> None:
@@ -850,6 +913,8 @@ def _compute_first_resample(
 
         def _write_one(pair: tuple[str, pd.DataFrame]) -> None:
             sym, df_r = pair
+            if resample_mgr.check_ready(sym, run_time):
+                return
             update_resample_candle_incremental(
                 resample_mgr, sym, df_r, None, run_time, resample_delta, min_ts=min_ts
             )
@@ -861,6 +926,7 @@ def _compute_first_resample(
             with ThreadPoolExecutor(max_workers=2, thread_name_prefix=f'flush_1h_{trade_type}') as fpool:
                 list(fpool.map(_write_one, pending_items))
 
+    _flush_to_disk.raw_map = raw_map  # type: ignore[attr-defined]
     logger.ok(
         f'Resample {trade_type} 内存合成就绪: {len(symbol_begin_time)}/{len(symbols_trading)} symbol '
         f'(后台待刷盘={len(deferred_writes)}), 当前时间={now_time_str()}'
@@ -896,7 +962,7 @@ def update_resample_from_base(
 
     if defer_disk_write:
         begins, tails, flush_fn = _compute_first_resample(
-            handle, trade_type, run_time, symbols_trading, return_tail_bars
+            handle, trade_type, run_time, symbols_trading, return_tail_bars, executor=executor
         )
         if return_tail_bars > 0:
             return begins, tails, flush_fn
