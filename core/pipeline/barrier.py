@@ -20,11 +20,12 @@ update_all 调用。
 from __future__ import annotations
 
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional
 
 from core.storage.candle_manager import CandleFileReader
+from core.ws.ws_local_cache import query_ws_cache_status
 
 
 def wait_for_ready_barrier(
@@ -38,6 +39,11 @@ def wait_for_ready_barrier(
     rest_submitted=None,
     rest_confirmed_empty=None,
     hard_timeout_sec: float = 180.0,
+    *,
+    ws_cache_db: Optional[Path] = None,
+    trade_type: Optional[str] = None,
+    base_delta: timedelta = timedelta(minutes=5),
+    once_update_candles: int = 99,
 ) -> tuple[set[str], set[str]]:
     """轮询 ready 文件，直到每个 symbol 都齐、REST 确认无待落盘项，或截止时间到。
 
@@ -58,6 +64,9 @@ def wait_for_ready_barrier(
     start = time.monotonic()
     deadline = start + timeout_sec
     hard_deadline = start + max(timeout_sec, hard_timeout_sec) if rest_done is not None else deadline
+    base_ms = max(1, int(base_delta.total_seconds() * 1000))
+    target_ms = int((run_time - base_delta).timestamp() * 1000)
+
     while True:
         # 必须在扫描 pending 之前采样 rest_done，确保 rest_done.set() 之前写入的 .ready
         # 至少被完整扫描一轮，绝不会因竞态被误判为 skipped。
@@ -65,19 +74,39 @@ def wait_for_ready_barrier(
         ws_grace_passed = (time.monotonic() - start) >= ws_wait_sec
         submitted_set = set(rest_submitted or ())
 
+        ws_ready_contig: set[str] = set()
+        ws_full_contig: set[str] = set()
+        ws_gapped: set[str] = set()
+        if ws_cache_db is not None and trade_type is not None:
+            ws_ready_contig, ws_full_contig, ws_gapped = query_ws_cache_status(
+                Path(ws_cache_db),
+                trade_type,
+                target_ms,
+                base_ms,
+                check_bars=once_update_candles,
+            )
+
         # 每轮一次目录遍历取断档标记；REST 已结束则只等它真正投递过数据的 symbol
+        disk_gaps = reader.list_gap_marker_symbols() & pending
         waiting_gap: set[str] = set()
         if rest_done is not None:
-            gap_syms = reader.list_gap_marker_symbols() & pending
+            gap_syms = (disk_gaps | (ws_gapped & pending))
             if gap_syms and rest_done_was_set:
                 gap_syms &= submitted_set
             waiting_gap = gap_syms
+        else:
+            waiting_gap = disk_gaps
 
         for sym in list(pending):
             if sym in waiting_gap:
                 continue
-            # 优先认 WS 已落盘（base 为 WS 最终值）；WS 缺则过 ws_wait 后回退认 REST 的 .ready
-            if reader.check_ws_ready(sym, run_time) or (
+            ws_fast_ok = (
+                sym in ws_ready_contig
+                and sym not in disk_gaps
+                and (sym in ws_full_contig or reader.has_symbol(sym))
+            )
+            # 优先认 WS 已收齐无断档（SQLite WAL 或磁盘 .ws_ready）；WS 缺则过 ws_wait 后回退认 REST 的 .ready
+            if ws_fast_ok or reader.check_ws_ready(sym, run_time) or (
                 ws_grace_passed and reader.check_ready(sym, run_time)
             ):
                 pending.discard(sym)

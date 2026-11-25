@@ -31,6 +31,9 @@ from __future__ import annotations
 
 import pathlib
 import sqlite3
+from typing import Iterable, Optional
+
+import pandas as pd
 
 
 _SCHEMA_VERSION = 1
@@ -200,3 +203,132 @@ class WsLocalCache:
 def _row_to_dict(row: sqlite3.Row) -> dict:
     """把 sqlite3.Row 转成按规范 K 线键顺序排列的普通 dict。"""
     return {col: row[col] for col in _KLINE_COLUMNS}
+
+
+def _open_readonly_conn(db_path: pathlib.Path) -> Optional[sqlite3.Connection]:
+    p = pathlib.Path(db_path)
+    if not p.exists():
+        return None
+    uri = p.resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=2.0)
+    return conn
+
+
+def query_ws_cache_status(
+    db_path: pathlib.Path,
+    trade_type: str,
+    target_begin_ms: int,
+    base_delta_ms: int,
+    check_bars: int = 99,
+) -> tuple[set[str], set[str], set[str]]:
+    """只读扫描 SQLite WAL 缓存，返回 `(ready_contiguous, full_window_contiguous, gapped_at_target)`。
+
+    - `ready_contiguous`: 已收到 `target_begin_ms`，且无紧邻前序缺口（`check_bars <= 1` 或同时存在 `target - base_delta`）
+    - `full_window_contiguous`: 在 `[target - (check_bars-1)*base_delta, target]` 内已攒满 `check_bars` 根闭合 K 线
+    - `gapped_at_target`: 已收到 `target_begin_ms`，但缺失紧邻的上一根 `target - base_delta`（提示存在 WS 断连缺口）
+    """
+    ready_contig: set[str] = set()
+    full_contig: set[str] = set()
+    gapped_latest: set[str] = set()
+    if db_path is None:
+        return ready_contig, full_contig, gapped_latest
+    try:
+        conn = _open_readonly_conn(pathlib.Path(db_path))
+    except Exception:
+        return ready_contig, full_contig, gapped_latest
+    if conn is None:
+        return ready_contig, full_contig, gapped_latest
+    try:
+        target_ms = int(target_begin_ms)
+        step_ms = max(1, int(base_delta_ms))
+        n_check = max(1, int(check_bars))
+        win_start_ms = target_ms - (n_check - 1) * step_ms
+        prev_ms = target_ms - step_ms
+        cur = conn.execute(
+            """
+            SELECT
+                symbol,
+                COUNT(*) AS n_win,
+                SUM(CASE WHEN begin_time_ms = ? THEN 1 ELSE 0 END) AS has_target,
+                SUM(CASE WHEN begin_time_ms = ? THEN 1 ELSE 0 END) AS has_prev
+            FROM kline
+            WHERE trade_type = ? AND begin_time_ms >= ? AND begin_time_ms <= ?
+            GROUP BY symbol
+            """,
+            (target_ms, prev_ms, trade_type, win_start_ms, target_ms),
+        )
+        for sym, n_win, has_target, has_prev in cur.fetchall():
+            if not has_target:
+                continue
+            if n_win >= n_check:
+                full_contig.add(sym)
+                ready_contig.add(sym)
+            elif n_check <= 1 or has_prev:
+                ready_contig.add(sym)
+            else:
+                gapped_latest.add(sym)
+    except Exception:
+        pass
+    finally:
+        conn.close()
+    return ready_contig, full_contig, gapped_latest
+
+
+def read_ws_cache_market_windows(
+    db_path: pathlib.Path,
+    trade_type: str,
+    symbols: Optional[Iterable[str]],
+    window_start_ms: int,
+    end_exclusive_ms: int,
+) -> dict[str, pd.DataFrame]:
+    """从 SQLite WAL 批量只读提取 `[window_start_ms, end_exclusive_ms)` 内的闭合 5m K 线表字典。"""
+    out: dict[str, pd.DataFrame] = {}
+    if db_path is None:
+        return out
+    try:
+        conn = _open_readonly_conn(pathlib.Path(db_path))
+    except Exception:
+        return out
+    if conn is None:
+        return out
+    try:
+        sym_filter = set(symbols) if symbols is not None else None
+        if sym_filter is not None and not sym_filter:
+            return out
+        cur = conn.execute(
+            """
+            SELECT symbol, begin_time_ms, open, high, low, close,
+                   volume, quote_volume, trade_num, taker_buy_base, taker_buy_quote
+              FROM kline
+             WHERE trade_type = ? AND begin_time_ms >= ? AND begin_time_ms < ?
+             ORDER BY symbol ASC, begin_time_ms ASC
+            """,
+            (trade_type, int(window_start_ms), int(end_exclusive_ms)),
+        )
+        buckets: dict[str, list[tuple]] = {}
+        for row in cur.fetchall():
+            sym = row[0]
+            if sym_filter is not None and sym not in sym_filter:
+                continue
+            buckets.setdefault(sym, []).append(row)
+
+        for sym, rows in buckets.items():
+            out[sym] = pd.DataFrame(
+                {
+                    "candle_begin_time": pd.to_datetime([r[1] for r in rows], unit="ms", utc=True),
+                    "open": pd.Series([float(r[2]) for r in rows], dtype="float64"),
+                    "high": pd.Series([float(r[3]) for r in rows], dtype="float64"),
+                    "low": pd.Series([float(r[4]) for r in rows], dtype="float64"),
+                    "close": pd.Series([float(r[5]) for r in rows], dtype="float64"),
+                    "volume": pd.Series([float(r[6]) for r in rows], dtype="float64"),
+                    "quote_volume": pd.Series([float(r[7]) for r in rows], dtype="float64"),
+                    "trade_num": pd.Series([int(r[8]) for r in rows], dtype="int64"),
+                    "taker_buy_base_asset_volume": pd.Series([float(r[9]) for r in rows], dtype="float64"),
+                    "taker_buy_quote_asset_volume": pd.Series([float(r[10]) for r in rows], dtype="float64"),
+                }
+            )
+    except Exception:
+        pass
+    finally:
+        conn.close()
+    return out

@@ -23,6 +23,7 @@ from core.handle import BmacHandle
 from core.ingest.coin_cap import run_coin_cap_update_to_recent
 from core.ingest.data_api_update import update_data_api_candles
 from core.pipeline.barrier import wait_for_ready_barrier
+from core.ws.ws_local_cache import query_ws_cache_status
 from core.pipeline.data_update import (
     fetch_update_binance_candles,
     update_binance_base_candles,
@@ -95,6 +96,14 @@ def _universe(handle: BmacHandle, trade_type: str) -> list:
     return df_exg["symbol"].to_list() if df_exg is not None else []
 
 
+def _resolve_ws_cache_db(handle: BmacHandle, trade_type: str) -> Optional[Path]:
+    base_dir = getattr(handle, "base_dir", None)
+    if base_dir is None:
+        return None
+    p = Path(base_dir) / "ws_cache" / f"{trade_type}.sqlite"
+    return p if p.exists() else None
+
+
 def _compute_missed_and_gaps(
     handle: BmacHandle, trade_type: str, run_time: datetime
 ) -> tuple[set[str], set[str]]:
@@ -108,15 +117,41 @@ def _compute_missed_and_gaps(
         for sym in stale:
             reader.clear_gap_marker(sym)
     gap_symbols -= stale
+
+    ws_ready_contig: set[str] = set()
+    ws_full_contig: set[str] = set()
+    ws_gapped: set[str] = set()
+    ws_cache_db = _resolve_ws_cache_db(handle, trade_type)
+    if ws_cache_db is not None:
+        base_delta = convert_interval_to_timedelta(getattr(handle, "base_interval", "5m"))
+        base_ms = max(1, int(base_delta.total_seconds() * 1000))
+        target_ms = int((run_time - base_delta).timestamp() * 1000)
+        once_bars = int(getattr(bh, "once_update_candles", 99))
+        ws_ready_contig, ws_full_contig, ws_gapped = query_ws_cache_status(
+            ws_cache_db, trade_type, target_ms, base_ms, check_bars=once_bars
+        )
+
+    universe_set = set(universe)
+    for sym in (ws_gapped & universe_set):
+        if not reader.check_ws_ready(sym, run_time):
+            gap_symbols.add(sym)
+
     if gap_symbols:
         logger.info(
             f"REST 兜底[{trade_type}]: {len(gap_symbols)} 个 symbol 有历史断档标记, "
             f"sample={sorted(gap_symbols)[:10]}"
         )
-    missed = {
-        sym for sym in universe
-        if sym in gap_symbols or not reader.check_ws_ready(sym, run_time)
-    }
+
+    missed: set[str] = set()
+    for sym in universe:
+        if sym in gap_symbols:
+            missed.add(sym)
+            continue
+        if reader.check_ws_ready(sym, run_time):
+            continue
+        if sym in ws_ready_contig and (sym in ws_full_contig or reader.has_symbol(sym)):
+            continue
+        missed.add(sym)
     return missed, gap_symbols
 
 
@@ -313,7 +348,7 @@ def _barrier_and_resample(
         rest_state.get("confirmed_empty", {}).get(trade_type) if rest_done is not None else None
     )
     ws_wait_sec = _resolve_ws_wait_sec(handle)
-    success, skipped = wait_for_ready_barrier(
+    bar_kwargs: dict = dict(
         symbols=symbols,
         base_5m_dir=bh.base_candle_dir,
         run_time=run_time,
@@ -322,6 +357,13 @@ def _barrier_and_resample(
         rest_submitted=rest_submitted,
         rest_confirmed_empty=rest_confirmed_empty,
     )
+    bar_sig = inspect.signature(wait_for_ready_barrier)
+    if "ws_cache_db" in bar_sig.parameters:
+        bar_kwargs["ws_cache_db"] = _resolve_ws_cache_db(handle, trade_type)
+        bar_kwargs["trade_type"] = trade_type
+        bar_kwargs["base_delta"] = convert_interval_to_timedelta(getattr(handle, "base_interval", "5m"))
+        bar_kwargs["once_update_candles"] = int(getattr(bh, "once_update_candles", 99))
+    success, skipped = wait_for_ready_barrier(**bar_kwargs)
     elapsed = time.monotonic() - t0
     logger.info(
         f"barrier[{trade_type}] 完成: success={len(success)}/{len(symbols)} "

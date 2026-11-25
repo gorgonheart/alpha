@@ -30,6 +30,35 @@ class CandleFileReader:
             self.ext = 'pkl.zst'
         else:
             raise ValueError(f'Save type {save_type} not supported, can only accept feather and parquet')
+        self._ready_cache: dict[str, list[str]] = {}
+        self._ws_ready_cache: dict[str, list[str]] = {}
+        self._ready_indexed: bool = False
+
+    def _ensure_ready_indexed(self) -> None:
+        if getattr(self, '_ready_indexed', False):
+            return
+        r_cache: dict[str, list[str]] = {}
+        w_cache: dict[str, list[str]] = {}
+        if os.path.isdir(self.base_dir):
+            try:
+                with os.scandir(self.base_dir) as it:
+                    for entry in it:
+                        name = entry.name
+                        if name.endswith('.ws_ready'):
+                            stem = name[:-9]
+                            sep = stem.rfind('_')
+                            if sep > 0:
+                                w_cache.setdefault(stem[:sep], []).append(entry.path)
+                        elif name.endswith('.ready'):
+                            stem = name[:-6]
+                            sep = stem.rfind('_')
+                            if sep > 0:
+                                r_cache.setdefault(stem[:sep], []).append(entry.path)
+            except OSError:
+                pass
+        self._ready_cache = r_cache
+        self._ws_ready_cache = w_cache
+        self._ready_indexed = True
 
     def format_ready_file_path(self, symbol, run_time: datetime):
         """
@@ -135,6 +164,9 @@ class CandleFileManager(CandleFileReader):
         if os.path.exists(self.base_dir):
             shutil.rmtree(self.base_dir)
         os.makedirs(self.base_dir)
+        self._ready_cache = {}
+        self._ws_ready_cache = {}
+        self._ready_indexed = True
 
     def save_data_file(self, symbol, df: pd.DataFrame):
         df_path = self.format_data_file_path(symbol)
@@ -178,14 +210,18 @@ class CandleFileManager(CandleFileReader):
         self.save_ready(symbol, run_time)
 
     def save_ready(self, symbol, run_time):
-        old_ready_file_paths = glob(os.path.join(self.base_dir, f'{symbol}_*.ready'))
-        for p in old_ready_file_paths:
-            os.remove(p)
+        self._ensure_ready_indexed()
+        for p in self._ready_cache.pop(symbol, ()):
+            try:
+                os.remove(p)
+            except FileNotFoundError:
+                pass
 
         if run_time is not None:
             ready_file_path = self.format_ready_file_path(symbol, run_time)
             with open(ready_file_path, 'w') as fout:
                 fout.write(str(datetime.now().timestamp()))
+            self._ready_cache[symbol] = [ready_file_path]
 
     def save_gap_marker(self, symbol):
         """写断档标记（已存在则不重复写）。"""
@@ -203,14 +239,18 @@ class CandleFileManager(CandleFileReader):
 
     def save_ws_ready(self, symbol, run_time):
         """写 ws_ready 标记（清理旧的）；由 writer 在处理 WS 闭合 K 落盘后调用。"""
-        old_ws_ready_paths = glob(os.path.join(self.base_dir, f'{symbol}_*.ws_ready'))
-        for p in old_ws_ready_paths:
-            os.remove(p)
+        self._ensure_ready_indexed()
+        for p in self._ws_ready_cache.pop(symbol, ()):
+            try:
+                os.remove(p)
+            except FileNotFoundError:
+                pass
 
         if run_time is not None:
             ws_ready_file_path = self.format_ws_ready_file_path(symbol, run_time)
             with open(ws_ready_file_path, 'w') as fout:
                 fout.write(str(datetime.now().timestamp()))
+            self._ws_ready_cache[symbol] = [ws_ready_file_path]
 
     def update_candle(self, symbol, run_time, df_new: pd.DataFrame, num_candles):
         """
@@ -274,9 +314,17 @@ class CandleFileManager(CandleFileReader):
         :param symbol:  币种
         :return:
         """
-        old_ready_file_paths = glob(os.path.join(self.base_dir, f'{symbol}_*.ready'))
-        for p in old_ready_file_paths:
-            os.remove(p)
+        self._ensure_ready_indexed()
+        for p in self._ready_cache.pop(symbol, ()):
+            try:
+                os.remove(p)
+            except FileNotFoundError:
+                pass
+        for p in self._ws_ready_cache.pop(symbol, ()):
+            try:
+                os.remove(p)
+            except FileNotFoundError:
+                pass
         df_path = self.format_data_file_path(symbol)
         if os.path.exists(df_path):
             os.remove(df_path)
