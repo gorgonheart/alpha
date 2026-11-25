@@ -745,4 +745,126 @@ def test_deferred_1h_on_demand_flush_when_anchor_revised(tmp_path):
     assert out_df.loc[len(times) - 6, "close"] == 99.9
 
 
+# ============================================================================
+# P0 Hotfixes: Cross-Process .ready Leak & ws_cache Index / Subset Seek
+# ============================================================================
+
+
+def test_candle_file_manager_pickle_and_cross_process_writes_never_leak_ready_files(tmp_path):
+    import pickle
+    from core.storage.candle_manager import CandleFileManager
+
+    d = tmp_path / "pre_25m"
+    d.mkdir()
+    rt1 = datetime(2026, 11, 25, 3, 25, tzinfo=timezone.utc)
+    rt2 = datetime(2026, 11, 25, 4, 25, tzinfo=timezone.utc)
+    rt3 = datetime(2026, 11, 25, 5, 25, tzinfo=timezone.utc)
+
+    # 1) Parent indexes directory BEFORE any worker writes batch1 or REVUSDT
+    parent_mgr = CandleFileManager(d, "pickle")
+    parent_mgr.save_ready("spot_dict", rt1)
+    parent_mgr.save_ready("REVUSDT", rt1)
+
+    # 2) Round 1 worker unpickles parent_mgr and writes batch1 (new symbol) + updates REVUSDT externally
+    worker_r1 = pickle.loads(pickle.dumps(parent_mgr))
+    worker_r1.save_ready("spot_dict_batch1", rt1)
+    worker_r1.save_ws_ready("spot_dict_batch1", rt1)
+    worker_r1.save_ready("REVUSDT", rt2)
+
+    # 3) Round 2 worker unpickles the STILL-ALIVE parent_mgr and writes batch1 for rt2 -> must NOT leak rt1!
+    worker_r2 = pickle.loads(pickle.dumps(parent_mgr))
+    worker_r2.save_ready("spot_dict_batch1", rt2)
+    worker_r2.save_ws_ready("spot_dict_batch1", rt2)
+
+    # 4) Parent writes spot_dict and REVUSDT on Round 3 (after cache TTL / external modification) -> must NOT leak rt2!
+    parent_mgr._ready_indexed_at = 0.0
+    parent_mgr.save_ready("spot_dict", rt3)
+    parent_mgr.save_ready("REVUSDT", rt3)
+
+    ep2 = int(rt2.timestamp())
+    ep3 = int(rt3.timestamp())
+    assert sorted(p.name for p in d.glob("*.ready")) == sorted([
+        f"spot_dict_{ep3}.ready",
+        f"spot_dict_batch1_{ep2}.ready",
+        f"REVUSDT_{ep3}.ready",
+    ])
+    assert sorted(p.name for p in d.glob("*.ws_ready")) == [
+        f"spot_dict_batch1_{ep2}.ws_ready",
+    ]
+
+
+def test_ws_cache_index_and_symbol_subset_query_avoid_full_table_scan(tmp_path):
+    import sqlite3
+    from core.ws.ws_local_cache import WsLocalCache, read_ws_cache_market_windows
+
+    # 1) Simulate an ALREADY-EXISTING v1 database created BEFORE this upgrade (no idx_kline_tt_time yet)
+    db_path = tmp_path / "swap.sqlite"
+    raw_conn = sqlite3.connect(str(db_path))
+    raw_conn.execute("PRAGMA journal_mode=WAL")
+    raw_conn.execute(
+        """
+        CREATE TABLE kline (
+            symbol TEXT NOT NULL, trade_type TEXT NOT NULL, begin_time_ms INTEGER NOT NULL,
+            open REAL, high REAL, low REAL, close REAL,
+            volume REAL, quote_volume REAL, trade_num INTEGER,
+            taker_buy_base REAL, taker_buy_quote REAL,
+            PRIMARY KEY (symbol, trade_type, begin_time_ms)
+        )
+        """
+    )
+    raw_conn.execute("PRAGMA user_version = 1")
+    base_ms = 1795580000000
+    rows = [
+        (f"SYM{i:03d}USDT", "swap", base_ms + b * 300000, 10.0 + b, 11.0, 9.0, 10.5, 100.0, 1050.0, 7, 50.0, 525.0)
+        for i in range(60)
+        for b in range(30)
+    ]
+    with raw_conn:
+        raw_conn.executemany("INSERT INTO kline VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+    raw_conn.close()
+
+    # Even BEFORE WsLocalCache reopens db_path, subset read MUST use PK index (NOT full SCAN kline)
+    # via WHERE symbol IN (...)!
+    subset = ["SYM003USDT", "SYM017USDT"]
+    win_map = read_ws_cache_market_windows(db_path, "swap", subset, base_ms + 5 * 300000, base_ms + 25 * 300000)
+    assert sorted(win_map.keys()) == subset
+    assert len(win_map["SYM003USDT"]) == 20
+    assert str(win_map["SYM003USDT"]["trade_num"].dtype) == "int64"
+
+    # 2) Opening WsLocalCache on existing v1 DB MUST preserve all 1,800 rows AND create idx_kline_tt_time!
+    cache = WsLocalCache(db_path)
+    total_after_open = cache._conn.execute("SELECT COUNT(*) FROM kline").fetchone()[0]
+    assert total_after_open == 1800  # Zero data loss!
+    idx_names = {r[1] for r in cache._conn.execute("PRAGMA index_list(kline)").fetchall()}
+    assert "idx_kline_tt_time" in idx_names
+
+    # Verify EXPLAIN QUERY PLAN for status query uses covering index (zero full-table SCAN kline)
+    plan_status = cache._conn.execute(
+        """
+        EXPLAIN QUERY PLAN
+        SELECT symbol, COUNT(*), SUM(CASE WHEN begin_time_ms = ? THEN 1 ELSE 0 END)
+          FROM kline
+         WHERE trade_type = ? AND begin_time_ms >= ? AND begin_time_ms <= ?
+         GROUP BY symbol
+        """,
+        (base_ms + 29 * 300000, "swap", base_ms, base_ms + 29 * 300000),
+    ).fetchall()
+    plan_detail = " ".join(str(tuple(r)) for r in plan_status)
+    assert "idx_kline_tt_time" in plan_detail and "SCAN kline" not in plan_detail
+
+    # Verify EXPLAIN QUERY PLAN for subset query uses primary key index seek
+    plan_subset = cache._conn.execute(
+        """
+        EXPLAIN QUERY PLAN
+        SELECT symbol, begin_time_ms, open FROM kline
+         WHERE symbol IN (?, ?) AND trade_type = ? AND begin_time_ms >= ? AND begin_time_ms < ?
+        """,
+        ("SYM003USDT", "SYM017USDT", "swap", base_ms, base_ms + 25 * 300000),
+    ).fetchall()
+    subset_detail = " ".join(str(tuple(r)) for r in plan_subset)
+    assert "SEARCH kline USING" in subset_detail and "SCAN kline" not in subset_detail
+    cache.close()
+
+
+
 

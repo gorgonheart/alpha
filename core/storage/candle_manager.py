@@ -10,6 +10,9 @@ import pandas as pd
 from core.utils.log_kit import logger
 
 
+_READY_INDEX_TTL_SEC = 2.0
+
+
 class CandleFileReader:
 
     def __init__(self, base_dir, save_type):
@@ -33,9 +36,22 @@ class CandleFileReader:
         self._ready_cache: dict[str, list[str]] = {}
         self._ws_ready_cache: dict[str, list[str]] = {}
         self._ready_indexed: bool = False
+        self._ready_indexed_at: float = 0.0
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state['_ready_cache'] = {}
+        state['_ws_ready_cache'] = {}
+        state['_ready_indexed'] = False
+        state['_ready_indexed_at'] = 0.0
+        return state
 
     def _ensure_ready_indexed(self) -> None:
-        if getattr(self, '_ready_indexed', False):
+        now_mono = time.monotonic()
+        if (
+            getattr(self, '_ready_indexed', False)
+            and (now_mono - getattr(self, '_ready_indexed_at', 0.0)) <= _READY_INDEX_TTL_SEC
+        ):
             return
         r_cache: dict[str, list[str]] = {}
         w_cache: dict[str, list[str]] = {}
@@ -59,6 +75,7 @@ class CandleFileReader:
         self._ready_cache = r_cache
         self._ws_ready_cache = w_cache
         self._ready_indexed = True
+        self._ready_indexed_at = now_mono
 
     def format_ready_file_path(self, symbol, run_time: datetime):
         """
@@ -167,6 +184,7 @@ class CandleFileManager(CandleFileReader):
         self._ready_cache = {}
         self._ws_ready_cache = {}
         self._ready_indexed = True
+        self._ready_indexed_at = time.monotonic()
 
     def save_data_file(self, symbol, df: pd.DataFrame):
         df_path = self.format_data_file_path(symbol)

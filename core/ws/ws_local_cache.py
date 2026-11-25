@@ -33,6 +33,7 @@ import pathlib
 import sqlite3
 from typing import Iterable, Optional
 
+import numpy as np
 import pandas as pd
 
 
@@ -99,6 +100,12 @@ class WsLocalCache:
                     taker_buy_quote REAL,
                     PRIMARY KEY (symbol, trade_type, begin_time_ms)
                 )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_kline_tt_time
+                ON kline (trade_type, begin_time_ms, symbol)
                 """
             )
             self._conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
@@ -292,39 +299,62 @@ def read_ws_cache_market_windows(
     if conn is None:
         return out
     try:
-        sym_filter = set(symbols) if symbols is not None else None
-        if sym_filter is not None and not sym_filter:
-            return out
-        cur = conn.execute(
-            """
-            SELECT symbol, begin_time_ms, open, high, low, close,
-                   volume, quote_volume, trade_num, taker_buy_base, taker_buy_quote
-              FROM kline
-             WHERE trade_type = ? AND begin_time_ms >= ? AND begin_time_ms < ?
-             ORDER BY symbol ASC, begin_time_ms ASC
-            """,
-            (trade_type, int(window_start_ms), int(end_exclusive_ms)),
-        )
         buckets: dict[str, list[tuple]] = {}
-        for row in cur.fetchall():
-            sym = row[0]
-            if sym_filter is not None and sym not in sym_filter:
-                continue
-            buckets.setdefault(sym, []).append(row)
+        w_start = int(window_start_ms)
+        w_end = int(end_exclusive_ms)
+        if symbols is not None:
+            sym_list = sorted(set(symbols))
+            if not sym_list:
+                return out
+            # 利用 PRIMARY KEY (symbol, trade_type, begin_time_ms) 做精确 B-Tree 范围查找，
+            # 避免分块并发重采样时对数万~数十万行 SQLite 表做重复全表扫描。
+            chunk_step = 450
+            for idx in range(0, len(sym_list), chunk_step):
+                sub_syms = sym_list[idx:idx + chunk_step]
+                placeholders = ",".join("?" for _ in sub_syms)
+                cur = conn.execute(
+                    f"""
+                    SELECT symbol, begin_time_ms, open, high, low, close,
+                           volume, quote_volume, trade_num, taker_buy_base, taker_buy_quote
+                      FROM kline
+                     WHERE symbol IN ({placeholders})
+                       AND trade_type = ?
+                       AND begin_time_ms >= ?
+                       AND begin_time_ms < ?
+                     ORDER BY symbol ASC, begin_time_ms ASC
+                    """,
+                    (*sub_syms, trade_type, w_start, w_end),
+                )
+                for row in cur.fetchall():
+                    buckets.setdefault(row[0], []).append(row)
+        else:
+            cur = conn.execute(
+                """
+                SELECT symbol, begin_time_ms, open, high, low, close,
+                       volume, quote_volume, trade_num, taker_buy_base, taker_buy_quote
+                  FROM kline
+                 WHERE trade_type = ? AND begin_time_ms >= ? AND begin_time_ms < ?
+                 ORDER BY symbol ASC, begin_time_ms ASC
+                """,
+                (trade_type, w_start, w_end),
+            )
+            for row in cur.fetchall():
+                buckets.setdefault(row[0], []).append(row)
 
         for sym, rows in buckets.items():
+            cols = list(zip(*rows))
             out[sym] = pd.DataFrame(
                 {
-                    "candle_begin_time": pd.to_datetime([r[1] for r in rows], unit="ms", utc=True),
-                    "open": pd.Series([float(r[2]) for r in rows], dtype="float64"),
-                    "high": pd.Series([float(r[3]) for r in rows], dtype="float64"),
-                    "low": pd.Series([float(r[4]) for r in rows], dtype="float64"),
-                    "close": pd.Series([float(r[5]) for r in rows], dtype="float64"),
-                    "volume": pd.Series([float(r[6]) for r in rows], dtype="float64"),
-                    "quote_volume": pd.Series([float(r[7]) for r in rows], dtype="float64"),
-                    "trade_num": pd.Series([int(r[8]) for r in rows], dtype="int64"),
-                    "taker_buy_base_asset_volume": pd.Series([float(r[9]) for r in rows], dtype="float64"),
-                    "taker_buy_quote_asset_volume": pd.Series([float(r[10]) for r in rows], dtype="float64"),
+                    "candle_begin_time": pd.to_datetime(cols[1], unit="ms", utc=True),
+                    "open": np.asarray(cols[2], dtype="float64"),
+                    "high": np.asarray(cols[3], dtype="float64"),
+                    "low": np.asarray(cols[4], dtype="float64"),
+                    "close": np.asarray(cols[5], dtype="float64"),
+                    "volume": np.asarray(cols[6], dtype="float64"),
+                    "quote_volume": np.asarray(cols[7], dtype="float64"),
+                    "trade_num": np.asarray(cols[8], dtype="int64"),
+                    "taker_buy_base_asset_volume": np.asarray(cols[9], dtype="float64"),
+                    "taker_buy_quote_asset_volume": np.asarray(cols[10], dtype="float64"),
                 }
             )
     except Exception:
