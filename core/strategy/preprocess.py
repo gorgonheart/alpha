@@ -568,14 +568,15 @@ def gen_batch_data_incremental(handle: BmacHandle, run_time: datetime, trade_typ
 
         # Fast Path 1: 内存重采样尾部直传（校验头部时间与锚点 K 线一致后免除 1.5 万行 1h pkl 读盘）
         hint = hints_map.get(symbol)
+        is_deferred_1h = bool(hint is not None and len(hint) >= 4 and hint[3])
         if (
             hint is not None
             and src_choice in (None, 'binance')
             and df_old is not None
             and len(df_old) > 2
-            and binance_mgr.check_ready(symbol, run_time)
+            and (is_deferred_1h or binance_mgr.check_ready(symbol, run_time))
         ):
-            hint_first, _hint_last, df_hint_tail = hint
+            hint_first, _hint_last, df_hint_tail = hint[:3]
             if (
                 df_hint_tail is not None
                 and len(df_hint_tail) >= 2
@@ -596,6 +597,11 @@ def gen_batch_data_incremental(handle: BmacHandle, run_time: datetime, trade_typ
                         new_market_dict[symbol] = fast_comb
                         price_updates.append(symbol)
                         continue
+
+        if is_deferred_1h and src_choice in (None, 'binance') and not binance_mgr.check_ready(symbol, run_time):
+            wait_deadline = time.monotonic() + 30.0
+            while not binance_mgr.check_ready(symbol, run_time) and time.monotonic() < wait_deadline:
+                time.sleep(0.02)
 
         result = read_candle_data(binance_mgr, data_api_mgr, symbol, run_time, source=src_choice)
         if result is None:

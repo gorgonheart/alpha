@@ -35,7 +35,13 @@ from core.pipeline.runtime_supervisor import RuntimeSupervisor
 from core.storage.candle_manager import CandleFileManager, CandleFileReader
 from core.strategy.preprocess import preprocess_offset_data
 from core.utils.log_kit import logger
-from core.utils.time import convert_interval_to_timedelta, next_run_time, now_time_str, sleep_until_run_time
+from core.utils.time import (
+    convert_interval_to_timedelta,
+    get_offset_from_runtime,
+    next_run_time,
+    now_time_str,
+    sleep_until_run_time,
+)
 
 # 默认 WS 等待/REST 兜底 grace 秒数（显式配置，避免 inspect 默认值隐式耦合；可通过 handle.ws_wait_sec 覆盖）
 _DEFAULT_WS_WAIT_SEC: float = 14.0
@@ -335,6 +341,7 @@ def _barrier_and_resample(
     *,
     compute_pool=None,
     return_tail_bars: int = 0,
+    defer_1h_write: bool = False,
 ) -> dict:
     """等该 trade_type 的 symbol 落盘（ready-file barrier），通过即从 base 存储 resample。"""
     bh = _get_market_handle(handle, trade_type)
@@ -384,9 +391,19 @@ def _barrier_and_resample(
         )
     begin_ts: dict = {}
     tail_dfs: dict = {}
+    flush_1h = None
     if success:
         sig = inspect.signature(update_resample_from_base)
-        if "executor" in sig.parameters and "return_tail_bars" in sig.parameters:
+        if defer_1h_write and "defer_disk_write" in sig.parameters and return_tail_bars > 0:
+            begin_ts, tail_dfs, flush_1h = update_resample_from_base(
+                handle,
+                trade_type,
+                run_time,
+                executor=compute_pool,
+                return_tail_bars=return_tail_bars,
+                defer_disk_write=True,
+            )
+        elif "executor" in sig.parameters and "return_tail_bars" in sig.parameters:
             res_out = update_resample_from_base(
                 handle, trade_type, run_time, executor=compute_pool, return_tail_bars=return_tail_bars
             )
@@ -404,6 +421,7 @@ def _barrier_and_resample(
         "has_gaps": has_gaps,
         "begin_ts": begin_ts,
         "tail_dfs": tail_dfs,
+        "flush_1h": flush_1h,
     }
 
 
@@ -478,27 +496,39 @@ def run_ws_cycle(handle: BmacHandle, run_time: datetime, supervisor: RuntimeSupe
 
             br_sig = inspect.signature(_barrier_and_resample)
             supports_pool_kw = "compute_pool" in br_sig.parameters
+            supports_defer_kw = "defer_1h_write" in br_sig.parameters
+            offset_str = get_offset_from_runtime(run_time, getattr(handle, "resample_interval", "1h"))
+            pre_mgr = (
+                getattr(handle.preprocess_handle, "preprocess_mgr_map", {}).get(offset_str)
+                if getattr(handle, "preprocess_handle", None) is not None
+                else None
+            )
             with ThreadPoolExecutor(max_workers=2) as br_exe:
-                results = list(
-                    br_exe.map(
-                        lambda tt: (
-                            _barrier_and_resample(
-                                handle, tt, run_time, rest_state,
-                                compute_pool=compute_pool,
-                                return_tail_bars=12 if compute_pool is not None else 0,
-                            )
-                            if supports_pool_kw
-                            else _barrier_and_resample(handle, tt, run_time, rest_state)
-                        ),
-                        ("spot", "swap"),
-                    )
-                )
+                def _call_br(tt: str):
+                    if supports_pool_kw:
+                        can_defer = bool(
+                            compute_pool is not None
+                            and pre_mgr is not None
+                            and hasattr(pre_mgr, "has_symbol")
+                            and pre_mgr.has_symbol(f"{tt}_dict_batch1")
+                        )
+                        extra_kw = {"defer_1h_write": can_defer} if supports_defer_kw else {}
+                        return _barrier_and_resample(
+                            handle, tt, run_time, rest_state,
+                            compute_pool=compute_pool,
+                            return_tail_bars=12 if compute_pool is not None else 0,
+                            **extra_kw,
+                        )
+                    return _barrier_and_resample(handle, tt, run_time, rest_state)
+
+                results = list(br_exe.map(_call_br, ("spot", "swap")))
 
             if rest_state and "cancel" in rest_state:
                 if all(r["success"] == r["total"] and not r.get("has_gaps", False) for r in results):
                     rest_state["cancel"].set()
 
             resample_tails: dict[str, dict] = {}
+            flush_1h_fns = []
             for r in results:
                 if r["success"]:
                     result.is_binance_success = True
@@ -506,11 +536,14 @@ def run_ws_cycle(handle: BmacHandle, run_time: datetime, supervisor: RuntimeSupe
                     result.spot_begin_ts = r["begin_ts"]
                 else:
                     result.swap_begin_ts = r["begin_ts"]
+                if callable(r.get("flush_1h")):
+                    flush_1h_fns.append(r["flush_1h"])
                 r_tails = r.get("tail_dfs") or {}
                 r_begins = r.get("begin_ts") or {}
+                is_deferred_1h = callable(r.get("flush_1h"))
                 if r_tails and r_begins:
                     resample_tails[r["trade_type"]] = {
-                        sym: (r_begins[sym][0], r_begins[sym][1], tdf)
+                        sym: (r_begins[sym][0], r_begins[sym][1], tdf, is_deferred_1h)
                         for sym, tdf in r_tails.items()
                         if tdf is not None and sym in r_begins
                     }
@@ -521,87 +554,95 @@ def run_ws_cycle(handle: BmacHandle, run_time: datetime, supervisor: RuntimeSupe
                     )
                     result.errs.append(f"barrier {r['trade_type']} timeout {len(r['skipped'])}/{r['total']}")
 
-            ws_binance_result = (
-                ({}, {}, result.spot_begin_ts or {}, result.swap_begin_ts or {})
-                if result.is_binance_success
-                else None
-            )
-            ws_confirmed_empty = rest_state.get("confirmed_empty") if rest_state else None
-            data_api_done = task_data_api is None
-            data_api_result = None
-            published = False
-
-            rp_sig = inspect.signature(_run_preprocess)
-            rp_supports_pool = (
-                any(p.kind == inspect.Parameter.VAR_KEYWORD for p in rp_sig.parameters.values())
-                or ("batch_executor" in rp_sig.parameters and "resample_tails" in rp_sig.parameters)
-            )
-
-            def _invoke_preprocess(pub_handle, sp_bt, sw_bt):
-                if rp_supports_pool:
-                    _run_preprocess(
-                        pub_handle,
-                        run_time,
-                        sp_bt,
-                        sw_bt,
-                        batch_executor=compute_pool,
-                        resample_tails=resample_tails or None,
-                    )
-                else:
-                    _run_preprocess(pub_handle, run_time, sp_bt, sw_bt)
-
-            if handle.preprocess_handle is not None:
+            # 启动后台线程将 1h_resample 增量落盘与接下来的 Preprocess CPU 计算真并行重叠；
+            # 退出本轮前（with 块收尾）必然等待全部 1h 落盘完成，保证对后续轮次与外部读取闭环。
+            with ThreadPoolExecutor(max_workers=max(1, len(flush_1h_fns)), thread_name_prefix="bg_1h_flush") as flush_exe:
+                flush_1h_futs = [flush_exe.submit(fn) for fn in flush_1h_fns]
                 try:
-                    chosen = choose_publication_inputs(
-                        handle,
-                        run_time,
-                        ws_binance_result,
-                        None,
-                        binance_done=True,
-                        data_api_done=data_api_done,
-                        confirmed_empty=ws_confirmed_empty,
+                    ws_binance_result = (
+                        ({}, {}, result.spot_begin_ts or {}, result.swap_begin_ts or {})
+                        if result.is_binance_success
+                        else None
                     )
-                except ValueError as error:
-                    result.errs.append(str(error))
-                    chosen = None
-                    published = True
+                    ws_confirmed_empty = rest_state.get("confirmed_empty") if rest_state else None
+                    data_api_done = task_data_api is None
+                    data_api_result = None
+                    published = False
 
-                if chosen is not None:
-                    sources, spot_begin_ts, swap_begin_ts = chosen
-                    publication_handle = copy(handle)
-                    publication_handle.publication_sources = sources
-                    _invoke_preprocess(publication_handle, spot_begin_ts, swap_begin_ts)
-                    published = True
+                    rp_sig = inspect.signature(_run_preprocess)
+                    rp_supports_pool = (
+                        any(p.kind == inspect.Parameter.VAR_KEYWORD for p in rp_sig.parameters.values())
+                        or ("batch_executor" in rp_sig.parameters and "resample_tails" in rp_sig.parameters)
+                    )
 
-                if not published and task_data_api is not None:
-                    try:
-                        data_api_result = task_data_api.result()
-                    except Exception as error:
-                        logger.warning(f"DataAPI采集任务失败: {type(error).__name__}")
-                        data_api_result = None
-                    data_api_done = True
-                    result.is_data_api_success = data_api_result is not None
+                    def _invoke_preprocess(pub_handle, sp_bt, sw_bt):
+                        if rp_supports_pool:
+                            _run_preprocess(
+                                pub_handle,
+                                run_time,
+                                sp_bt,
+                                sw_bt,
+                                batch_executor=compute_pool,
+                                resample_tails=resample_tails or None,
+                            )
+                        else:
+                            _run_preprocess(pub_handle, run_time, sp_bt, sw_bt)
 
-                    try:
-                        chosen = choose_publication_inputs(
-                            handle,
-                            run_time,
-                            ws_binance_result,
-                            data_api_result,
-                            binance_done=True,
-                            data_api_done=True,
-                            confirmed_empty=ws_confirmed_empty,
-                        )
-                    except ValueError as error:
-                        result.errs.append(str(error))
-                        chosen = None
+                    if handle.preprocess_handle is not None:
+                        try:
+                            chosen = choose_publication_inputs(
+                                handle,
+                                run_time,
+                                ws_binance_result,
+                                None,
+                                binance_done=True,
+                                data_api_done=data_api_done,
+                                confirmed_empty=ws_confirmed_empty,
+                            )
+                        except ValueError as error:
+                            result.errs.append(str(error))
+                            chosen = None
+                            published = True
 
-                    if chosen is not None:
-                        sources, spot_begin_ts, swap_begin_ts = chosen
-                        publication_handle = copy(handle)
-                        publication_handle.publication_sources = sources
-                        _invoke_preprocess(publication_handle, spot_begin_ts, swap_begin_ts)
-                        published = True
+                        if chosen is not None:
+                            sources, spot_begin_ts, swap_begin_ts = chosen
+                            publication_handle = copy(handle)
+                            publication_handle.publication_sources = sources
+                            _invoke_preprocess(publication_handle, spot_begin_ts, swap_begin_ts)
+                            published = True
+
+                        if not published and task_data_api is not None:
+                            try:
+                                data_api_result = task_data_api.result()
+                            except Exception as error:
+                                logger.warning(f"DataAPI采集任务失败: {type(error).__name__}")
+                                data_api_result = None
+                            data_api_done = True
+                            result.is_data_api_success = data_api_result is not None
+
+                            try:
+                                chosen = choose_publication_inputs(
+                                    handle,
+                                    run_time,
+                                    ws_binance_result,
+                                    data_api_result,
+                                    binance_done=True,
+                                    data_api_done=True,
+                                    confirmed_empty=ws_confirmed_empty,
+                                )
+                            except ValueError as error:
+                                result.errs.append(str(error))
+                                chosen = None
+
+                            if chosen is not None:
+                                sources, spot_begin_ts, swap_begin_ts = chosen
+                                publication_handle = copy(handle)
+                                publication_handle.publication_sources = sources
+                                _invoke_preprocess(publication_handle, spot_begin_ts, swap_begin_ts)
+                                published = True
+                finally:
+                    for fut in flush_1h_futs:
+                        fut.result()
 
             if task_coin_cap is not None:
                 if not task_coin_cap.result():
