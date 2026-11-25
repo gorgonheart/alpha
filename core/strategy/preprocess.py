@@ -37,8 +37,13 @@ PIVOT_COLUMNS = ['candle_begin_time', 'symbol', 'open', 'close', 'avg_price_1m',
 
 
 def _release_memory() -> None:
-    """Explicitly reclaim cyclic garbage and return free arena pages on Linux."""
+    """Explicitly reclaim cyclic garbage, PyArrow pool buffers, and free arena pages on Linux."""
     gc.collect()
+    try:
+        import pyarrow as pa
+        pa.default_memory_pool().release_unused()
+    except Exception:
+        pass
     if sys.platform.startswith('linux'):
         try:
             ctypes.CDLL('libc.so.6').malloc_trim(0)
@@ -281,9 +286,9 @@ def apply_symbol_match(frame, trade_type, symbol, row):
 
 def gen_batch_data(handle: BmacHandle, run_time: datetime, trade_type: str, df_match: pd.DataFrame,
                    symbol_list: list[str], batch_name: str, with_factors: bool = False, *,
-                   funding_publication=None, year_pivot_out=None):
+                   funding_publication=None, year_pivot_out=None, defer_save: bool = False):
     if not symbol_list:
-        return None, dict(), dict()
+        return (None, dict(), dict(), None) if defer_save else (None, dict(), dict())
 
     symbol_list = sorted(symbol_list)
 
@@ -369,7 +374,13 @@ def gen_batch_data(handle: BmacHandle, run_time: datetime, trade_type: str, df_m
     # by the Arrow publish) below.
     if start_year is not None:
         invalidate_price_years(preprocess_mgr, trade_type, range(start_year, end_year + 1))
-    preprocess_mgr.set_candle(full_batch_name, run_time, market_dict)
+    raw_to_save = dict(market_dict)
+
+    def _save_raw_batch():
+        preprocess_mgr.set_candle(full_batch_name, run_time, raw_to_save)
+
+    if not defer_save:
+        _save_raw_batch()
 
     year_pivot_name = dict()
     run_utc = run_time.astimezone(timezone.utc)
@@ -406,6 +417,8 @@ def gen_batch_data(handle: BmacHandle, run_time: datetime, trade_type: str, df_m
                  f'数据源={dict(sources)}, 当前时间={now_time_str()}, '
                  f'耗时 {time_elapsed:.1f} 秒')
 
+    if defer_save:
+        return full_batch_name, year_pivot_name, market_dict, _save_raw_batch
     return full_batch_name, year_pivot_name, market_dict
 
 
@@ -466,6 +479,8 @@ def _try_tail_enrich_merge(
     old_rates = old_tail.set_index('candle_begin_time')['funding_fee']
     overlap = tail_incoming['candle_begin_time'].isin(old_rates.index)
     if overlap.any():
+        if pd.api.types.is_float_dtype(old_rates.dtype) and not pd.api.types.is_float_dtype(tail_incoming['funding_fee'].dtype):
+            tail_incoming['funding_fee'] = tail_incoming['funding_fee'].astype('float64')
         tail_incoming.loc[overlap, 'funding_fee'] = (
             tail_incoming.loc[overlap, 'candle_begin_time'].map(old_rates).to_numpy()
         )
@@ -500,7 +515,8 @@ def _try_tail_enrich_merge(
 
 def gen_batch_data_incremental(handle: BmacHandle, run_time: datetime, trade_type: str, df_match: pd.DataFrame,
                                symbol_list: list[str], batch_name: str, with_factors: bool = False, *,
-                               funding_publication=None, year_pivot_out=None, resample_tail_hints=None):
+                               funding_publication=None, year_pivot_out=None, resample_tail_hints=None,
+                               defer_save: bool = False):
     shorthand = isinstance(run_time, str)
     if shorthand:
         trade_type, run_time = run_time, trade_type
@@ -511,6 +527,8 @@ def gen_batch_data_incremental(handle: BmacHandle, run_time: datetime, trade_typ
             batch_name = 'batch1'
 
     if not symbol_list:
+        if defer_save:
+            return (dict(), None, dict(), None) if shorthand else (None, dict(), dict(), None)
         return (dict(), None, dict()) if shorthand else (None, dict(), dict())
 
     resample_interval = getattr(handle, 'resample_interval', '1h')
@@ -522,6 +540,13 @@ def gen_batch_data_incremental(handle: BmacHandle, run_time: datetime, trade_typ
         funding_publication = FundingPublication(preprocess_mgr.base_dir, run_time)
 
     if not preprocess_mgr.has_symbol(full_batch_name):
+        if defer_save:
+            fb, yp, md, save_fn = gen_batch_data(
+                handle, run_time, trade_type, df_match, symbol_list, batch_name,
+                with_factors=with_factors, funding_publication=funding_publication,
+                year_pivot_out=year_pivot_out, defer_save=True,
+            )
+            return (md, fb, yp, save_fn) if shorthand else (fb, yp, md, save_fn)
         fb, yp, md = gen_batch_data(handle, run_time, trade_type, df_match, symbol_list, batch_name,
                                     with_factors=with_factors, funding_publication=funding_publication,
                                     year_pivot_out=year_pivot_out)
@@ -580,7 +605,8 @@ def gen_batch_data_incremental(handle: BmacHandle, run_time: datetime, trade_typ
             if (
                 df_hint_tail is not None
                 and len(df_hint_tail) >= 2
-                and hint_first == df_old['candle_begin_time'].iloc[0]
+                and hint_first >= df_old['candle_begin_time'].iloc[0]
+                and hint_first <= df_hint_tail['candle_begin_time'].iloc[0]
             ):
                 anchor_ts = df_hint_tail['candle_begin_time'].iloc[0]
                 anchor_pos = int(df_old['candle_begin_time'].searchsorted(anchor_ts))
@@ -615,16 +641,23 @@ def gen_batch_data_incremental(handle: BmacHandle, run_time: datetime, trade_typ
         if df_candle_full.empty:
             continue
 
-        # Fast Path 2: 已读入磁盘 1h 全表，前缀 NumPy 快速校验一致时仅对尾部 ~16 根做 pandas 富集
+        # Fast Path 2: 已读入磁盘 1h 全表，对齐起始位置后前缀 NumPy 快速校验一致时仅对尾部 ~16 根做 pandas 富集
         if (
             df_old is not None
             and len(df_old) > _TAIL_FAST_OVERLAP_BARS + 2
-            and len(df_candle_full) >= len(df_old) - _TAIL_FAST_OVERLAP_BARS
         ):
             anchor_pos = len(df_old) - _TAIL_FAST_OVERLAP_BARS
-            if _frames_ohlcv_equal(df_old.iloc[:anchor_pos], df_candle_full.iloc[:anchor_pos]):
+            first_full_ts = df_candle_full['candle_begin_time'].iloc[0]
+            start_pos = int(df_old['candle_begin_time'].searchsorted(first_full_ts))
+            full_prefix_len = anchor_pos - start_pos
+            if (
+                0 <= start_pos < anchor_pos
+                and df_old['candle_begin_time'].iloc[start_pos] == first_full_ts
+                and len(df_candle_full) > full_prefix_len
+                and _frames_ohlcv_equal(df_old.iloc[start_pos:anchor_pos], df_candle_full.iloc[:full_prefix_len])
+            ):
                 fast_comb, fast_rev = _try_tail_enrich_merge(
-                    df_old, df_candle_full.iloc[anchor_pos:], anchor_pos, trade_type, symbol,
+                    df_old, df_candle_full.iloc[full_prefix_len:], anchor_pos, trade_type, symbol,
                     df_funding, origins.get(symbol), min_ts,
                 )
                 if fast_comb is not None:
@@ -640,7 +673,10 @@ def gen_batch_data_incremental(handle: BmacHandle, run_time: datetime, trade_typ
             # previously confirmed fees while replacing the price/volume overlap.
             old_rates = df_old.set_index('candle_begin_time')['funding_fee']
             overlap = incoming['candle_begin_time'].isin(old_rates.index)
-            incoming.loc[overlap, 'funding_fee'] = incoming.loc[overlap, 'candle_begin_time'].map(old_rates).to_numpy()
+            if overlap.any():
+                if pd.api.types.is_float_dtype(old_rates.dtype) and not pd.api.types.is_float_dtype(incoming['funding_fee'].dtype):
+                    incoming['funding_fee'] = incoming['funding_fee'].astype('float64')
+                incoming.loc[overlap, 'funding_fee'] = incoming.loc[overlap, 'candle_begin_time'].map(old_rates).to_numpy()
             keep = ~df_old['candle_begin_time'].isin(incoming['candle_begin_time'])
             combined = pd.concat([df_old.loc[keep], incoming], ignore_index=True)
             combined.sort_values('candle_begin_time', inplace=True, ignore_index=True)
@@ -681,7 +717,13 @@ def gen_batch_data_incremental(handle: BmacHandle, run_time: datetime, trade_typ
     # cycle and never read back as input, so they are embedded only into the returned
     # dict (consumed by the Arrow publish) below — not written to the batch pkl.
     invalidate_price_years(preprocess_mgr, trade_type, revised_years)
-    preprocess_mgr.set_candle(full_batch_name, run_time, new_market_dict)
+    raw_to_save = dict(new_market_dict)
+
+    def _save_raw_batch():
+        preprocess_mgr.set_candle(full_batch_name, run_time, raw_to_save)
+
+    if not defer_save:
+        _save_raw_batch()
 
     year_pivot_name = dict()
     if start_year is not None and end_year is not None:
@@ -710,6 +752,10 @@ def gen_batch_data_incremental(handle: BmacHandle, run_time: datetime, trade_typ
             for symbol, df in new_market_dict.items()
         }
 
+    if defer_save:
+        return (new_market_dict, full_batch_name, year_pivot_name, _save_raw_batch) if shorthand else (
+            full_batch_name, year_pivot_name, new_market_dict, _save_raw_batch
+        )
     if shorthand:
         return new_market_dict, full_batch_name, year_pivot_name
     return full_batch_name, year_pivot_name, new_market_dict
@@ -1027,32 +1073,45 @@ def _run_batch_worker_task(
     )
     year_pivot_slice: dict[int, dict[str, pd.DataFrame]] = {}
 
-    _fb, year_pivot_name, batch_market_dict = gen_batch_data_incremental(
+    _fb, year_pivot_name, batch_market_dict, save_raw_batch_fn = gen_batch_data_incremental(
         handle, run_time, trade_type, df_match, batch_symbols, batch_name,
         with_factors=False,
         funding_publication=funding_publication,
         year_pivot_out=year_pivot_slice,
         resample_tail_hints=resample_tail_hints,
+        defer_save=True,
     )
 
-    if factor_specs:
-        worker_fmp = []
-        for factor_name, param_list in factor_specs:
-            mod = _WORKER_FACTOR_MOD_CACHE.get(factor_name)
-            if mod is None:
-                mod = importlib.import_module(f'factors.{factor_name}')
-                _WORKER_FACTOR_MOD_CACHE[factor_name] = mod
-            worker_fmp.append((mod, factor_name, param_list))
-        batch_market_dict = {
-            sym: apply_precomputed_factors(df, worker_fmp)
-            for sym, df in batch_market_dict.items()
-        }
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix='batch_save') as save_pool:
+        save_fut = save_pool.submit(save_raw_batch_fn) if save_raw_batch_fn is not None else None
+        try:
+            if factor_specs:
+                worker_fmp = []
+                for factor_name, param_list in factor_specs:
+                    mod = _WORKER_FACTOR_MOD_CACHE.get(factor_name)
+                    if mod is None:
+                        mod = importlib.import_module(f'factors.{factor_name}')
+                        _WORKER_FACTOR_MOD_CACHE[factor_name] = mod
+                    worker_fmp.append((mod, factor_name, param_list))
+                batch_market_dict = {
+                    sym: apply_precomputed_factors(df, worker_fmp)
+                    for sym, df in batch_market_dict.items()
+                }
 
-    has_non_empty = any(not frame.empty for frame in batch_market_dict.values())
-    batch_origins = extract_ready_origins(batch_market_dict)
-    pub_depth = int(publish_kline_num or 0)
-    schema_bytes, ipc_items = serialize_market_dict_to_ipc_batches(batch_market_dict, pub_depth)
-    fpub_by_year = dict(funding_publication.by_year) if funding_publication is not None else {}
+            has_non_empty = any(not frame.empty for frame in batch_market_dict.values())
+            batch_origins = extract_ready_origins(batch_market_dict)
+            pub_depth = int(publish_kline_num or 0)
+            schema_bytes, ipc_items = serialize_market_dict_to_ipc_batches(batch_market_dict, pub_depth)
+            fpub_by_year = dict(funding_publication.by_year) if funding_publication is not None else {}
+        except BaseException:
+            if save_fut is not None:
+                try:
+                    save_fut.result()
+                except Exception:
+                    pass
+            raise
+        if save_fut is not None:
+            save_fut.result()
 
     del batch_market_dict
     _release_memory()

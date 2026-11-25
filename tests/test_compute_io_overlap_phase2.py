@@ -458,3 +458,216 @@ def test_compute_first_resample_defers_1h_disk_write_and_flushes_exact(tmp_path)
         assert r1_def.check_ready(s, rt2)
         pd.testing.assert_frame_equal(r1_def.read_candle(s), r1_ora.read_candle(s), check_exact=True)
 
+
+# ============================================================================
+# Task 3: Mature-Coin Head Offset Fast-Path, Async Batch Save & PyArrow Release
+# ============================================================================
+
+
+def test_mature_coin_with_earlier_batch_head_hits_both_tail_fast_paths_without_warnings(tmp_path, monkeypatch):
+    import warnings
+    from core.storage.candle_manager import CandleFileManager
+    from core.strategy import preprocess as pp
+    from core.strategy.funding_publication import FundingPublication
+
+    # Exact alphatest topology: batch.pkl starts 11h earlier (06:25) than 1h_resample (17:25)
+    times_full = pd.date_range("2025-04-16 06:25", periods=120, freq="h", tz="UTC")
+    rt1 = times_full[-1].to_pydatetime()
+    rt2 = (times_full[-1] + timedelta(hours=1)).to_pydatetime()
+    times_r2_all = pd.date_range("2025-04-16 06:25", periods=121, freq="h", tz="UTC")
+    times_r2_trimmed = times_r2_all[11:]  # Starts at 17:25 (110 bars vs 120 in df_old!)
+
+    syms = ["MATURE1USDT", "MATURE2USDT", "DEEPREV2USDT"]
+    raw_all = {}
+    for i, s in enumerate(syms):
+        p = 50.0 + i * 10.0 + np.arange(len(times_r2_all)) * 0.2
+        raw_all[s] = pd.DataFrame({
+            "candle_begin_time": times_r2_all,
+            "open": p, "high": p + 0.5, "low": p - 0.5, "close": p + 0.1,
+            "volume": 1000.0, "quote_volume": 1000.0 * p,
+            "trade_num": pd.Series([25] * len(times_r2_all), dtype="int64"),
+            "taker_buy_base_asset_volume": 500.0, "taker_buy_quote_asset_volume": 500.0 * p,
+        })
+
+    def _mk_side(sub: str):
+        root = tmp_path / sub
+        res_mgr = CandleFileManager(root / "res" / "25m", "pickle")
+        pre_mgr = CandleFileManager(root / "pre" / "25m", "pickle")
+        f_mgr = CandleFileManager(root / "funding", "pickle")
+        for m in (res_mgr, pre_mgr, f_mgr):
+            m.base_dir.mkdir(parents=True)
+        h = SimpleNamespace(
+            resample_interval="1h",
+            fetch_funding_rate=True,
+            data_api=None,
+            history_trim_ts=lambda: None,
+            funding_mgr=f_mgr,
+            preprocess_handle=SimpleNamespace(preprocess_mgr_map={"25m": pre_mgr}),
+            get_market_handle=lambda _: SimpleNamespace(resample_mgr_map={"25m": res_mgr}),
+        )
+        # Round 1: seed full 120 bars (starting at 06:25) with float64 funding_fee in batch1.pkl
+        for s in syms:
+            res_mgr.set_candle(s, rt1, raw_all[s].iloc[:-1].reset_index(drop=True))
+            f_mgr.set_candle(s, rt1, pd.DataFrame({
+                "candle_begin_time": [times_r2_all[-5].floor("h")],
+                "funding_rate": [-0.00012],
+            }))
+        m1 = pd.DataFrame([
+            {"spot": s, "swap": s, "first_begin_time": times_full[0], "last_begin_time": times_full[-1]}
+            for s in syms
+        ])
+        pp.gen_batch_data_incremental(h, rt1, "swap", m1, syms, "batch1")
+        pre_mgr.save_ready("market_pivot_swap", rt1)
+        # Simulate missing/empty funding on Round 2 to verify no FutureWarning on float64 funding_fee!
+        for s in syms:
+            f_mgr.remove_symbol(s)
+        return h, res_mgr, pre_mgr
+
+    h_fast, res_fast, pre_fast = _mk_side("fast")
+    h_ora, res_ora, pre_ora = _mk_side("ora")
+
+    # Round 2: 1h_resample only has [17:25 .. latest] (11h shorter head than batch1.pkl!)
+    # - MATURE1USDT: passed via resample_tail_hints -> MUST hit Fast Path 1 (zero 1h disk read!)
+    # - MATURE2USDT: no hint -> reads disk 1h_resample -> MUST hit Fast Path 2 (enrich <= 20 rows, NOT 110 rows!)
+    # - DEEPREV2USDT: no hint + historical revision at bar 20 -> MUST fallback to full enrich (110 rows)
+    rev_r2 = raw_all["DEEPREV2USDT"].iloc[11:].reset_index(drop=True).copy()
+    rev_r2.loc[20, "close"] += 9.99
+
+    for res_m in (res_fast, res_ora):
+        res_m.set_candle("MATURE1USDT", rt2, raw_all["MATURE1USDT"].iloc[11:].reset_index(drop=True))
+        res_m.set_candle("MATURE2USDT", rt2, raw_all["MATURE2USDT"].iloc[11:].reset_index(drop=True))
+        res_m.set_candle("DEEPREV2USDT", rt2, rev_r2.copy())
+
+    m2 = pd.DataFrame([
+        {"spot": s, "swap": s, "first_begin_time": times_r2_trimmed[0], "last_begin_time": times_r2_trimmed[-1]}
+        for s in syms
+    ])
+
+    # Run baseline oracle (force full path by disabling tail overlap bars and passing no hints)
+    monkeypatch.setattr(pp, "_TAIL_FAST_OVERLAP_BARS", 999999)
+    pp.gen_batch_data_incremental(h_ora, rt2, "swap", m2, syms, "batch1")
+    monkeypatch.setattr(pp, "_TAIL_FAST_OVERLAP_BARS", 16)
+
+    # Guard MATURE1USDT against disk read AND record enrich lengths on h_fast!
+    orig_read = res_fast.read_candle
+    monkeypatch.setattr(
+        res_fast, "read_candle",
+        lambda s: (_ for _ in ()).throw(AssertionError("MATURE1USDT must hit Fast Path 1 without reading disk!"))
+        if s == "MATURE1USDT" else orig_read(s),
+    )
+    enrich_lens = {}
+    orig_add_cols = pp.add_additional_cols
+
+    def spy_add_cols(df, tt, sym, *a, **kw):
+        enrich_lens[sym] = len(df)
+        return orig_add_cols(df, tt, sym, *a, **kw)
+
+    monkeypatch.setattr(pp, "add_additional_cols", spy_add_cols)
+
+    hints = {
+        "MATURE1USDT": (
+            times_r2_trimmed[0],
+            times_r2_trimmed[-1],
+            raw_all["MATURE1USDT"].tail(12).reset_index(drop=True),
+        )
+    }
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        pp.gen_batch_data_incremental(h_fast, rt2, "swap", m2, syms, "batch1", resample_tail_hints=hints)
+
+    future_warns = [w for w in caught if issubclass(w.category, FutureWarning)]
+    assert future_warns == [], f"Unexpected FutureWarnings: {future_warns}"
+    assert enrich_lens["MATURE1USDT"] == 12
+    assert enrich_lens["MATURE2USDT"] == 17  # 16 overlap + 1 new bar (NOT 110!)
+    assert enrich_lens["DEEPREV2USDT"] == len(times_r2_trimmed)
+
+    b_fast = pre_fast.read_candle("swap_dict_batch1")
+    b_ora = pre_ora.read_candle("swap_dict_batch1")
+    for s in syms:
+        pd.testing.assert_frame_equal(b_fast[s], b_ora[s], check_exact=True)
+
+
+def test_batch_worker_overlaps_raw_batch_save_with_factor_compute_and_propagates_io_error(tmp_path, monkeypatch):
+    from threading import Barrier
+    from core.storage.candle_manager import CandleFileManager
+    from core.strategy import preprocess as pp
+
+    times = pd.date_range("2026-11-20 00:25", periods=40, freq="h", tz="UTC")
+    rt = times[-1].to_pydatetime()
+    res_mgr = CandleFileManager(tmp_path / "res" / "25m", "pickle")
+    pre_mgr = CandleFileManager(tmp_path / "pre" / "25m", "pickle")
+    res_mgr.base_dir.mkdir(parents=True)
+    pre_mgr.base_dir.mkdir(parents=True)
+
+    df_in = pd.DataFrame({
+        "candle_begin_time": times,
+        "open": 10.0, "high": 11.0, "low": 9.0, "close": 10.5,
+        "volume": 100.0, "quote_volume": 1050.0,
+        "trade_num": pd.Series([5] * len(times), dtype="int64"),
+        "taker_buy_base_asset_volume": 50.0, "taker_buy_quote_asset_volume": 525.0,
+    })
+    res_mgr.set_candle("AAAUSDT", rt, df_in)
+    df_match = pd.DataFrame([{"spot": "AAAUSDT", "swap": "AAAUSDT", "first_begin_time": times[0], "last_begin_time": times[-1]}])
+
+    h = SimpleNamespace(
+        resample_interval="1h",
+        fetch_funding_rate=False,
+        data_api=None,
+        history_trim_ts=lambda: None,
+        preprocess_handle=SimpleNamespace(preprocess_mgr_map={"25m": pre_mgr}),
+        get_market_handle=lambda _: SimpleNamespace(resample_mgr_map={"25m": res_mgr}),
+    )
+
+    # 1) Barrier(2) between set_candle('spot_dict_batch1') and apply_precomputed_factors proves TRUE concurrency!
+    overlap_barrier = Barrier(2)
+    orig_set_candle = pre_mgr.set_candle
+    orig_apply_factors = pp.apply_precomputed_factors
+
+    def synced_set_candle(sym, r_time, obj):
+        if sym == "spot_dict_batch1":
+            overlap_barrier.wait(timeout=3.0)
+        return orig_set_candle(sym, r_time, obj)
+
+    def synced_apply_factors(df, fmp):
+        overlap_barrier.wait(timeout=3.0)
+        return orig_apply_factors(df, fmp)
+
+    monkeypatch.setattr(pre_mgr, "set_candle", synced_set_candle)
+    monkeypatch.setattr(pp, "apply_precomputed_factors", synced_apply_factors)
+
+    out = pp._run_batch_worker_task(
+        h, rt, "spot", df_match, ["AAAUSDT"], "batch1", [("CciV3", [24])], 20, None
+    )
+    assert out[6] is True  # has_non_empty
+    assert pre_mgr.has_symbol("spot_dict_batch1")
+
+    # 2) Verify background set_candle IO failure is NOT swallowed — it must raise before worker returns!
+    monkeypatch.setattr(pp, "apply_precomputed_factors", orig_apply_factors)
+
+    def failing_set_candle(sym, r_time, obj):
+        if sym == "spot_dict_batch1":
+            raise OSError("simulated disk write failure")
+        return orig_set_candle(sym, r_time, obj)
+
+    monkeypatch.setattr(pre_mgr, "set_candle", failing_set_candle)
+    with pytest.raises(OSError, match="simulated disk write failure"):
+        pp._run_batch_worker_task(
+            h, rt, "spot", df_match, ["AAAUSDT"], "batch1", [("CciV3", [24])], 20, None
+        )
+
+
+def test_release_memory_releases_pyarrow_unused_pool(monkeypatch):
+    import pyarrow as pa
+    from core.strategy import preprocess as pp
+
+    called = []
+
+    class FakePool:
+        def release_unused(self):
+            called.append(True)
+
+    monkeypatch.setattr(pa, "default_memory_pool", lambda: FakePool())
+    pp._release_memory()
+    assert called == [True]
+
+
