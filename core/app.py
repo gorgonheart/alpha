@@ -20,7 +20,7 @@ from core.handle import BmacHandle, debug_handle
 from core.history_data.history import run_download_all_history_with_backfill
 from core.pipeline.backfill import maybe_backfill
 from core.pipeline.data_update import update_meta
-from core.pipeline.resample import resample_history
+from core.pipeline.resample import merge_resample_bounds_cache, resample_history
 from core.pipeline.runtime_supervisor import RuntimeSupervisor
 from core.pipeline.update_cycle import (
     _fetch_wake_time,
@@ -155,8 +155,12 @@ def init_history(handle: BmacHandle, cfg=None):
             resample_history, handle, "swap", run_time, full_backfill_symbols=swap_backfill
         )
 
-        resample_swap_task.result()
-        resample_spot_task.result()
+        swap_bounds = resample_swap_task.result()
+        spot_bounds = resample_spot_task.result()
+        if isinstance(swap_bounds, dict):
+            merge_resample_bounds_cache(swap_bounds)
+        if isinstance(spot_bounds, dict):
+            merge_resample_bounds_cache(spot_bounds)
 
     if handle.data_api is not None:
         copy_data_api_candles(handle)  # 复制一份给 Quantclass Data API

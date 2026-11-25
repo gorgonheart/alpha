@@ -354,7 +354,8 @@ class RecentDownloader(Downloader):
             )
             not_enough = df_new.empty
         else:
-            start_ts = int(info.last_begin_time.timestamp()) * 1000
+            base_delta = convert_interval_to_timedelta(self.handle.base_interval)
+            start_ts = int((info.last_begin_time + base_delta).timestamp()) * 1000
             df_new = await self.fetcher.get_candle(
                 symbol, self.handle.base_interval, limit=once_candles, startTime=start_ts
             )
@@ -424,12 +425,22 @@ async def download_recent_until_runtime(
     candle_infos: dict[str, CandleInfo],
 ):
     market_handle = _get_market_handle(handle, trade_type)
+    base_delta = convert_interval_to_timedelta(handle.base_interval)
+    pending_infos: dict[str, CandleInfo] = {
+        symbol: info
+        for symbol, info in candle_infos.items()
+        if info.is_empty or info.last_begin_time is None or (info.last_begin_time + base_delta < run_time)
+    }
 
     logger.info(
         f"{trade_type} 初始化历史 K线, 阶段 2, 补全 {handle.base_interval} 最新数据, "
-        f"交易对数量={len(candle_infos)}, "
+        f"交易对数量={len(pending_infos)}/{len(candle_infos)}, "
         f"当前时间={now_time_str()}"
     )
+
+    if not pending_infos:
+        logger.ok(f"{trade_type} 初始化历史 K线, 阶段 2 无需补拉，当前时间={now_time_str()}")
+        return candle_infos
 
     t_start = time.perf_counter()
 
@@ -437,7 +448,8 @@ async def download_recent_until_runtime(
         fetcher = create_fetcher(handle, trade_type, session)
         _enable_fail_fast_on_rate_limit(fetcher)
         downloader = RecentDownloader(handle, market_handle, fetcher, trade_type, run_time)
-        candle_infos = await downloader.run_download(candle_infos)
+        updated = await downloader.run_download(pending_infos)
+        candle_infos.update(updated)
 
     time_elapsed = (time.perf_counter() - t_start) / 60
 
@@ -577,6 +589,101 @@ def verify_exist_history(
     return candle_infos
 
 
+def _sync_ws_authority_to_tsmanager(
+    handle: BmacHandle,
+    trade_type: str,
+    run_time: datetime,
+    symbols: list[str],
+) -> dict[str, pd.DataFrame]:
+    """将本地 ws_cache（48h WAL）与 flat_pkl（_source=='ws'）中的权威闭合 K 线同步回灌到 TSManager：
+    - 对 TSManager 现有连续段及 <= ts_last 的历史段立即覆盖更新，修复关停尾棒并保证分区与 WS 同源；
+    - 若存在停机断档后的孤立 WS 尾棒，暂存至 post_gap_ws，待阶段 2 填补断档后再覆盖还原。
+    """
+    from core.ws.ws_local_cache import read_ws_cache_market_windows
+
+    market_handle = _get_market_handle(handle, trade_type)
+    base_candle_dir = Path(market_handle.base_candle_dir)
+    if not symbols or not base_candle_dir.exists():
+        return {}
+
+    base_delta = convert_interval_to_timedelta(handle.base_interval)
+    root_dir = getattr(handle, "base_dir", None)
+    ws_cache_map: dict[str, pd.DataFrame] = {}
+    if root_dir is not None:
+        ws_db = Path(root_dir) / "ws_cache" / f"{trade_type}.sqlite"
+        if ws_db.exists():
+            end_excl_ms = int(run_time.timestamp() * 1000)
+            start_ms = end_excl_ms - int(timedelta(hours=50).total_seconds() * 1000)
+            ws_cache_map = read_ws_cache_market_windows(ws_db, trade_type, symbols, start_ms, end_excl_ms)
+
+    post_gap_ws: dict[str, pd.DataFrame] = {}
+    for symbol in symbols:
+        parts: list[pd.DataFrame] = []
+        flat_path = base_candle_dir / f"{symbol}.pkl"
+        if flat_path.exists():
+            try:
+                df_flat = pd.read_pickle(flat_path)
+            except Exception:
+                df_flat = None
+            if (
+                isinstance(df_flat, pd.DataFrame)
+                and not df_flat.empty
+                and "_source" in df_flat.columns
+                and "candle_begin_time" in df_flat.columns
+            ):
+                df_f_ws = df_flat[(df_flat["_source"] == "ws") & (df_flat["candle_begin_time"] < run_time)]
+                if not df_f_ws.empty:
+                    parts.append(df_f_ws.drop(columns=["_source"]))
+
+        df_c_ws = ws_cache_map.get(symbol)
+        if df_c_ws is not None and not df_c_ws.empty:
+            df_c_ws = df_c_ws[df_c_ws["candle_begin_time"] < run_time]
+            if not df_c_ws.empty:
+                parts.append(df_c_ws)
+
+        if not parts:
+            continue
+
+        df_ws = (
+            pd.concat(parts, ignore_index=True)
+            .drop_duplicates(subset="candle_begin_time", keep="last")
+            .sort_values("candle_begin_time", ignore_index=True)
+            if len(parts) > 1
+            else parts[0].drop_duplicates(subset="candle_begin_time", keep="last").sort_values("candle_begin_time", ignore_index=True)
+        )
+        if df_ws.empty:
+            continue
+
+        sym_dir = base_candle_dir / symbol
+        ts_mgr = TSManager(sym_dir)
+        partitions = ts_mgr.list_partitions() if sym_dir.exists() else []
+        if not partitions:
+            post_gap_ws[symbol] = df_ws
+            continue
+
+        last_part = ts_mgr.read_partition(partitions[-1])
+        if last_part is None or last_part.empty or "candle_begin_time" not in last_part.columns:
+            post_gap_ws[symbol] = df_ws
+            continue
+
+        cur_end = last_part["candle_begin_time"].max()
+        for ts in df_ws.loc[df_ws["candle_begin_time"] > cur_end, "candle_begin_time"]:
+            if ts - cur_end <= base_delta:
+                cur_end = ts
+            else:
+                break
+
+        df_pre = df_ws[df_ws["candle_begin_time"] <= cur_end]
+        if not df_pre.empty:
+            ts_mgr.update(df_pre)
+
+        df_post = df_ws[df_ws["candle_begin_time"] > cur_end]
+        if not df_post.empty:
+            post_gap_ws[symbol] = df_post
+
+    return post_gap_ws
+
+
 def init_history_candles(
     handle: BmacHandle,
     trade_type: str,
@@ -589,13 +696,23 @@ def init_history_candles(
     else:
         full_backfill_symbols = set(full_backfill_symbols)
 
+    # 阶段0: 先将本地权威闭合 WS K 线回灌至 TSManager，消除关停尾差与无缺口重启的假修订
+    post_gap_ws = _sync_ws_authority_to_tsmanager(handle, trade_type, run_time, symbols)
+
     # 阶段1: 校验已保存的 K线数据，并清除过时的 K线（常规 symbol 裁回 30 天）
     candle_infos = verify_exist_history(
         handle, trade_type, run_time, symbols, full_backfill_symbols=full_backfill_symbols
     )
 
-    # 阶段2: 向现在补全最新的 K线, 直到 run_time
+    # 阶段2: 向现在补全缺失的 K 线（仅对存在缺口的 symbol 请求严格开区间 (last_begin_time, run_time)）
     candle_infos = asyncio.run(download_recent_until_runtime(handle, trade_type, run_time, candle_infos))
+
+    if post_gap_ws:
+        base_candle_dir = Path(_get_market_handle(handle, trade_type).base_candle_dir)
+        for sym, df_post in post_gap_ws.items():
+            sym_dir = base_candle_dir / sym
+            if sym_dir.exists():
+                TSManager(sym_dir).update(df_post)
 
     # 阶段3: 向过去补全基础 K 线（常规 30 天，自愈 symbol 按 effective_kline_count_1h 下满）
     asyncio.run(

@@ -866,5 +866,251 @@ def test_ws_cache_index_and_symbol_subset_query_avoid_full_table_scan(tmp_path):
     cache.close()
 
 
+# ============================================================================
+# P1: Zero-Revision Restart (WS Authority Sync + Open-Interval Gap Fill)
+# ============================================================================
+
+
+def test_rolling_restart_syncs_ws_authority_makes_zero_rest_calls_and_preserves_1h_exact(tmp_path, monkeypatch):
+    from core.history_data import candle as c_mod
+    from core.pipeline.resample import merge_resample_bounds_cache, resample_history, _get_cached_resample_bounds
+    from core.storage.candle_manager import CandleFileManager
+    from core.storage.ts_manager import TSManager
+    from core.ws.ws_local_cache import WsLocalCache
+
+    root = tmp_path / "data"
+    b5 = root / "binance_swap_5m"
+    r1_dir = root / "binance_swap_1h_resample" / "25m"
+    exg_dir = root / "exg"
+    b5.mkdir(parents=True)
+    r1_dir.mkdir(parents=True)
+    exg_dir.mkdir(parents=True)
+
+    res_mgr = CandleFileManager(r1_dir, "pickle")
+    exg_mgr = CandleFileManager(exg_dir, "pickle")
+    exg_mgr.save_data_file("exginfo_swap", pd.DataFrame({"symbol": ["BTCUSDT"]}))
+
+    # Seed 32 days of 5m history up to 02:55 UTC (run_time = 03:00 UTC, like 10:57:53 CST restart!)
+    run_time = datetime(2026, 11, 25, 3, 0, tzinfo=timezone.utc)
+    t_5m = pd.date_range(end=run_time - timedelta(minutes=5), periods=31 * 288, freq="5min", tz="UTC")
+    df_ws_true = pd.DataFrame({
+        "candle_begin_time": t_5m,
+        "open": 100.0, "high": 102.0, "low": 99.0, "close": 101.0,
+        "volume": 10.0, "quote_volume": 1010.0,
+        "trade_num": pd.Series([5] * len(t_5m), dtype="int64"),
+        "taker_buy_base_asset_volume": 5.0, "taker_buy_quote_asset_volume": 505.0,
+    })
+
+    # Simulate pre-restart state:
+    # 1) 1h_resample/25m was cleanly built from WS up to 02:25 (last closed 1h bar = 01:25 -> 02:25!)
+    from core.pipeline.resample import calc_resample, fill_gaps
+    df_1h_before = fill_gaps(
+        calc_resample(df_ws_true[df_ws_true["candle_begin_time"] < datetime(2026, 11, 25, 2, 25, tzinfo=timezone.utc)], "1h", "25m", t_5m[0].to_pydatetime()),
+        timedelta(hours=1),
+    )
+    res_mgr.set_candle("BTCUSDT", datetime(2026, 11, 25, 2, 25, tzinfo=timezone.utc), df_1h_before)
+    finalized_before = res_mgr.read_candle("BTCUSDT").copy()
+
+    # 2) TSManager had TWO real-world hazards:
+    #    a) 5 hours ago, an old REST row (close=999.9) was in TSManager while flat_pkl/ws_cache had true WS (101.0)
+    #    b) The very last shutdown bar (02:55) had landed in ws_cache, NOT yet written to TSManager!
+    df_ts_dirty = df_ws_true.iloc[:-1].copy()
+    df_ts_dirty.iloc[-60, df_ts_dirty.columns.get_loc("close")] = 999.9
+    ts_mgr = TSManager(b5 / "BTCUSDT")
+    ts_mgr.update(df_ts_dirty)
+
+    # 3) ws_cache has the last 120 closed WS bars (including true 101.0 5h ago AND the 02:55 shutdown bar!)
+    ws_cache = WsLocalCache(root / "ws_cache" / "swap.sqlite")
+    for row in df_ws_true.tail(120).itertuples(index=False):
+        ws_cache.write("BTCUSDT", "swap", {
+            "begin_time_ms": int(row.candle_begin_time.timestamp() * 1000),
+            "open": float(row.open), "high": float(row.high), "low": float(row.low), "close": float(row.close),
+            "volume": float(row.volume), "quote_volume": float(row.quote_volume), "trade_num": int(row.trade_num),
+            "taker_buy_base": float(row.taker_buy_base_asset_volume), "taker_buy_quote": float(row.taker_buy_quote_asset_volume),
+        })
+    ws_cache.close()
+
+    # Spy fetcher: if Stage 2 calls REST at all, fail / poison with 777.7!
+    rest_calls = []
+
+    class PoisonFetcher:
+        def batch_size(self):
+            return 80
+        def once_candles(self):
+            return 99
+        async def acquire(self, n):
+            pass
+        async def get_candle(self, symbol, interval, limit=99, **kw):
+            rest_calls.append((symbol, kw))
+            poison = df_ws_true.tail(5).copy()
+            poison["close"] = 777.7
+            return poison
+
+    monkeypatch.setattr(c_mod, "create_fetcher", lambda *a, **kw: PoisonFetcher())
+
+    h = SimpleNamespace(
+        base_dir=root,
+        base_interval="5m",
+        resample_interval="1h",
+        enabled_hour_offsets=("25m",),
+        base_5m_retention_days=30,
+        base_5m_retention_bars=lambda: 30 * 288,
+        http_timeout_sec=5,
+        history_trim_ts=lambda: None,
+        effective_kline_count_1h=lambda tt, rt: 15000,
+        exg_mgr=exg_mgr,
+        get_market_handle=lambda _: SimpleNamespace(base_candle_dir=b5, resample_mgr_map={"25m": res_mgr}, once_update_candles=99),
+    )
+
+    bf = c_mod.init_history_candles(h, "swap", run_time, ["BTCUSDT"])
+    assert bf == set()
+    # Zero REST requests during rolling gap-free restart!
+    assert rest_calls == []
+
+    # TSManager must now contain the 02:55 bar AND the repaired 101.0 WS value from 5h ago!
+    ts_after = ts_mgr.read_all()
+    assert ts_after["candle_begin_time"].max() == pd.Timestamp("2026-11-25 02:55", tz="UTC")
+    assert (ts_after.tail(100)["close"] == 101.0).all()
+
+    bounds_out = resample_history(h, "swap", run_time, full_backfill_symbols=bf)
+    if isinstance(bounds_out, dict):
+        merge_resample_bounds_cache(bounds_out)
+
+    # All finalized 1h bars (<= 01:25) in 1h_resample/25m MUST be 100% bit-for-bit identical (ZERO replay!)
+    after_1h = res_mgr.read_candle("BTCUSDT")
+    after_finalized = after_1h[after_1h["candle_begin_time"] <= finalized_before["candle_begin_time"].max()]
+    pd.testing.assert_frame_equal(after_finalized.reset_index(drop=True), finalized_before.reset_index(drop=True), check_exact=True)
+    # And bounds cache must be pre-warmed for immediate deferred resample on Cycle 1!
+    assert _get_cached_resample_bounds(res_mgr, "BTCUSDT") is not None
+
+
+def test_outage_restart_fetches_strictly_after_last_ws_bar_without_overwriting_pre_outage(tmp_path, monkeypatch):
+    from core.history_data import candle as c_mod
+    from core.storage.candle_manager import CandleFileManager
+    from core.storage.ts_manager import TSManager
+
+    root = tmp_path / "data"
+    b5 = root / "binance_swap_5m"
+    r1_dir = root / "binance_swap_1h_resample" / "25m"
+    b5.mkdir(parents=True)
+    r1_dir.mkdir(parents=True)
+    res_mgr = CandleFileManager(r1_dir, "pickle")
+
+    # Simulate 25-minute outage: last known WS bar is 01:55, restart run_time is 02:25 (missing 02:00..02:20!)
+    run_time = datetime(2026, 11, 25, 2, 25, tzinfo=timezone.utc)
+    t_pre = pd.date_range(end=datetime(2026, 11, 25, 1, 55, tzinfo=timezone.utc), periods=31 * 288, freq="5min", tz="UTC")
+    df_pre = pd.DataFrame({
+        "candle_begin_time": t_pre,
+        "open": 50.0, "high": 51.0, "low": 49.0, "close": 50.5,
+        "volume": 10.0, "quote_volume": 505.0,
+        "trade_num": pd.Series([3] * len(t_pre), dtype="int64"),
+        "taker_buy_base_asset_volume": 5.0, "taker_buy_quote_asset_volume": 252.5,
+    })
+    TSManager(b5 / "ETHUSDT").update(df_pre)
+    res_mgr.save_data_file("ETHUSDT", pd.DataFrame({
+        "candle_begin_time": pd.to_datetime(["2026-11-25 00:25"], utc=True),
+        "open": [50.0], "high": [51.0], "low": [49.0], "close": [50.5],
+        "volume": [120.0], "quote_volume": [6060.0], "trade_num": [36],
+        "taker_buy_base_asset_volume": [60.0], "taker_buy_quote_asset_volume": [3030.0],
+    }))
+
+    seen_start_ms = []
+
+    class OutageFetcher:
+        def batch_size(self):
+            return 80
+        def once_candles(self):
+            return 99
+        async def acquire(self, n):
+            pass
+        async def get_candle(self, symbol, interval, limit=99, startTime=None, **kw):
+            seen_start_ms.append(startTime)
+            # Even if exchange would return a different value at 01:55, startTime MUST be 02:00!
+            t_gap = pd.date_range("2026-11-25 02:00", "2026-11-25 02:20", freq="5min", tz="UTC")
+            return pd.DataFrame({
+                "candle_begin_time": t_gap,
+                "open": 88.0, "high": 89.0, "low": 87.0, "close": 88.5,
+                "volume": 20.0, "quote_volume": 1770.0,
+                "trade_num": pd.Series([9] * len(t_gap), dtype="int64"),
+                "taker_buy_base_asset_volume": 10.0, "taker_buy_quote_asset_volume": 885.0,
+            })
+
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def dummy_session(*a, **kw):
+        yield object()
+
+    monkeypatch.setattr(c_mod, "create_aiohttp_session", dummy_session)
+    monkeypatch.setattr(c_mod, "create_fetcher", lambda *a, **kw: OutageFetcher())
+    h = SimpleNamespace(
+        base_dir=root, base_interval="5m", resample_interval="1h",
+        enabled_hour_offsets=("25m",), base_5m_retention_days=30,
+        base_5m_retention_bars=lambda: 30 * 288, http_timeout_sec=5,
+        get_market_handle=lambda _: SimpleNamespace(base_candle_dir=b5, resample_mgr_map={"25m": res_mgr}, once_update_candles=99),
+    )
+    c_mod.init_history_candles(h, "swap", run_time, ["ETHUSDT"])
+
+    expected_0200_ms = int(datetime(2026, 11, 25, 2, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    assert seen_start_ms == [expected_0200_ms]
+    ts_all = TSManager(b5 / "ETHUSDT").read_all()
+    assert ts_all.loc[ts_all["candle_begin_time"] == pd.Timestamp("2026-11-25 01:55", tz="UTC"), "close"].iloc[0] == 50.5
+    assert ts_all.loc[ts_all["candle_begin_time"] == pd.Timestamp("2026-11-25 02:20", tz="UTC"), "close"].iloc[0] == 88.5
+
+
+def test_run_startup_catchup_skips_covered_ws_symbols_and_fetches_only_missed(tmp_path, monkeypatch):
+    from core.pipeline import update_cycle as uc
+    from core.storage.candle_manager import CandleFileManager
+    from core.ws.ws_local_cache import WsLocalCache
+
+    root = tmp_path / "data"
+    sp_dir = root / "spot_5m"
+    sw_dir = root / "swap_5m"
+    exg_dir = root / "exg"
+    for d in (sp_dir, sw_dir, exg_dir, sp_dir / "BTCUSDT", sw_dir / "BTCUSDT"):
+        d.mkdir(parents=True)
+
+    exg_mgr = CandleFileManager(exg_dir, "pickle")
+    exg_mgr.save_data_file("exginfo_spot", pd.DataFrame({"symbol": ["BTCUSDT"]}))
+    exg_mgr.save_data_file("exginfo_swap", pd.DataFrame({"symbol": ["BTCUSDT", "MISSUSDT"]}))
+
+    rt = datetime(2026, 11, 25, 3, 5, tzinfo=timezone.utc)
+    target_ms = int((rt - timedelta(minutes=5)).timestamp() * 1000)
+    prev_ms = target_ms - 300_000
+
+    for tt in ("spot", "swap"):
+        c = WsLocalCache(root / "ws_cache" / f"{tt}.sqlite")
+        for ms in (prev_ms, target_ms):
+            c.write("BTCUSDT", tt, {
+                "begin_time_ms": ms, "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0,
+                "volume": 1.0, "quote_volume": 1.0, "trade_num": 1, "taker_buy_base": 0.5, "taker_buy_quote": 0.5,
+            })
+        c.close()
+
+    monkeypatch.setattr(uc, "next_run_time", lambda _: rt + timedelta(minutes=5))
+    fetch_calls = []
+
+    def fake_fetch(handle, r_time, resample_inline=False, symbols_subset=None, symbol_limits=None):
+        fetch_calls.append((symbols_subset, symbol_limits))
+        df_miss = pd.DataFrame({"candle_begin_time": pd.to_datetime(["2026-11-25 03:00"], utc=True), "close": [2.0]})
+        return {}, {"MISSUSDT": df_miss}, {}, {}
+
+    monkeypatch.setattr(uc, "fetch_update_binance_candles", fake_fetch)
+    routed = []
+    router = SimpleNamespace(put=lambda item: routed.append(item["symbol"]))
+    h = SimpleNamespace(
+        base_dir=root, base_interval="5m", exg_mgr=exg_mgr,
+        get_market_handle=lambda tt: SimpleNamespace(base_candle_dir=sp_dir if tt == "spot" else sw_dir, once_update_candles=99),
+    )
+
+    assert uc.run_startup_catchup(h, router, settle_sec=0.0) is True
+    assert len(fetch_calls) == 1
+    subset_arg, limits_arg = fetch_calls[0]
+    assert subset_arg == {"spot": set(), "swap": {"MISSUSDT"}}
+    assert limits_arg["swap"]["MISSUSDT"] == 5
+    assert routed == ["MISSUSDT"]
+
+
+
 
 

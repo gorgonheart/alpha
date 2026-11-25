@@ -155,7 +155,11 @@ def _compute_missed_and_gaps(
             continue
         if reader.check_ws_ready(sym, run_time):
             continue
-        if sym in ws_ready_contig and (sym in ws_full_contig or reader.has_symbol(sym)):
+        if sym in ws_ready_contig and (
+            sym in ws_full_contig
+            or reader.has_symbol(sym)
+            or (Path(bh.base_candle_dir) / sym).is_dir()
+        ):
             continue
         missed.add(sym)
     return missed, gap_symbols
@@ -216,14 +220,38 @@ def _submit_rest_dfs(
 
 
 def run_startup_catchup(handle: BmacHandle, router, settle_sec: float = 5.0) -> bool:
-    """WS 启动后、进入主循环前，同步全量 REST 一次，补齐"历史下载截止 → WS 订阅生效"的启动缺口。"""
+    """WS 启动后、进入主循环前，按需补齐"历史下载截止 → WS 订阅生效"期间确实缺失的 symbol，
+    避免对 ws_cache/磁盘已完整覆盖的交易对发起无谓全量 REST 覆盖。
+    """
     time.sleep(settle_sec)
     base_delta = convert_interval_to_timedelta(handle.base_interval)
     run_time = next_run_time(handle.base_interval) - base_delta
-    logger.info(f"启动补齐: 全量 REST 拉取 base K, run_time={run_time}")
     t0 = time.monotonic()
     try:
-        result = fetch_update_binance_candles(handle, run_time, resample_inline=False)
+        spot_missed, spot_gaps = _compute_missed_and_gaps(handle, "spot", run_time)
+        swap_missed, swap_gaps = _compute_missed_and_gaps(handle, "swap", run_time)
+        if not spot_missed and not swap_missed:
+            logger.ok(f"启动补齐跳过: 本地闭合 K 线已完整覆盖 run_time={run_time}")
+            return True
+
+        missed_per_type = {"spot": spot_missed, "swap": swap_missed}
+        symbol_limits: dict[str, dict[str, int]] = {"spot": {}, "swap": {}}
+        for tt, m_set, g_set in (("spot", spot_missed, spot_gaps), ("swap", swap_missed, swap_gaps)):
+            mh = _get_market_handle(handle, tt)
+            full_lim = int(getattr(mh, "once_update_candles", 99))
+            single_lim = min(_SINGLE_BAR_FALLBACK_LIMIT, full_lim)
+            symbol_limits[tt] = {sym: (full_lim if sym in g_set else single_lim) for sym in m_set}
+
+        logger.info(
+            f"启动补齐: 按需 REST 拉取 missed spot={len(spot_missed)} swap={len(swap_missed)}, run_time={run_time}"
+        )
+        call_kwargs = {}
+        sig = inspect.signature(fetch_update_binance_candles)
+        if "symbol_limits" in sig.parameters:
+            call_kwargs["symbol_limits"] = symbol_limits
+        result = fetch_update_binance_candles(
+            handle, run_time, resample_inline=False, symbols_subset=missed_per_type, **call_kwargs
+        )
     except Exception:
         logger.exception("启动补齐异常，首轮由断档标记兜底")
         return False

@@ -40,6 +40,13 @@ def _record_resample_bounds(
     return entry
 
 
+def merge_resample_bounds_cache(entries: Optional[dict]) -> None:
+    if not entries:
+        return
+    with _RESAMPLE_BOUNDS_LOCK:
+        _RESAMPLE_BOUNDS_CACHE.update(entries)
+
+
 def _get_cached_resample_bounds(
     candle_mgr: CandleFileManager, symbol: str
 ) -> Optional[tuple[int, pd.Timestamp, pd.Timestamp]]:
@@ -278,14 +285,15 @@ def update_resample_candle_incremental(
     *,
     min_ts: Optional[pd.Timestamp] = None,
     return_tail_bars: int = 0,
+    df_old_preloaded: Optional[pd.DataFrame] = None,
 ):
-    if not candle_mgr.has_symbol(symbol):
+    if df_old_preloaded is None and not candle_mgr.has_symbol(symbol):
         return update_resample_candle(
             candle_mgr, symbol, df_resample, num_candles, run_time, resample_delta,
             min_ts=min_ts, return_tail_bars=return_tail_bars,
         )
 
-    df_old = candle_mgr.read_candle(symbol)
+    df_old = df_old_preloaded if df_old_preloaded is not None else candle_mgr.read_candle(symbol)
     if df_old.empty or df_resample.empty:
         return update_resample_candle(
             candle_mgr, symbol, df_resample, num_candles, run_time, resample_delta,
@@ -443,7 +451,7 @@ def resample_history(
     trade_type: str,
     run_time: datetime,
     full_backfill_symbols: Optional[set[str]] = None,
-) -> None:
+) -> dict:
     base_delta = convert_interval_to_timedelta(handle.base_interval)
     resample_delta = convert_interval_to_timedelta(handle.resample_interval)
     logger.info(f'开始 Resample 历史数据，类型={trade_type}，当前时间={now_time_str()}')
@@ -453,7 +461,7 @@ def resample_history(
     base_candle_dir = market_handle.base_candle_dir
     if not base_candle_dir.exists():
         logger.ok(f'Resample 历史数据成功，类型={trade_type}，当前时间={now_time_str()}')
-        return
+        return {}
 
     full_backfill_set = set(full_backfill_symbols or ())
     trim_ts = _resolve_history_trim_ts(handle)
@@ -464,6 +472,8 @@ def resample_history(
     stale_cutoff = pd.Timestamp(run_time) - timedelta(days=max(1, retention_days - 2))
 
     symbols = sorted(item.name for item in base_candle_dir.iterdir() if item.is_dir())
+    bounds_collected: dict = {}
+    bounds_lock = threading.Lock()
 
     def _process_symbol(symbol: str):
         symbol_dir = base_candle_dir / symbol
@@ -481,29 +491,55 @@ def resample_history(
 
         is_full_backfill = symbol in full_backfill_set
         df_min_time = df['candle_begin_time'].min()
+        cbt_diff = df['candle_begin_time'].diff().fillna(timedelta(minutes=0))
+        p_chg = (df['open'] / df['close'].shift().fillna(df['open']) - 1).fillna(0)
+        has_token_split = bool(((cbt_diff > timedelta(hours=48)) & (p_chg.abs() > 0.1)).any())
+        local_bounds: dict = {}
 
         for offset_str, resample_mgr in resample_mgr_map.items():
-            is_healthy = _is_healthy_existing_resample(resample_mgr, symbol, stale_cutoff)
+            df_old = None
+            is_healthy = False
+            last_old_ts = None
+            if resample_mgr.has_symbol(symbol):
+                try:
+                    df_old = resample_mgr.read_candle(symbol)
+                except Exception:
+                    df_old = None
+                if isinstance(df_old, pd.DataFrame) and not df_old.empty and 'candle_begin_time' in df_old.columns:
+                    last_old_ts = df_old['candle_begin_time'].max()
+                    is_healthy = bool(pd.notna(last_old_ts) and last_old_ts >= stale_cutoff)
 
-            if is_healthy:
-                # 健康 offset 始终走增量合并（即便同 symbol 因其他 offset 缺失处于自愈中），
-                # 丢弃截断窗口首根不完整 1h bar，绝不覆盖既有历史头部
-                df_resample = calc_resample(df, handle.resample_interval, offset_str, theoretical_start)
-                if df_resample.empty:
-                    continue
-                if df_min_time > df_resample['candle_begin_time'].iloc[0]:
-                    df_resample = df_resample.iloc[1:]
-                if df_resample.empty:
-                    continue
-                update_resample_candle_incremental(
-                    resample_mgr,
-                    symbol,
-                    df_resample,
-                    None,
-                    run_time,
-                    resample_delta,
-                    min_ts=trim_ts,
-                )
+            if is_healthy and df_old is not None and last_old_ts is not None:
+                # 健康 offset 且无代币拆分时仅重采样 >= last_old_ts 的增量尾部，
+                # 既保护已定型的历史小时不被重复覆盖，又将启动重采样耗时从 ~80s 压缩至数秒。
+                if not has_token_split:
+                    df_src = df[df['candle_begin_time'] >= pd.Timestamp(last_old_ts)]
+                else:
+                    df_src = df
+
+                if not df_src.empty:
+                    src_min = df_src['candle_begin_time'].iloc[0]
+                    df_resample = calc_resample(df_src, handle.resample_interval, offset_str, theoretical_start)
+                    if not df_resample.empty and src_min > df_resample['candle_begin_time'].iloc[0]:
+                        df_resample = df_resample.iloc[1:]
+                else:
+                    df_resample = df.iloc[0:0]
+
+                if not df_resample.empty:
+                    update_resample_candle_incremental(
+                        resample_mgr,
+                        symbol,
+                        df_resample,
+                        None,
+                        run_time,
+                        resample_delta,
+                        min_ts=trim_ts,
+                        df_old_preloaded=df_old,
+                    )
+                else:
+                    _record_resample_bounds(
+                        resample_mgr, symbol, df_old['candle_begin_time'].iloc[0], last_old_ts
+                    )
             else:
                 # 缺失/损坏/超期 offset：基于完整 base_5m 全量重采样覆盖写入
                 df_resample = calc_resample(df, handle.resample_interval, offset_str, theoretical_start)
@@ -515,6 +551,17 @@ def resample_history(
                 df_resample = _apply_history_bound(df_resample, None, trim_ts)
                 if len(df_resample) > 0:
                     resample_mgr.set_candle(symbol, run_time, df_resample)
+                    _record_resample_bounds(
+                        resample_mgr, symbol, df_resample['candle_begin_time'].iloc[0], df_resample['candle_begin_time'].iloc[-1]
+                    )
+
+            entry = _get_cached_resample_bounds(resample_mgr, symbol)
+            if entry is not None:
+                local_bounds[(str(resample_mgr.base_dir), symbol)] = entry
+
+        if local_bounds:
+            with bounds_lock:
+                bounds_collected.update(local_bounds)
 
         if is_full_backfill:
             # 自愈完成后将临时拉取的深历史 base_5m 全部旧月分区裁回保留期（30 天）
@@ -525,6 +572,7 @@ def resample_history(
         list(pool.map(_process_symbol, symbols))
 
     logger.ok(f'Resample 历史数据成功，类型={trade_type}，当前时间={now_time_str()}')
+    return bounds_collected
 
 
 def _read_base_tail(
