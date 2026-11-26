@@ -60,7 +60,7 @@ class ExchangeAdapter(ABC):
     def match_spot_swap(self, spot_symbols, swap_symbols):
         """返回 spot<->swap 配对表（``pd.DataFrame``，列 'spot'/'swap'）。"""
 
-    async def update_meta(self, handle, run_time):
+    async def update_meta(self, handle, run_time, *, include_realtime_funding: bool = True):
         """刷新 exginfo_spot / exginfo_swap（+ 可选 funding）。
 
         默认实现对所有交易所通用（委派 ``core.pipeline.data_update.update_exchange_meta``，
@@ -69,7 +69,10 @@ class ExchangeAdapter(ABC):
         """
         from core.pipeline.data_update import update_exchange_meta  # 惰性导入规避循环
 
-        await update_exchange_meta(handle, run_time)
+        if include_realtime_funding:
+            await update_exchange_meta(handle, run_time)
+        else:
+            await update_exchange_meta(handle, run_time, include_realtime_funding=False)
 
     @abstractmethod
     def create_protocol(self):

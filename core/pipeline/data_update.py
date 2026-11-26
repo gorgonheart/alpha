@@ -127,7 +127,7 @@ async def update_funding_rates(handle: BmacHandle, session, run_time):
         funding_mgr.update_candle(symbol, run_time, g, kline_count)
 
 
-async def update_binance_meta(handle: BmacHandle, run_time):
+async def update_binance_meta(handle: BmacHandle, run_time, *, include_realtime_funding: bool = True):
     meta_started = time.monotonic()
     write_deadline = meta_started + run_time.timestamp() - time.time() - 2
     deadline = min(meta_started + NETWORK_SECONDS, write_deadline)
@@ -138,7 +138,9 @@ async def update_binance_meta(handle: BmacHandle, run_time):
         funding_task = history_task = None
 
         if handle.fetch_funding_rate:
-            funding_task = asyncio.create_task(update_binance_funding_rates(handle, session, run_time))
+            if include_realtime_funding:
+                funding_task = asyncio.create_task(update_binance_funding_rates(handle, session, run_time))
+                tasks.append(funding_task)
 
             async def history_branch():
                 stats = dict(requests=0, success=0, failed=0, elapsed=0., reason='deadline')
@@ -160,36 +162,38 @@ async def update_binance_meta(handle: BmacHandle, run_time):
                 return {}, stats
 
             history_task = asyncio.create_task(history_branch())
-            tasks.append(funding_task)
 
         try:
             await asyncio.gather(*tasks)
-            if funding_task is not None:
-                realtime = funding_task.result()
-                saved_realtime = []
-                started = time.monotonic()
-                if not realtime.empty and not history_task.done():
-                    # Let optional requests progress during mandatory disk I/O. Keep
-                    # one writer; as soon as history arrives, combine remaining saves.
-                    depth = _resolve_funding_depth(handle)
-                    min_ts = _resolve_history_trim_ts(handle)
-                    for symbol, current in realtime.groupby('symbol'):
-                        if history_task.done():
-                            break
-                        await asyncio.to_thread(
-                            _save_funding_with_trim,
-                            handle.funding_mgr,
-                            symbol,
-                            run_time,
-                            current,
-                            depth,
-                            min_ts,
-                        )
-                        saved_realtime.append(symbol)
-                if saved_realtime:
-                    realtime = realtime.loc[~realtime.symbol.isin(saved_realtime)]
-                    logger.info('等待历史期间已落盘实时资金费: 币种=%d 耗时=%.3fs',
-                                len(saved_realtime), time.monotonic() - started)
+            if history_task is not None:
+                if funding_task is not None:
+                    realtime = funding_task.result()
+                    saved_realtime = []
+                    started = time.monotonic()
+                    if not realtime.empty and not history_task.done():
+                        # Let optional requests progress during mandatory disk I/O. Keep
+                        # one writer; as soon as history arrives, combine remaining saves.
+                        depth = _resolve_funding_depth(handle)
+                        min_ts = _resolve_history_trim_ts(handle)
+                        for symbol, current in realtime.groupby('symbol'):
+                            if history_task.done():
+                                break
+                            await asyncio.to_thread(
+                                _save_funding_with_trim,
+                                handle.funding_mgr,
+                                symbol,
+                                run_time,
+                                current,
+                                depth,
+                                min_ts,
+                            )
+                            saved_realtime.append(symbol)
+                    if saved_realtime:
+                        realtime = realtime.loc[~realtime.symbol.isin(saved_realtime)]
+                        logger.info('等待历史期间已落盘实时资金费: 币种=%d 耗时=%.3fs',
+                                    len(saved_realtime), time.monotonic() - started)
+                else:
+                    realtime = pd.DataFrame()
                 history, stats = await history_task
                 save_funding_updates(handle, run_time, realtime, history, stats, write_deadline)
         finally:
@@ -237,17 +241,20 @@ def save_funding_updates(handle, run_time, realtime, history, stats, write_deadl
                 stats['failed'], stats['reason'], stats['elapsed'], time.monotonic() - started)
 
 
-async def update_exchange_meta(handle: BmacHandle, run_time):
+async def update_exchange_meta(handle: BmacHandle, run_time, *, include_realtime_funding: bool = True):
     """按交易所分派 meta 更新：Binance 走并发 funding_task + 8s 回补；OKX 保留 v2.0.2 逻辑。"""
     if getattr(handle, 'exchange', 'binance') == 'binance':
-        await update_binance_meta(handle, run_time)
+        if include_realtime_funding:
+            await update_binance_meta(handle, run_time)
+        else:
+            await update_binance_meta(handle, run_time, include_realtime_funding=False)
         return
 
     async with create_aiohttp_session(handle.http_timeout_sec) as session:
         exginfo_spot = update_exginfo(handle, session, 'spot', run_time)
         exginfo_swap = update_exginfo(handle, session, 'swap', run_time)
         tasks = [exginfo_spot, exginfo_swap]
-        if handle.fetch_funding_rate:
+        if handle.fetch_funding_rate and include_realtime_funding:
             tasks.append(update_funding_rates(handle, session, run_time))
         await asyncio.gather(*tasks)
 
@@ -255,9 +262,13 @@ async def update_exchange_meta(handle: BmacHandle, run_time):
 update_okx_meta = update_exchange_meta
 
 
-async def update_meta(handle: BmacHandle, run_time):
+async def update_meta(handle: BmacHandle, run_time, *, include_realtime_funding: bool = True):
     """按 handle.exchange 经交易所注册表分派 meta 更新（exginfo_spot/swap + 可选 funding）。"""
-    await get_adapter(handle.exchange).update_meta(handle, run_time)
+    adapter = get_adapter(handle.exchange)
+    if include_realtime_funding:
+        await adapter.update_meta(handle, run_time)
+    else:
+        await adapter.update_meta(handle, run_time, include_realtime_funding=False)
 
 
 async def fetch_update_resample(

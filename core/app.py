@@ -6,12 +6,15 @@
 只需委派到本模块。
 """
 import asyncio
+import inspect
 import sys
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timedelta
 from typing import Optional
+
+ENABLED_META_LEAD_SEC = 22
 
 from core.alert import Alert
 from core.exchange.adapter import get_adapter
@@ -51,6 +54,18 @@ def select_protocol(exchange: Optional[str]):
     return get_adapter(exchange).create_protocol()
 
 
+async def _invoke_update_meta(handle: BmacHandle, run_time: datetime, *, include_realtime_funding: bool = True):
+    sig = inspect.signature(update_meta)
+    accepts_kw = (
+        "include_realtime_funding" in sig.parameters
+        or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+    )
+    if accepts_kw:
+        await update_meta(handle, run_time, include_realtime_funding=include_realtime_funding)
+    else:
+        await update_meta(handle, run_time)
+
+
 def update_all(
     handle: BmacHandle,
     run_time: datetime,
@@ -66,7 +81,7 @@ def update_all(
     if f"{run_time.minute}m" not in handle.enabled_hour_offsets:
         logger.info(f"Runtime={run_time} 未启用该 Offset，刷新市场信息与资金费后检查补算")
         sleep_until_run_time(run_time - timedelta(seconds=15))
-        asyncio.run(update_meta(handle, run_time))
+        asyncio.run(_invoke_update_meta(handle, run_time, include_realtime_funding=False))
         update_symbol_match(handle, run_time)
 
         if supervisor is not None:
@@ -99,13 +114,14 @@ def update_all(
 
     divider(f"Update {handle.base_interval} Runtime={run_time}", with_timestamp=False)
 
-    # 提前 15 秒更新 exchange info
-    sleep_until_run_time(run_time - timedelta(seconds=15))
+    # 提前唤醒预热计算池并更新 exchange info / 资金费（留足余量防跨整点）
+    lead_sec = int(getattr(cfg, "enabled_meta_lead_sec", ENABLED_META_LEAD_SEC))
+    sleep_until_run_time(run_time - timedelta(seconds=lead_sec))
 
     if supervisor is not None:
         if callable(getattr(supervisor, "warm_compute_pool", None)):
             supervisor.warm_compute_pool()
-        asyncio.run(update_meta(handle, run_time))
+        asyncio.run(_invoke_update_meta(handle, run_time, include_realtime_funding=True))
         update_symbol_match(handle, run_time)
         logger.ok(f"Exchange Info 与实时资金费获取成功, 本地时间={now_time_str()}")
 

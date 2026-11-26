@@ -1141,79 +1141,95 @@ def _run_batch_worker_task(
 
 def preprocess_type_data(handle: BmacHandle, run_time: datetime, trade_type: str, df_match: pd.DataFrame,
                          *, factor_executor=None, factor_modules_params=None, publish_kline_num=None,
-                         batch_executor=None, resample_tail_hints=None):
-    num_batch = handle.preprocess_handle.num_batch
-    exg_mgr = handle.exg_mgr
-    exginfo_name = f'exginfo_{trade_type}'
-    resample_interval = getattr(handle, 'resample_interval', '1h')
-    offset_str = get_offset_from_runtime(run_time, resample_interval)
-    preprocess_handle = handle.preprocess_handle
-    preprocess_mgr = preprocess_handle.preprocess_mgr_map[offset_str]
-    if preprocess_mgr.check_ready(f'{trade_type}_dict', run_time) and preprocess_mgr.check_ready(
-            f'market_pivot_{trade_type}', run_time):
-        return
+                         batch_executor=None, resample_tail_hints=None,
+                         wait_before_submit=None, on_batches_submitted=None):
+    submitted_notified = False
+    try:
+        num_batch = handle.preprocess_handle.num_batch
+        exg_mgr = handle.exg_mgr
+        exginfo_name = f'exginfo_{trade_type}'
+        resample_interval = getattr(handle, 'resample_interval', '1h')
+        offset_str = get_offset_from_runtime(run_time, resample_interval)
+        preprocess_handle = handle.preprocess_handle
+        preprocess_mgr = preprocess_handle.preprocess_mgr_map[offset_str]
+        if preprocess_mgr.check_ready(f'{trade_type}_dict', run_time) and preprocess_mgr.check_ready(
+                f'market_pivot_{trade_type}', run_time):
+            return
 
-    if not exg_mgr.check_ready(exginfo_name, run_time):
-        logger.error(f'读取 {trade_type} Exchange Info 失败，预处理数据 {trade_type} 失败')
-        return
+        if not exg_mgr.check_ready(exginfo_name, run_time):
+            logger.error(f'读取 {trade_type} Exchange Info 失败，预处理数据 {trade_type} 失败')
+            return
 
-    df_exginfo = exg_mgr.read_candle(exginfo_name)
-    symbol_list = sorted(df_exginfo['symbol'].to_list())
-    if factor_modules_params is None:
-        factor_modules_params = _load_factor_modules_params()
+        df_exginfo = exg_mgr.read_candle(exginfo_name)
+        symbol_list = sorted(df_exginfo['symbol'].to_list())
+        if factor_modules_params is None:
+            factor_modules_params = _load_factor_modules_params()
 
-    logger.info(f'开始预处理 {trade_type}, 当前时间={now_time_str()}')
+        logger.info(f'开始预处理 {trade_type}, 当前时间={now_time_str()}')
 
-    batches: list[tuple[int, list[str]]] = []
-    idx = 1
-    rem = symbol_list
-    while rem:
-        if len(rem) > num_batch:
-            batch, rem = rem[:num_batch], rem[num_batch:]
-        else:
-            batch, rem = rem, []
-        batches.append((idx, batch))
-        idx += 1
+        batches: list[tuple[int, list[str]]] = []
+        idx = 1
+        rem = symbol_list
+        while rem:
+            if len(rem) > num_batch:
+                batch, rem = rem[:num_batch], rem[num_batch:]
+            else:
+                batch, rem = rem, []
+            batches.append((idx, batch))
+            idx += 1
 
-    use_batch_pool = (
-        batch_executor is not None
-        and _can_offload_factors_to_process_pool(factor_modules_params)
-    )
+        use_batch_pool = (
+            batch_executor is not None
+            and _can_offload_factors_to_process_pool(factor_modules_params)
+        )
 
-    year_pivot_names = defaultdict(list)
-    year_pivot_data: dict[int, dict[str, pd.DataFrame]] = {}
-    funding_publication = (FundingPublication(preprocess_mgr.base_dir, run_time)
-                           if trade_type == 'swap' and handle.fetch_funding_rate else None)
+        year_pivot_names = defaultdict(list)
+        year_pivot_data: dict[int, dict[str, pd.DataFrame]] = {}
+        funding_publication = (FundingPublication(preprocess_mgr.base_dir, run_time)
+                               if trade_type == 'swap' and handle.fetch_funding_rate else None)
+
+        if use_batch_pool:
+            t_start = time.perf_counter()
+            pub_depth = (
+                publish_kline_num
+                if publish_kline_num is not None
+                else getattr(bmac_config, 'publish_kline_num', getattr(handle, 'publish_kline_num', 5000))
+            )
+            factor_specs = [(fn, pl) for _, fn, pl in (factor_modules_params or ())]
+            if wait_before_submit is not None:
+                wait_before_submit.wait(timeout=5.0)
+            futures = []
+            try:
+                for b_idx, b_syms in batches:
+                    b_hints = (
+                        {s: resample_tail_hints[s] for s in b_syms if s in resample_tail_hints}
+                        if resample_tail_hints
+                        else None
+                    )
+                    futures.append(
+                        batch_executor.submit(
+                            _run_batch_worker_task,
+                            handle,
+                            run_time,
+                            trade_type,
+                            df_match,
+                            b_syms,
+                            f'batch{b_idx}',
+                            factor_specs,
+                            int(pub_depth or 0),
+                            b_hints,
+                        )
+                    )
+            finally:
+                if on_batches_submitted is not None and not submitted_notified:
+                    submitted_notified = True
+                    on_batches_submitted()
+    finally:
+        if on_batches_submitted is not None and not submitted_notified:
+            submitted_notified = True
+            on_batches_submitted()
 
     if use_batch_pool:
-        t_start = time.perf_counter()
-        pub_depth = (
-            publish_kline_num
-            if publish_kline_num is not None
-            else getattr(bmac_config, 'publish_kline_num', getattr(handle, 'publish_kline_num', 5000))
-        )
-        factor_specs = [(fn, pl) for _, fn, pl in (factor_modules_params or ())]
-        futures = []
-        for b_idx, b_syms in batches:
-            b_hints = (
-                {s: resample_tail_hints[s] for s in b_syms if s in resample_tail_hints}
-                if resample_tail_hints
-                else None
-            )
-            futures.append(
-                batch_executor.submit(
-                    _run_batch_worker_task,
-                    handle,
-                    run_time,
-                    trade_type,
-                    df_match,
-                    b_syms,
-                    f'batch{b_idx}',
-                    factor_specs,
-                    int(pub_depth or 0),
-                    b_hints,
-                )
-            )
 
         ipc_chunks: list[tuple[bytes, list[tuple[str, bytes]]]] = []
         ready_origins: dict = {}
@@ -1363,7 +1379,13 @@ def preprocess_offset_data(handle: BmacHandle, run_time: datetime,
         any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
         or ('batch_executor' in sig.parameters and 'resample_tail_hints' in sig.parameters)
     )
+    accepts_gate = (
+        any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        or ('wait_before_submit' in sig.parameters and 'on_batches_submitted' in sig.parameters)
+    )
     tails_map = resample_tails or {}
+    import threading
+    spot_submitted = threading.Event() if (batch_executor is not None and accepts_gate) else None
 
     with factor_pool as factor_executor:
         def _invoke_market(tt: str):
@@ -1375,12 +1397,18 @@ def preprocess_offset_data(handle: BmacHandle, run_time: datetime,
             if accepts_extra:
                 kw['batch_executor'] = batch_executor
                 kw['resample_tail_hints'] = tails_map.get(tt)
+            if spot_submitted is not None:
+                if tt == 'spot':
+                    kw['on_batches_submitted'] = spot_submitted.set
+                else:
+                    kw['wait_before_submit'] = spot_submitted
             return preprocess_type_data(handle, run_time, tt, df_match, **kw)
 
-        # 双市场并发调度：swap 体量更大优先投递，避免尾部空等；spot 收齐即刻先发 spot_dict.ready。
+        # 双市场并发调度：spot（3 批）确定性先于 swap（5 批）入队 4 进程池（总计仍 2 波完成，不拖慢 swap），
+        # 确保 spot 100% 在第 1 波提前发 spot_dict.ready 供下游流式抢读。
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix='preprocess_mkt') as mkt_pool:
-            fut_swap = mkt_pool.submit(_invoke_market, 'swap')
             fut_spot = mkt_pool.submit(_invoke_market, 'spot')
+            fut_swap = mkt_pool.submit(_invoke_market, 'swap')
             fut_spot.result()
             fut_swap.result()
         _release_memory()
