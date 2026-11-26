@@ -18,6 +18,7 @@ from core.exchange.adapter import get_adapter
 from core.exchange.symbol_match import update_symbol_match
 from core.handle import BmacHandle, debug_handle
 from core.history_data.history import run_download_all_history_with_backfill
+from core.ingest.coin_cap import maybe_update_coin_cap_idle
 from core.pipeline.backfill import maybe_backfill
 from core.pipeline.data_update import update_meta
 from core.pipeline.resample import merge_resample_bounds_cache, resample_history
@@ -76,6 +77,18 @@ def update_all(
         # 首次启动时，除 init 那个分钟归属的 offset 外都还没有预处理 ready。
         # Wait for this base-period tick, instead of rechecking its future time every minute.
         sleep_until_run_time(run_time)
+        if supervisor is not None and callable(getattr(supervisor, "flush_pending_1h", None)):
+            try:
+                supervisor.flush_pending_1h()
+            except Exception as e:
+                logger.error(f"空档刷盘挂起的 1h_resample 失败: {e!r}")
+                logger.debug(traceback.format_exc())
+        if getattr(handle, "coin_cap_handle", None) is not None:
+            try:
+                maybe_update_coin_cap_idle(handle, run_time)
+            except Exception as e:
+                logger.error(f"空档更新市值数据失败: {e!r}")
+                logger.debug(traceback.format_exc())
         try:
             maybe_backfill(handle)
         except Exception as e:
@@ -90,6 +103,8 @@ def update_all(
     sleep_until_run_time(run_time - timedelta(seconds=15))
 
     if supervisor is not None:
+        if callable(getattr(supervisor, "warm_compute_pool", None)):
+            supervisor.warm_compute_pool()
         asyncio.run(update_meta(handle, run_time))
         update_symbol_match(handle, run_time)
         logger.ok(f"Exchange Info 与实时资金费获取成功, 本地时间={now_time_str()}")

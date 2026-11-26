@@ -151,6 +151,33 @@ def is_base_data_fresh(handle: BmacHandle, trade_type: str, run_time: datetime) 
     return newest + convert_interval_to_timedelta(handle.base_interval) >= run_time, newest
 
 
+def has_active_consumer(handle: BmacHandle) -> bool:
+    """轻量检测是否存在活跃下游消费端（全量需求标记或运行中的交易/初始化子进程）。"""
+    pre_handle = getattr(handle, 'preprocess_handle', None)
+    mgr_map = getattr(pre_handle, 'preprocess_mgr_map', None) if pre_handle is not None else None
+    if isinstance(mgr_map, dict):
+        for offset in getattr(handle, 'enabled_hour_offsets', ()):
+            mgr = mgr_map.get(offset)
+            base_dir = getattr(mgr, 'base_dir', None)
+            if base_dir is not None and (Path(base_dir) / '.arrow-demand').exists():
+                return True
+    if sys.platform.startswith('linux'):
+        try:
+            proc_root = Path('/proc')
+            for entry in proc_root.iterdir():
+                if not entry.name.isdigit():
+                    continue
+                try:
+                    cmdline = (entry / 'cmdline').read_bytes().decode('utf-8', errors='ignore')
+                except OSError:
+                    continue
+                if 'server_robust40.py' in cmdline or 'account_exec.py' in cmdline:
+                    return True
+        except OSError:
+            pass
+    return False
+
+
 def maybe_backfill(handle: BmacHandle) -> float:
     """在空闲等待里补算缺失的 offset，返回本次耗时（秒）。
 
@@ -159,6 +186,10 @@ def maybe_backfill(handle: BmacHandle) -> float:
     missing = pending_offsets(handle)
     targets = [offset for offset in missing if not _in_cooldown(offset)]
     if not targets:
+        return 0.0
+
+    if has_active_consumer(handle):
+        logger.info(f'检测到活跃下游消费端/初始化需求，本轮空档暂缓补算 {targets}，当前时间={now_time_str()}')
         return 0.0
 
     remain = seconds_to_next_offset(handle, now_time())

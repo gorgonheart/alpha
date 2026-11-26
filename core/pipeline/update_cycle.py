@@ -12,6 +12,7 @@ import multiprocessing as mp
 import threading
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from copy import copy
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -502,6 +503,11 @@ def run_ws_cycle(handle: BmacHandle, run_time: datetime, supervisor: RuntimeSupe
     """
     result = CycleResult()
     router = supervisor.router
+    offset_str = get_offset_from_runtime(run_time, getattr(handle, "resample_interval", "1h"))
+
+    # 同 offset 下一轮开始前兜底刷盘上次挂起的 1h_resample（防止罕见跳过空档导致读旧盘）
+    if callable(getattr(supervisor, "flush_pending_1h", None)):
+        supervisor.flush_pending_1h(offset_str)
 
     compute_pool = (
         supervisor.get_compute_pool()
@@ -510,22 +516,23 @@ def run_ws_cycle(handle: BmacHandle, run_time: datetime, supervisor: RuntimeSupe
     )
     rest_thread, rest_state = _start_rest_fallback(handle, run_time, router)
     try:
-        with ProcessPoolExecutor(max_workers=2, mp_context=_SPAWN_CTX) as aux_exe:
+        # 日频 coin_cap 移至非启用空档按需刷新；仅在启用 data_api 时才创建 aux_exe 子进程，
+        # 避免关键发布期陪跑无谓的 spawn 子进程占内存。
+        aux_ctx = (
+            ProcessPoolExecutor(max_workers=1, mp_context=_SPAWN_CTX)
+            if handle.data_api is not None
+            else nullcontext(None)
+        )
+        with aux_ctx as aux_exe:
             task_data_api = (
                 aux_exe.submit(update_data_api_candles, handle, run_time)
-                if handle.data_api is not None
-                else None
-            )
-            task_coin_cap = (
-                aux_exe.submit(run_coin_cap_update_to_recent, handle, run_time)
-                if handle.coin_cap_handle is not None
+                if aux_exe is not None and handle.data_api is not None
                 else None
             )
 
             br_sig = inspect.signature(_barrier_and_resample)
             supports_pool_kw = "compute_pool" in br_sig.parameters
             supports_defer_kw = "defer_1h_write" in br_sig.parameters
-            offset_str = get_offset_from_runtime(run_time, getattr(handle, "resample_interval", "1h"))
             pre_mgr = (
                 getattr(handle.preprocess_handle, "preprocess_mgr_map", {}).get(offset_str)
                 if getattr(handle, "preprocess_handle", None) is not None
@@ -669,14 +676,25 @@ def run_ws_cycle(handle: BmacHandle, run_time: datetime, supervisor: RuntimeSupe
                             _invoke_preprocess(publication_handle, spot_begin_ts, swap_begin_ts)
                             published = True
             finally:
-                if flush_1h_fns:
-                    with ThreadPoolExecutor(max_workers=len(flush_1h_fns), thread_name_prefix="bg_1h_flush") as flush_exe:
-                        for fut in [flush_exe.submit(fn) for fn in flush_1h_fns]:
-                            fut.result()
+                # Preprocess 已完成（.ready 已发出或异常退出），立即销毁计算池让 OS 100% 回收子进程匿名堆页
+                if callable(getattr(supervisor, "release_compute_pool", None)):
+                    supervisor.release_compute_pool(wait=False)
 
-            if task_coin_cap is not None:
-                if not task_coin_cap.result():
-                    result.errs.append("获取市值数据失败")
+                if flush_1h_fns:
+                    can_defer_post_ready = (
+                        published
+                        and callable(getattr(supervisor, "defer_1h_flush", None))
+                        and len(set(getattr(handle, "enabled_hour_offsets", ()))) < 12
+                    )
+                    if can_defer_post_ready:
+                        supervisor.defer_1h_flush(offset_str, run_time, flush_1h_fns)
+                    else:
+                        with ThreadPoolExecutor(
+                            max_workers=len(flush_1h_fns),
+                            thread_name_prefix="bg_1h_flush",
+                        ) as flush_exe:
+                            for fut in [flush_exe.submit(fn) for fn in flush_1h_fns]:
+                                fut.result()
 
             if task_data_api is not None and not data_api_done:
                 try:

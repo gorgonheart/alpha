@@ -19,7 +19,7 @@ import pandas as pd
 
 import config as bmac_config
 from core.handle import BmacHandle
-from core.storage.candle_manager import CandleFileReader
+from core.storage.candle_manager import CandleFileReader, drop_file_page_cache
 from core.utils.log_kit import logger
 from core.utils.time import get_offset_from_runtime, now_time_str
 
@@ -378,6 +378,8 @@ def gen_batch_data(handle: BmacHandle, run_time: datetime, trade_type: str, df_m
 
     def _save_raw_batch():
         preprocess_mgr.set_candle(full_batch_name, run_time, raw_to_save)
+        if hasattr(preprocess_mgr, 'format_data_file_path'):
+            drop_file_page_cache(preprocess_mgr.format_data_file_path(full_batch_name))
 
     if not defer_save:
         _save_raw_batch()
@@ -730,6 +732,8 @@ def gen_batch_data_incremental(handle: BmacHandle, run_time: datetime, trade_typ
 
     def _save_raw_batch():
         preprocess_mgr.set_candle(full_batch_name, run_time, raw_to_save)
+        if hasattr(preprocess_mgr, 'format_data_file_path'):
+            drop_file_page_cache(preprocess_mgr.format_data_file_path(full_batch_name))
 
     if not defer_save:
         _save_raw_batch()

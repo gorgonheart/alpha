@@ -13,6 +13,27 @@ from core.utils.log_kit import logger
 _READY_INDEX_TTL_SEC = 2.0
 
 
+def drop_file_page_cache(path) -> bool:
+    """Hint Linux kernel to evict write-only file pages from OS page cache (no-op on Windows)."""
+    fadvise = getattr(os, 'posix_fadvise', None)
+    dontneed = getattr(os, 'POSIX_FADV_DONTNEED', None)
+    if fadvise is None or dontneed is None:
+        return False
+    fd = None
+    try:
+        fd = os.open(os.fspath(path), os.O_RDONLY)
+        fadvise(fd, 0, 0, dontneed)
+        return True
+    except OSError:
+        return False
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 class CandleFileReader:
 
     def __init__(self, base_dir, save_type):
@@ -186,7 +207,7 @@ class CandleFileManager(CandleFileReader):
         self._ready_indexed = True
         self._ready_indexed_at = time.monotonic()
 
-    def save_data_file(self, symbol, df: pd.DataFrame):
+    def save_data_file(self, symbol, df: pd.DataFrame, *, drop_page_cache: bool = False):
         df_path = self.format_data_file_path(symbol)
         if os.path.exists(df_path):
             os.remove(df_path)
@@ -206,6 +227,8 @@ class CandleFileManager(CandleFileReader):
                 df.to_pickle(df_path)
             else:
                 raise ValueError(f'Symbol {symbol} if of type {type(df)}, cannot save as compressed_pickle')
+        if drop_page_cache:
+            drop_file_page_cache(df_path)
         _dt = time.perf_counter() - _t0
         try:
             _mb = os.path.getsize(df_path) / 1e6
@@ -215,7 +238,7 @@ class CandleFileManager(CandleFileReader):
         except OSError:
             pass
 
-    def set_candle(self, symbol, run_time, df: pd.DataFrame):
+    def set_candle(self, symbol, run_time, df: pd.DataFrame, *, drop_page_cache: bool = False):
         """
         设置K线，首先将新的K线 DataFrame 写入 Feather，然后删除旧 ready file，并生成新 ready file
         :param symbol:  币种
@@ -223,7 +246,7 @@ class CandleFileManager(CandleFileReader):
         :param df:      DataFrame
         :return:
         """
-        self.save_data_file(symbol, df)
+        self.save_data_file(symbol, df, drop_page_cache=drop_page_cache)
 
         self.save_ready(symbol, run_time)
 

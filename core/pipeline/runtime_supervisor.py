@@ -19,12 +19,12 @@ import sys
 import threading
 import time
 import zlib
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from core.alert import Alert
 from core.exchange.protocol import BinanceProtocol, ExchangeProtocol
@@ -33,6 +33,17 @@ from core.utils.path_kit import get_file_path
 from core.ws.ws_runner import WsRunner
 
 logger = logging.getLogger(__name__)
+
+
+def _warm_compute_worker() -> int:
+    """顶层预热函数：提前导入重型数值与 Arrow 依赖，隐藏 spawn 冷启动于 T-15s 空窗期。"""
+    import numpy  # noqa: F401
+    import pandas  # noqa: F401
+    try:
+        import pyarrow  # noqa: F401
+    except Exception:
+        pass
+    return os.getpid()
 
 
 def writer_shard(symbol: str, num_writers: int) -> int:
@@ -221,7 +232,10 @@ class RuntimeSupervisor:
             resolved_compute = cfg_workers if cfg_workers > 0 else min(self.COMPUTE_WORKERS, max(1, os.cpu_count() or 4))
         self.compute_workers: int = max(1, resolved_compute)
         self._compute_pool: Optional[ProcessPoolExecutor] = None
+        self._compute_pool_warmed: bool = False
         self._compute_pool_lock = threading.Lock()
+        self._pending_1h_flushes: dict[str, tuple[datetime, list[Callable[[], None]]]] = {}
+        self._pending_1h_lock = threading.Lock()
 
         self.queues: list = [
             ctx.Queue(maxsize=self.QUEUE_MAXSIZE)
@@ -416,7 +430,7 @@ class RuntimeSupervisor:
                         pass
 
     def get_compute_pool(self) -> ProcessPoolExecutor:
-        """获取跨周期常驻的多进程计算池（用于 Resample 与 Preprocess Batch 并行，消除每轮 spawn 冷启动）。"""
+        """获取周期内复用的多进程计算池（用于 Resample 与 Preprocess Batch 并行）。"""
         with self._compute_pool_lock:
             broken = getattr(self._compute_pool, "_broken", False) if self._compute_pool is not None else False
             if self._compute_pool is not None and broken:
@@ -425,23 +439,108 @@ class RuntimeSupervisor:
                 except Exception:
                     pass
                 self._compute_pool = None
+                self._compute_pool_warmed = False
             if self._compute_pool is None:
                 self._compute_pool = ProcessPoolExecutor(
                     max_workers=self.compute_workers,
                     mp_context=self.ctx,
                 )
+                self._compute_pool_warmed = False
             return self._compute_pool
 
-    def shutdown(self, timeout_sec: Optional[float] = None) -> None:
-        """通知 WS 退出，关闭常驻计算池与 writer。"""
-        timeout = timeout_sec if timeout_sec is not None else self.SHUTDOWN_JOIN_TIMEOUT_SEC
+    def warm_compute_pool(self) -> ProcessPoolExecutor:
+        """在启用 offset 的 T-15s 空窗期异步预热计算池，消除发布阶段 spawn 冷启动开销。"""
         with self._compute_pool_lock:
-            if self._compute_pool is not None:
+            broken = getattr(self._compute_pool, "_broken", False) if self._compute_pool is not None else False
+            if self._compute_pool is not None and broken:
                 try:
-                    self._compute_pool.shutdown(wait=True, cancel_futures=True)
+                    self._compute_pool.shutdown(wait=False, cancel_futures=True)
                 except Exception:
                     pass
                 self._compute_pool = None
+                self._compute_pool_warmed = False
+            if self._compute_pool is None:
+                self._compute_pool = ProcessPoolExecutor(
+                    max_workers=self.compute_workers,
+                    mp_context=self.ctx,
+                )
+                self._compute_pool_warmed = False
+            pool = self._compute_pool
+            if not self._compute_pool_warmed:
+                for _ in range(self.compute_workers):
+                    pool.submit(_warm_compute_worker)
+                self._compute_pool_warmed = True
+            return pool
+
+    def release_compute_pool(self, *, wait: bool = False) -> bool:
+        """在 .ready 发布后立即销毁计算池，让 OS 100% 回收子进程 pymalloc/glibc 匿名堆页。"""
+        with self._compute_pool_lock:
+            pool = self._compute_pool
+            if pool is None:
+                return False
+            self._compute_pool = None
+            self._compute_pool_warmed = False
+        try:
+            pool.shutdown(wait=wait, cancel_futures=True)
+        except Exception:
+            pass
+        return True
+
+    @staticmethod
+    def _run_flush_callbacks(flush_fns: list[Callable[[], None]]) -> int:
+        if not flush_fns:
+            return 0
+        if len(flush_fns) == 1:
+            flush_fns[0]()
+            return 1
+        with ThreadPoolExecutor(
+            max_workers=min(2, len(flush_fns)),
+            thread_name_prefix="bg_1h_flush",
+        ) as flush_exe:
+            for fut in [flush_exe.submit(fn) for fn in flush_fns]:
+                fut.result()
+        return len(flush_fns)
+
+    def defer_1h_flush(
+        self,
+        offset_str: str,
+        run_time: datetime,
+        flush_fns: list[Callable[[], None]],
+    ) -> None:
+        """将非关键路径的 1h_resample 落盘挂入主进程轻量待办槽，避开下游刚唤醒的计算窗口。"""
+        if not flush_fns:
+            return
+        with self._pending_1h_lock:
+            stale = self._pending_1h_flushes.pop(offset_str, None)
+            self._pending_1h_flushes[offset_str] = (run_time, list(flush_fns))
+        if stale is not None:
+            self._run_flush_callbacks(stale[1])
+
+    def flush_pending_1h(self, offset_str: Optional[str] = None) -> int:
+        """执行指定 offset（或全部）挂起的 1h_resample 延迟刷盘。"""
+        items: list[tuple[str, datetime, list[Callable[[], None]]]] = []
+        with self._pending_1h_lock:
+            if offset_str is not None:
+                entry = self._pending_1h_flushes.pop(offset_str, None)
+                if entry is not None:
+                    items.append((offset_str, entry[0], entry[1]))
+            else:
+                for off, (rt, fns) in list(self._pending_1h_flushes.items()):
+                    items.append((off, rt, fns))
+                self._pending_1h_flushes.clear()
+        total = 0
+        for _off, _rt, fns in items:
+            total += self._run_flush_callbacks(fns)
+        return total
+
+    def shutdown(self, timeout_sec: Optional[float] = None) -> None:
+        """先兜底刷盘挂起的 1h_resample，再通知 WS 退出、关闭计算池与 writer。"""
+        timeout = timeout_sec if timeout_sec is not None else self.SHUTDOWN_JOIN_TIMEOUT_SEC
+        try:
+            self.flush_pending_1h()
+        except Exception:
+            logger.exception("shutdown 时刷盘挂起的 1h_resample 失败")
+        self.release_compute_pool(wait=True)
         ws_all = [p for procs in self.ws_procs.values() for p in procs]
         for stop_event in self._ws_stop_events.values():
             stop_event.set()

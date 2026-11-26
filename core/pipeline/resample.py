@@ -9,7 +9,7 @@ from typing import Callable, Optional
 import pandas as pd
 
 from core.handle import BmacHandle
-from core.storage.candle_manager import CandleFileManager
+from core.storage.candle_manager import CandleFileManager, drop_file_page_cache
 from core.storage.ts_manager import TSManager
 from core.utils.log_kit import logger
 from core.utils.time import (convert_interval_to_timedelta,
@@ -250,6 +250,8 @@ def update_resample_candle(
 
     # 写入硬盘
     candle_mgr.set_candle(symbol, run_time, df_total)
+    if hasattr(candle_mgr, 'format_data_file_path'):
+        drop_file_page_cache(candle_mgr.format_data_file_path(symbol))
 
     if df_total.empty:
         return (None, None, None) if return_tail_bars > 0 else (None, None)
@@ -352,6 +354,8 @@ def update_resample_candle_incremental(
 
                     df_total = _apply_history_bound(df_total, num_candles, min_ts)
                     candle_mgr.set_candle(symbol, run_time, df_total)
+                    if hasattr(candle_mgr, 'format_data_file_path'):
+                        drop_file_page_cache(candle_mgr.format_data_file_path(symbol))
                     if df_total.empty:
                         return (None, None, None) if return_tail_bars > 0 else (None, None)
                     first_begin_time = df_total['candle_begin_time'].iloc[0]
@@ -386,6 +390,8 @@ def update_resample_candle_incremental(
         df_total = pd.concat([df_old, df_resample], ignore_index=True)
         df_total = _apply_history_bound(df_total, num_candles, min_ts)
         candle_mgr.set_candle(symbol, run_time, df_total)
+        if hasattr(candle_mgr, 'format_data_file_path'):
+            drop_file_page_cache(candle_mgr.format_data_file_path(symbol))
         if df_total.empty:
             return (None, None, None) if return_tail_bars > 0 else (None, None)
         first_begin_time = df_total['candle_begin_time'].iloc[0]
@@ -410,6 +416,8 @@ def update_resample_candle_incremental(
     df_total = _apply_history_bound(df_total, num_candles, min_ts)
 
     candle_mgr.set_candle(symbol, run_time, df_total)
+    if hasattr(candle_mgr, 'format_data_file_path'):
+        drop_file_page_cache(candle_mgr.format_data_file_path(symbol))
     if df_total.empty:
         return (None, None, None) if return_tail_bars > 0 else (None, None)
 
