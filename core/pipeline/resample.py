@@ -622,22 +622,60 @@ def _overlay_ws_window(disk_df: Optional[pd.DataFrame], ws_df: Optional[pd.DataF
     return merged
 
 
+def _is_contiguous_closed_window(
+    df: Optional[pd.DataFrame],
+    run_time: datetime,
+    once_update_candles: int,
+    base_delta: timedelta,
+) -> bool:
+    """校验 df 末尾 once_update_candles 根 K 线严格按 base_delta 等步长连续，
+    且末根精确闭合在 run_time - base_delta（防止重启跨根空洞被 ws_cache 48h 行数掩盖）。
+    """
+    if df is None or once_update_candles <= 0 or len(df) < once_update_candles:
+        return False
+    tail_cbt = df['candle_begin_time'].iloc[-once_update_candles:]
+    if not tail_cbt.is_monotonic_increasing or tail_cbt.duplicated().any():
+        return False
+    step = pd.Timedelta(base_delta)
+    ts_last = tail_cbt.iloc[-1]
+    expected_last = pd.Timestamp(run_time) - step
+    if ts_last.tzinfo is not None and expected_last.tzinfo is None:
+        expected_last = expected_last.tz_localize(ts_last.tzinfo)
+    elif ts_last.tzinfo is None and expected_last.tzinfo is not None:
+        expected_last = expected_last.tz_convert('UTC').tz_localize(None)
+    if ts_last != expected_last:
+        return False
+    expected_first = expected_last - (once_update_candles - 1) * step
+    if tail_cbt.iloc[0] != expected_first:
+        return False
+    if once_update_candles > 1:
+        if not (tail_cbt.diff().iloc[1:] == step).all():
+            return False
+    return True
+
+
 def _load_closed_base_window(
     base_dir: Path,
     symbol: str,
     run_time: datetime,
     once_update_candles: int,
     ws_df: Optional[pd.DataFrame] = None,
+    base_delta: Optional[timedelta] = None,
 ) -> pd.DataFrame | None:
     """优先合并实时 ws_cache 与轻量 flat_pkl（默认 240 根）读取闭合 5m 窗口；
-    当 ws_cache 已攒满连续无缺口窗口时直接免读盘返回；不足时回退叠加 flat_pkl 或 TSManager 月分区。
+    仅当 ws_cache 末尾 once_update_candles 根时间网格完全连续无空洞且无 .gap 时直接免读盘返回；
+    否则回退叠加 flat_pkl 或 TSManager 月分区，确保 REST 补齐的历史缺口不被遗漏。
     """
+    step = base_delta if base_delta is not None else timedelta(minutes=5)
     ws_closed: pd.DataFrame | None = None
     if ws_df is not None and not ws_df.empty:
         ws_closed = ws_df[ws_df['candle_begin_time'] < run_time]
         if ws_closed.empty:
             ws_closed = None
-        elif len(ws_closed) >= once_update_candles and not (base_dir / f'{symbol}.gap').exists():
+        elif (
+            not (base_dir / f'{symbol}.gap').exists()
+            and _is_contiguous_closed_window(ws_closed, run_time, once_update_candles, step)
+        ):
             return ws_closed
 
     df_flat_closed: pd.DataFrame | None = None
@@ -653,7 +691,7 @@ def _load_closed_base_window(
                 df_flat = df_flat.drop(columns=['_source'])
             if not df_flat.empty:
                 df_flat_closed = _overlay_ws_window(df_flat, ws_closed)
-                if df_flat_closed is not None and len(df_flat_closed) >= once_update_candles:
+                if _is_contiguous_closed_window(df_flat_closed, run_time, once_update_candles, step):
                     return df_flat_closed
 
     df_part = _read_base_tail(base_dir, symbol, run_time, once_update_candles)
@@ -662,7 +700,7 @@ def _load_closed_base_window(
         if '_source' in df_part.columns:
             df_part = df_part.drop(columns=['_source'])
         if not df_part.empty:
-            df_part_merged = _overlay_ws_window(df_part, ws_closed)
+            df_part_merged = _overlay_ws_window(_overlay_ws_window(df_part, df_flat_closed), ws_closed)
             if df_flat_closed is None or (df_part_merged is not None and len(df_part_merged) >= len(df_flat_closed)):
                 return df_part_merged
     return df_flat_closed if df_flat_closed is not None else ws_closed
@@ -678,8 +716,11 @@ def _prepare_df_resample_from_base(
     run_time: datetime,
     once_update_candles: int,
     ws_df: Optional[pd.DataFrame] = None,
+    base_delta: Optional[timedelta] = None,
 ) -> Optional[pd.DataFrame]:
-    df_base = _load_closed_base_window(base_dir, symbol, run_time, once_update_candles, ws_df=ws_df)
+    df_base = _load_closed_base_window(
+        base_dir, symbol, run_time, once_update_candles, ws_df=ws_df, base_delta=base_delta
+    )
     if df_base is None or df_base.empty:
         return None
     window_truncated = len(df_base) >= once_update_candles
@@ -707,11 +748,12 @@ def _resample_one_symbol(
     min_ts: Optional[pd.Timestamp] = None,
     return_tail_bars: int = 0,
     ws_df: Optional[pd.DataFrame] = None,
+    base_delta: Optional[timedelta] = None,
 ):
     """对单个 symbol：读 base 闭合 K（ws_cache / flat_pkl 优先，月分区回退）→ resample → 增量合并写入 resample_mgr。"""
     df_resample = _prepare_df_resample_from_base(
         symbol, base_dir, resample_mgr, resample_interval, offset_str,
-        theoretical_start, run_time, once_update_candles, ws_df=ws_df,
+        theoretical_start, run_time, once_update_candles, ws_df=ws_df, base_delta=base_delta,
     )
     if df_resample is None:
         return None
@@ -760,6 +802,7 @@ def _resample_chunk_worker(
     return_tail_bars: int = 0,
     include_bounds_meta: bool = False,
 ):
+    base_delta = convert_interval_to_timedelta(getattr(handle, 'base_interval', '5m'))
     resample_interval = handle.resample_interval
     resample_delta = convert_interval_to_timedelta(resample_interval)
     offset_str = get_offset_from_runtime(run_time, resample_interval)
@@ -789,6 +832,7 @@ def _resample_chunk_worker(
             min_ts=min_ts,
             return_tail_bars=return_tail_bars,
             ws_df=ws_windows.get(symbol),
+            base_delta=base_delta,
         )
         if res is not None:
             out_begins[symbol] = (res[0], res[1])
@@ -813,6 +857,7 @@ def _compute_first_chunk_worker(
     return_tail_bars: int,
     cached_bounds_map: dict,
 ):
+    base_delta = convert_interval_to_timedelta(getattr(handle, 'base_interval', '5m'))
     resample_interval = handle.resample_interval
     resample_delta = convert_interval_to_timedelta(resample_interval)
     offset_str = get_offset_from_runtime(run_time, resample_interval)
@@ -831,6 +876,7 @@ def _compute_first_chunk_worker(
         df_res = _prepare_df_resample_from_base(
             symbol, base_dir, resample_mgr, resample_interval, offset_str,
             theoretical_start, run_time, once_update_candles, ws_df=ws_windows.get(symbol),
+            base_delta=base_delta,
         )
         if df_res is None:
             continue

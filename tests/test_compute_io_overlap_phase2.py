@@ -1111,6 +1111,68 @@ def test_run_startup_catchup_skips_covered_ws_symbols_and_fetches_only_missed(tm
     assert routed == ["MISSUSDT"]
 
 
+def test_load_closed_base_window_rejects_gapped_ws_cache_and_heals_from_flat_pkl(tmp_path, monkeypatch):
+    """Regression for 2026-11-25 11:25 UTC bug: when a restart leaves a 1-bar hole
+    (e.g. 12:10) in 48h ws_cache while run_startup_catchup healed flat_pkl (src='rest'),
+    _load_closed_base_window MUST detect the internal time gap in ws_cache and merge
+    with flat_pkl instead of returning the gapped ws_closed directly.
+    Meanwhile, a truly contiguous ws_cache window MUST still skip flat_pkl disk reads.
+    """
+    from core.pipeline import resample as r_mod
+
+    b5 = tmp_path / "binance_swap_5m"
+    b5.mkdir(parents=True)
+    run_time = datetime(2026, 11, 25, 12, 25, tzinfo=timezone.utc)
+    once_update = 24
+
+    # Full 36 contiguous 5m bars ending at 12:20 (including 12:10)
+    all_times = pd.date_range(end=datetime(2026, 11, 25, 12, 20, tzinfo=timezone.utc), periods=36, freq="5min", tz="UTC")
+    df_full = pd.DataFrame({
+        "candle_begin_time": all_times,
+        "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5,
+        "volume": 10.0, "quote_volume": 1005.0,
+        "trade_num": pd.Series([5] * len(all_times), dtype="int64"),
+        "taker_buy_base_asset_volume": 5.0, "taker_buy_quote_asset_volume": 502.5,
+    })
+    # Give 12:10 a distinct volume (701.526) and mark WS bars with 10.5 close to verify WS priority
+    t_hole = pd.Timestamp("2026-11-25 12:10:00", tz="UTC")
+    df_flat = df_full.copy()
+    df_flat.loc[df_flat["candle_begin_time"] == t_hole, "volume"] = 701.526
+    df_flat["_source"] = "ws"
+    df_flat.loc[df_flat["candle_begin_time"] == t_hole, "_source"] = "rest"
+    df_flat.to_pickle(b5 / "BTCUSDT.pkl")
+
+    # 1) ws_cache has 35 rows (>= once_update=24!) but is MISSING 12:10:00 (and no .gap file!)
+    df_ws_gapped = df_full[df_full["candle_begin_time"] != t_hole].reset_index(drop=True).copy()
+    df_ws_gapped["close"] = 100.75  # WS authority should still win on non-hole bars
+
+    loaded = r_mod._load_closed_base_window(
+        b5, "BTCUSDT", run_time, once_update, ws_df=df_ws_gapped, base_delta=timedelta(minutes=5)
+    )
+    assert loaded is not None
+    tail24 = loaded.tail(once_update).reset_index(drop=True)
+    # 12:10 MUST be present with its exact REST volume!
+    hole_rows = tail24[tail24["candle_begin_time"] == t_hole]
+    assert len(hole_rows) == 1, "12:10:00 REST-recovered bar was dropped by gapped ws_cache fast path!"
+    assert float(hole_rows["volume"].iloc[0]) == pytest.approx(701.526)
+    # Non-hole WS bars must preserve WS authority (100.75)
+    assert float(tail24.loc[tail24["candle_begin_time"] == pd.Timestamp("2026-11-25 12:20:00", tz="UTC"), "close"].iloc[0]) == pytest.approx(100.75)
+
+    # 2) Truly contiguous ws_cache MUST still take the disk-free fast path (zero read_pickle!)
+    orig_read_pickle = pd.read_pickle
+    monkeypatch.setattr(
+        pd, "read_pickle",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("Contiguous ws_cache must skip disk read!")),
+    )
+    loaded_fast = r_mod._load_closed_base_window(
+        b5, "BTCUSDT", run_time, once_update, ws_df=df_full, base_delta=timedelta(minutes=5)
+    )
+    monkeypatch.setattr(pd, "read_pickle", orig_read_pickle)
+    assert loaded_fast is not None
+    assert len(loaded_fast) == len(df_full)
+
+
+
 
 
 
