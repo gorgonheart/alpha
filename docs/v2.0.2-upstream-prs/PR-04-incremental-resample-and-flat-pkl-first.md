@@ -1,4 +1,4 @@
-# PR-04: `O(1)` 重叠增量重采样、`flat_pkl` 优先读、多线程 `resample_history` 与 `fill_gaps` 整型还原
+# PR-04: `O(1)` 重叠增量重采样、`flat_pkl` 优先读、核数自适应 `resample_history` 与 `fill_gaps` 整型还原
 
 * **建议分支**：`perf/incremental-resample-and-flat-pkl-first`
 * **目标仓库 / 基线**：`coin-realtime-data_v2.0.2`
@@ -15,7 +15,7 @@
 
 1. **实时重采样优先读 240 根轻量 `flat_pkl`**：避开读取 7,000~8,640 行的月度分区 pkl，仅在 `flat_pkl` 缺失或闭合根数不足 `once_update_candles` 时安全回退 `TSManager` 月分区。
 2. **新增 `update_resample_candle_incremental()` 实现 $O(1)$ 重叠窗口合并**：常规每小时重采样仅产出 ~7 根 1h bar（前 6 根与历史尾部重叠、末 1 根新增）；通过 `searchsorted` 定位切点，零拷贝保留不变历史前缀，仅对尾部 ~8 根执行去重、48h 拆分检测与补空；遇任何异常自动回退全量 `update_resample_candle()`。
-3. **启动期 `resample_history()` 改为 4 线程并行**：取代 `v2.0.2` 的单线程串行遍历 1,287 币。
+3. **启动期 `resample_history()` 按核数自适应并发**：取代 `v2.0.2` 的单线程串行遍历，同时严格控制每进程线程数防止 `2c4g` 重启 OOM。
 4. **修复 `fill_gaps()` 整型列类型漂移**：防止 `how='left'` merge 注入 `NaN` 把 `trade_num`（`int64`）静默提升为 `float64`。
 
 ## 3. 问题（v2.0.2 现状与根因）
@@ -34,9 +34,24 @@
   * `docs/kb/performance-analysis.md`（§5.8）：Windows 240 序列 × 6,000 根合成对拍，接入 `flat_pkl` 优先读与计算池后，`resample` 从 **`4.10s → 1.45s`（2.83×）**，`check_exact=True` 逐位一致。
   * `docs/superpowers/plans/2026-11-25-producer-compute-io-overlap.md`（Task 2）指出：早先的 `update_resample_candle_incremental` 在 `first_new_time <= last_old_time` 时直接退回全量，而常规 99 根 5m 重采样产出的 ~7 根 1h bar **100% 满足重叠条件**，导致增量快路径几乎从未命中！引入切点 `cut_pos = searchsorted(first_new_time)` 后，每轮仅处理尾部 ~8 根，与全量 Oracle `check_exact=True` 逐位零差。
 
-## 5. 代码改动（面向 `coin-realtime-data_v2.0.2`）
+## 5. 硬件规格（`2c4g`/`2c8g`/`4c8g`）与消费端（PKL vs Arrow）局限评估
 
-### 5.1 `core/pipeline/resample.py` — 修复 `fill_gaps` 整型 dtype 还原
+### 5.1 硬件规格局限与防 OOM 修正
+* **`update_resample_candle_incremental` + `flat_pkl` 优先读 + `fill_gaps` 整型还原**：**全规格强正收益**（大幅减少 CPU、内存拷贝与磁盘读量）。
+* **`resample_history` 多线程在 `2c4g` 上的 OOM 高危点**：
+  * `v2.0.2/core/app.py` 的 `init_history` 外层已通过 `ProcessPoolExecutor(max_workers=2)` 并发执行 `spot` 和 `swap` 两个 `resample_history` 子进程。
+  * 若内部硬编码 `ThreadPoolExecutor(max_workers=4)`，会叠加出 **`2 进程 × 4 线程 = 8 个并发流`** 同时调用 `TSManager.read_all()`。由于 `v2.0.2` 保留完整 5m 月分区（未做 30 天裁剪），当 `kline_count_1h` 较大时，单币全量 5m DataFrame 可达数十 MB，8 份叠加 concat/copy 极易瞬间击穿 `2c4g`（~3.3 GiB 可用内存）诱发 OOM Killer。
+* **修正护栏**：`resample_history` 线程数改为按核数自适应：`n_threads = min(4, max(1, (os.cpu_count() or 2) // 2))`——
+  * `2c4g` / `2c8g`：每市场 `1` 线程（spot + swap 合计正好 `2` 并发，既吃满 2 核又把内存峰值砍半）；
+  * `4c8g`：每市场 `2` 线程（合计 `4` 并发，吃满 4 核）；
+  * `8c+`：每市场上限 `4` 线程。
+
+### 5.2 强依赖 PKL 消费端评估
+* **完全成立**。产出 `1h_resample/{offset}/{symbol}.pkl` 与旧全量版 `check_exact=True`；`fill_gaps` 恢复 `trade_num` 的 `int64` 类型对 PKL 消费端（防止跨币种 `concat` 隐式转 `float64`）同样是正向修复。
+
+## 6. 代码改动（面向 `coin-realtime-data_v2.0.2`）
+
+### 6.1 `core/pipeline/resample.py` — 修复 `fill_gaps` 整型 dtype 还原
 
 ```python
     int_dtypes = {col: dt for col, dt in df.dtypes.items() if pd.api.types.is_integer_dtype(dt)}
@@ -48,7 +63,7 @@
         df[col] = df[col].astype(dt)
 ```
 
-### 5.2 `core/pipeline/resample.py` — 新增 `update_resample_candle_incremental`
+### 6.2 `core/pipeline/resample.py` — 新增 `update_resample_candle_incremental`
 
 关键快路径逻辑（支持严格追加 + 常规重叠窗口，异常自动回退 `update_resample_candle(..., df_old_preloaded=df_old)` 避免重复读盘）：
 
@@ -159,7 +174,7 @@ def update_resample_candle_incremental(
     return df_total['candle_begin_time'].iloc[0], df_total['candle_begin_time'].iloc[-1]
 ```
 
-### 5.3 `core/pipeline/resample.py` — `_load_closed_base_window`（`flat_pkl` 优先 + 月分区回退）与多线程 `resample_history`
+### 6.3 `core/pipeline/resample.py` — `_load_closed_base_window`（`flat_pkl` 优先 + 月分区回退）与自适应 `resample_history`
 
 ```python
 def _load_closed_base_window(
@@ -196,12 +211,23 @@ def _load_closed_base_window(
 ```
 
 * `_resample_one_symbol` 改用 `_load_closed_base_window` + `update_resample_candle_incremental`。
-* `resample_history` 将 `for symbol in symbols:` 提取为 `_process_symbol(symbol)` 并用 `ThreadPoolExecutor(max_workers=4)` 并行执行。
+* `resample_history` 线程并发改为按核自适应：
 
-## 6. 测试与验收清单
+```python
+    n_threads = min(4, max(1, (os.cpu_count() or 2) // 2))
+    if n_threads <= 1 or len(symbols) <= 1:
+        for sym in symbols:
+            _process_symbol(sym)
+    else:
+        with ThreadPoolExecutor(max_workers=n_threads) as pool:
+            list(pool.map(_process_symbol, symbols))
+```
+
+## 7. 测试与验收清单
 
 参考 `alpha/tests/test_2b_history_and_resample.py`、`tests/test_parallel_pipeline_phase1.py`、`tests/test_compute_io_overlap_phase2.py`：
 1. `test_fill_gaps_restores_integer_trade_num_dtype`：存在缺口补空后，`trade_num` 保持 `int64` 且缺口填 0。
 2. `test_update_resample_candle_incremental_overlapping_7_bars_matches_oracle_and_returns_tail`：覆盖常规 7 根重叠、含 1h 缺口、代币拆分（>48h + >10% 跳空）三种场景，与 `update_resample_candle` 全量 Oracle `check_exact=True`。
 3. `test_resample_prefers_flat_pkl_without_reading_tsmanager_when_window_sufficient`：当 `flat_pkl` 有 240 根闭合 K 线时，monkeypatch `TSManager.read_partition` 抛错断言零触发，结果与纯月分区 Oracle 逐位一致。
 4. `test_resample_falls_back_to_tsmanager_when_flat_pkl_shorter_than_window`：当 `flat_pkl` 仅 24 根（`< 99`）而月分区有 150 根时，自动回退月分区保证窗口完整。
+5. 新增并发上限单测：在 `os.cpu_count() == 2` 时 `resample_history` 串行运行（配合外层 2 进程总并发为 2），`os.cpu_count() == 4` 时每市场 2 线程（总并发为 4）。

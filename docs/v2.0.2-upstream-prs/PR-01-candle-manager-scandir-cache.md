@@ -9,7 +9,7 @@
 
 ## 1. 场景
 
-在 `use_websocket=True` 模式下，4 个 `Writer` 子进程在每个 5 分钟边界集中处理 1,287+ 个交易对（Binance 约 520 spot + 767 swap），每个交易对落盘后需连续调用 `save_ready(symbol, run_time)` 与 `save_ws_ready(symbol, run_time)` 清理旧时间戳标记并写入新标记；同时在 `resample_1h` 与 `preprocess` 目录，每轮也会高频调用 `save_ready` / `remove_symbol`。
+在 `use_websocket=True` 模式下，`Writer` 子进程在每个 5 分钟边界集中处理 1,287+ 个交易对（Binance 约 520 spot + 767 swap），每个交易对落盘后需连续调用 `save_ready(symbol, run_time)` 与 `save_ws_ready(symbol, run_time)` 清理旧时间戳标记并写入新标记；同时在 `resample_1h` 与 `preprocess` 目录，每轮也会高频调用 `save_ready` / `remove_symbol`。
 
 ## 2. 目标
 
@@ -48,9 +48,15 @@ def save_ws_ready(self, symbol, run_time):
     2. 引入 `_READY_INDEX_TTL_SEC = 2.0`：在 2 秒突发落盘窗内命中 $O(1)$ 缓存（覆盖整轮 1,287 币写入），超过 2 秒进入下个周期或被外部进程改写后自动用单次 `os.scandir()` 刷新。
   * 修复上线验证（`2026-11-25`）：跨进程 `.ready` 文件数量长期恒定在 14 个，零泄漏。
 
-## 5. 代码改动（面向 `coin-realtime-data_v2.0.2`）
+## 5. 硬件规格（`2c4g`/`2c8g`/`4c8g`）与消费端（PKL vs Arrow）局限评估
 
-### 5.1 修改 `core/storage/candle_manager.py`
+* **硬件规格**：**全规格强正收益，无低配副作用**。进程内索引缓存仅存路径字符串（1,287 币约 `~200 KB` 内存），在 `2c4g` / `2c8g` 弱 CPU 与低突发 IOPS 云盘上，省去数百万次目录项遍历的边际收益比 `4c8g` 更加显著。
+* **强依赖 PKL 消费端**：**完全成立**。本改动不改变 `.ready` 文件命名、内容或写入时机，下游 `check_ready()` / `pd.read_pickle()` 契约零变化。
+* **联动建议**：针对 PKL 消费端慢读易踩非原子写竞态的问题，建议配合 PR-05 中的 `save_data_file` 原子写（`.tmp` + `os.replace`）一并合入。
+
+## 6. 代码改动（面向 `coin-realtime-data_v2.0.2`）
+
+### 6.1 修改 `core/storage/candle_manager.py`
 
 1. 顶部增加 `import time` 及模块常量 `_READY_INDEX_TTL_SEC = 2.0`。
 2. 在 `CandleFileReader.__init__` 初始化缓存字段，并新增 `__getstate__` 与 `_ensure_ready_indexed`：
@@ -163,7 +169,7 @@ class CandleFileReader:
             os.remove(df_path)
 ```
 
-## 6. 测试与验收清单
+## 7. 测试与验收清单
 
 参考 `alpha/tests/test_compute_io_overlap_phase2.py` 中以下两个用例直接迁移至 `v2.0.2`：
 1. `test_candle_file_manager_save_ready_eliminates_per_call_glob`：预置历史 `.ready`/`.ws_ready` 文件，连续 15 次调用 `save_ready`/`save_ws_ready`，monkeypatch `glob` 断言调用次数为 **0**，且磁盘仅保留最新时间戳标记。

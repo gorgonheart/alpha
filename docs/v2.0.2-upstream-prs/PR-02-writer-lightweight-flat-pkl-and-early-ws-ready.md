@@ -15,8 +15,9 @@
 
 1. **解除 `flat_pkl` 磁盘与 I/O 炸弹**：将 `flat_pkl` 滚动上限与 `TSManager` 历史保留期彻底解耦，固定为轻量小窗（默认 `ws_flat_pkl_bars = 240` 根 ≈ 20 小时，单文件 ~22 KB），同时保证大批量补齐（`>240` 根）写入月度分区时不丢数据。
 2. **削减 IPC 序列化开销**：`WsRunner → Writer` 队列改传原生轻量 `kline` 字典，消除 WS 进程每根构造单行 `DataFrame` + pickle 序列化开销，且 `Writer` 保持向后兼容 `df` 载荷（供 REST 兜底使用）。
-3. **将慢速月分区写移出屏障热路径**：`Writer` 在原子写完 `flat_pkl` 并更新 `.gap` 后**立即发布 `.ready` / `.ws_ready`**，再异步执行 `TSManager` 月度分区更新（且月分区异常不回滚已落盘的 `flat_pkl`）。
-4. **修复 3 个工程隐患**：
+3. **将慢速月分区写移出屏障热路径**：`Writer` 在原子写完 `flat_pkl` 并更新 `.gap` 后**立即发布 `.ready` / `.ws_ready`**，再执行 `TSManager` 月度分区更新（且月分区异常不回滚已落盘的 `flat_pkl`）。
+4. **Writer 进程数按 CPU 核数自适应**：`4c+` 机器默认 4 个 Writer，`2c` 机器默认 2 个 Writer，避免低配机多 Writer 与 Resample 抢核。
+5. **修复 3 个工程隐患**：
    * 裁剪所有早于保留窗口的历史月分区（修复 `v2.0.2` 仅裁 `partitions[0]` 导致多月积累无法回收的 Bug）；
    * 统一 `candle_begin_time` 为 `datetime64[ns, UTC]`，兼容遗留 tz-naive 或 ms 精度 pkl；
    * `_write_pkl` 使用 `{pid}.{tid}.tmp` 并增加 Windows `PermissionError` 退避重试。
@@ -39,15 +40,29 @@
 * **上线组合收益**：`docs/superpowers/plans/2026-11-24-producer-4core-parallel-pipeline.md`（Task 1）及 `docs/kb/performance-analysis.md`（§2、§5.8）记录：一期 4 核流水线（含本 PR 全部 Writer 改造）上线测试机 5 小时实测，`25m` 轮 `.ready` 中位数由 **`+149.1s` 降至 `+74.0s`（-50.4%）**，活跃 7 父策略 157/157 选币与 538/538 合约方向 100% 一致。
 * **临界顺序护栏**：`flat_pkl` 必须使用未裁剪的 `df_merged` 过滤 `df_for_partition` 再写月分区（提交 `65f78ae`），否则当单次 REST 批量写入行数超过 `flat_pkl_max_bars=240` 时会导致历史补齐行丢失。
 
-## 5. 代码改动（面向 `coin-realtime-data_v2.0.2`）
+## 5. 硬件规格（`2c4g`/`2c8g`/`4c8g`）与消费端（PKL vs Arrow）局限评估
 
-### 5.1 `config_binance.py` / `config_okx.py` & `core/handle.py`
+### 5.1 硬件规格局限与自适应调整
+* **轻载荷 `kline` dict + `flat_pkl=240` + 多旧分区裁剪**：**全规格强正收益**（大幅削减 `2c4g` 磁盘写放大与 IPC 内存）。
+* **`num_writers` 与“提前发 `.ws_ready`”在 `2c4g`/`2c8g` 上的风险**：
+  * `Writer._update_tsmanager()` 并非零 CPU DMA，而是反序列化 ~7,000 行月分区 + `concat`/`sort` + 重新 pickle 序列化的 CPU/内存重活。
+  * 在 **`4c8g`** 上，4 个 Writer 并行落盘 + 提前发 `.ws_ready` 让出 2~3 核给 Resample 可显著缩短墙钟；
+  * 在 **`2c4g` / `2c8g`** 上，若硬编码 `num_writers=4`，提前放行后 `4 Writer + 2 ws_runner + Resample` 将在 2 个 vCPU 上发生剧烈抢核，且 4 个常驻 Writer 进程在 4 GB 机器上多占 ~200 MB RSS 并与重采样叠峰。
+* **修正护栏**：`num_writers` 默认值改为 **`min(4, max(2, os.cpu_count() or 2))`**（2 核机器默认 2 个 Writer，4 核及以上默认 4 个，仍允许用户通过配置显式覆盖）。
+
+### 5.2 强依赖 PKL 消费端评估
+* **常规 1h 消费端（读 `1h_resample` 或 `preprocess` PKL）**：**完全成立**，消费端零感知。
+* **边界前提（5m 直读策略）**：若存在 5m 级下游消费端或自定义脚本**直接读取 `base_5m/{symbol}.pkl`**（flat pkl）并期望读到超过 240 根（20 小时）的 5m 历史，本 PR 会使其行数截断至 240 根。此类场景须将 5m 消费端改为通过 `TSManager(base_5m / symbol).read_all()` 读取月分区，或在配置中显式调大 `ws_flat_pkl_bars`。
+
+## 6. 代码改动（面向 `coin-realtime-data_v2.0.2`）
+
+### 6.1 `config_binance.py` / `config_okx.py` & `core/handle.py`
 * 新增可配置参数（保持向后兼容默认值）：
   * `ws_flat_pkl_bars = 240`（`BmacHandle.ws_flat_pkl_bars: int = 240`）
-  * `num_writers = 4`（允许在配置中覆盖 `RuntimeSupervisor.NUM_WRITERS`）
-* `BmacHandle` 提供 `flat_pkl_max_bars()` 方法：`max(int(self.ws_flat_pkl_bars), int(self.spot.once_update_candles) * 2)` 或直接返回 `int(self.ws_flat_pkl_bars)`。
+  * `num_writers = None`（`None` 时按 `min(4, max(2, os.cpu_count() or 2))` 自适应，也可显式填整数如 `2` 或 `4`）
+* `BmacHandle` 提供 `flat_pkl_max_bars()` 方法返回 `int(self.ws_flat_pkl_bars)`。
 
-### 5.2 `core/ws/ws_runner.py`
+### 6.2 `core/ws/ws_runner.py`
 * `_kline_to_writer_item()` 不再构造 `pd.DataFrame`，改为输出纯 Python 字典：
 
 ```python
@@ -80,7 +95,7 @@ def _kline_to_writer_item(
     }
 ```
 
-### 5.3 `core/storage/writer.py`
+### 6.3 `core/storage/writer.py`
 1. 新增 `_kline_dict_to_df(kline)` 与 `_normalize_candle_begin_time(df)`：
 
 ```python
@@ -143,10 +158,18 @@ def _kline_dict_to_df(kline: dict) -> pd.DataFrame:
                 self._last_partition_trim[key] = run_time
 ```
 
-### 5.4 `core/pipeline/runtime_supervisor.py`
+### 6.4 `core/pipeline/runtime_supervisor.py`
+* `RuntimeSupervisor.__init__` 解析自适应 writer 数：
+
+```python
+default_writers = min(self.NUM_WRITERS, max(2, os.cpu_count() or 2))
+cfg_writers = getattr(handle, "num_writers", None)
+resolved_writers = int(num_writers if num_writers is not None else (cfg_writers or default_writers))
+```
+
 * `run_writer_subprocess` 与 `start_writers` 透传 `flat_pkl_max_bars` 与 `partition_retention_bars`（默认取 `handle.num_base_candles`，不改变 `v2.0.2` 的 5m 历史保留策略）。
 
-## 6. 测试与验收清单
+## 7. 测试与验收清单
 
 参考 `alpha/tests/test_2b_writer_and_storage.py`、`tests/test_parallel_pipeline_phase1.py`、`tests/test_compute_io_overlap_phase2.py`：
 1. `test_ws_runner_emits_lightweight_kline_dict_and_writer_accepts_both_kline_and_df`：断言 `kline` 字典与 `df` 两种输入落盘的 `flat_pkl` 和 `TSManager` 逐位一致（`check_exact=True`）。
@@ -154,3 +177,4 @@ def _kline_dict_to_df(kline: dict) -> pd.DataFrame:
 3. `test_writer_publishes_ws_ready_after_flat_pkl_and_gap_before_tsmanager`：在 `_update_tsmanager` 内断言 `flat_pkl`/`.gap`/`.ws_ready` 均已落盘，且即使月分区抛出 `OSError` 也不影响已发布的 `.ws_ready`。
 4. `test_writer_normalizes_mixed_naive_and_ms_timestamps_in_legacy_flat_pkl`：验证混合时区与 ms 精度遗留 pkl 合并后统一为 `datetime64[ns, UTC]`。
 5. `test_writer_atomic_replace_retries_transient_permission_error`：模拟前 2 次 `os.replace` 抛 `PermissionError`，第 3 次成功并保证内容一致。
+6. 新增自适应单测：monkeypatch `os.cpu_count` 分别返回 `2` 与 `4`，验证默认 `num_writers` 分别为 `2` 与 `4`。

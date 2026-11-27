@@ -45,12 +45,20 @@ WS 模式下每个启用周期，`update_cycle.py` 会并发启动：
   * 参数扫描证伪“缩短 grace 到 3s”（会把 55–77% swap 推给 REST，请求涨至 ~1,050），确认 **`ws_wait_sec=14.0`（判定点 `+16s`）** 为兼顾 0 假缺口与掉线兜底的最优解。
 * **重启按需补齐实测（`alphaonline/docs/kb/performance-analysis.md` §2）**：上线 `0d64e9d` 后，滚动重启阶段 2 实现 **0 REST 覆盖**，首轮零修订。
 
-## 5. 代码改动（面向 `coin-realtime-data_v2.0.2`）
+## 5. 硬件规格（`2c4g`/`2c8g`/`4c8g`）与消费端（PKL vs Arrow）局限评估
 
-### 5.1 `config_binance.py` / `config_okx.py` & `core/handle.py`
-* 新增可配置项 `ws_wait_sec = 14.0`（带非负数值校验，写入 `BmacHandle.ws_wait_sec: float = 14.0`）。
+* **硬件规格局限（`ws_wait_sec=14.0` 的跨规格漂移）**：
+  * Barrier 早退、可取消事件、分级 `limit(5/99)` 与按需启动补齐在 **`2c4g` / `2c8g` / `4c8g`** 上均是纯正收益。
+  * 但默认值 `ws_wait_sec = 14.0` 是基于 **`4c8g` 云盘（排空 max `14.92s`）** 标定的。在 **`2c4g` / `2c8g`**（仅 2 个 Writer 且入门云盘突发 IOPS 较低）上，若仅合入 PR-03 而未启用 PR-08 的 **Layer 1（WAL 缺口判定）**，全市场 1,287 币 `.ws_ready` 排空可能超过 `16~20s`，此时 `14.0s` 仍会压在排空中段引发假缺口 REST。
+  * **应对建议**：① 最优解是搭配 PR-07 + PR-08（仅启 WAL 缺口判定），从根源将判定信号与磁盘排空解耦；② 若暂不上 PR-07/08，低配机器可在 `config_*.py` 中按实测排空 `p99` 将 `ws_wait_sec` 调至 `18.0~20.0`（仍远小于 `45s` 软截止）。
+* **强依赖 PKL 消费端**：**完全成立**。本 PR 仅优化采集与兜底调度，落盘的 5m/1h/batch PKL 内容与旧版完全等价。
 
-### 5.2 `core/pipeline/barrier.py`
+## 6. 代码改动（面向 `coin-realtime-data_v2.0.2`）
+
+### 6.1 `config_binance.py` / `config_okx.py` & `core/handle.py`
+* 新增可配置项 `ws_wait_sec = 14.0`（带非负数值校验，写入 `BmacHandle.ws_wait_sec: float = 14.0`；注释提示 2c 弱云盘未开 WAL 判定时可调至 `18.0~20.0`）。
+
+### 6.2 `core/pipeline/barrier.py`
 * 新增可选参数 `rest_confirmed_empty=None`，并在 `while True` 顶部竞态安全采样 `rest_done_was_set`：
 
 ```python
@@ -85,7 +93,7 @@ WS 模式下每个启用周期，`update_cycle.py` 会并发启动：
             break
 ```
 
-### 5.3 `core/pipeline/data_update.py`
+### 6.3 `core/pipeline/data_update.py`
 * 为 `fetch_update_resample`、`async_fetch_update_resample_candles`、`fetch_update_binance_candles` 增加可选参数 `symbol_limits: Optional[dict[str, int]] = None`（及空集合短路）：
 
 ```python
@@ -105,7 +113,7 @@ WS 模式下每个启用周期，`update_cycle.py` 会并发启动：
             df_base = df_base[df_base['candle_begin_time'] < run_time]
 ```
 
-### 5.4 `core/pipeline/update_cycle.py`
+### 6.4 `core/pipeline/update_cycle.py`
 1. 拆分 `_compute_missed_and_gaps()` 返回 `(missed, gap_symbols)`（保留 `_compute_missed_symbols` 兼容包装）。
 2. `_start_rest_fallback` 的 `state` 新增 `"cancel": threading.Event()`、`"confirmed_empty"` 与 `"failed"`。
 3. `_rest_fallback_worker` 使用 `cancel_ev.wait(timeout=grace_sec)` 替代 `time.sleep`；屏障双市场 `success == total` 且 `not has_gaps` 时，主流程立即调用 `rest_state["cancel"].set()`。
@@ -124,7 +132,7 @@ for tt, m_set, g_set in (("spot", spot_missed, spot_gaps), ("swap", swap_missed,
 
 5. `run_startup_catchup()` 改为先调用 `_compute_missed_and_gaps()`，仅当 `spot_missed` 或 `swap_missed` 非空时才按 `symbols_subset` + `symbol_limits` 拉取缺失子集。
 
-## 6. 测试与验收清单
+## 7. 测试与验收清单
 
 参考 `alpha/tests/test_2b_ws_cycle_and_app.py`、`tests/test_parallel_pipeline_phase1.py`、`tests/test_compute_io_overlap_phase2.py`：
 1. `test_barrier_exits_early_after_rest_done_for_unopened_listing_without_race`：验证未开盘新币在 `rest_done` 后 `<1s` 早退，不等满 `timeout_sec`。
