@@ -1,0 +1,15 @@
+============================= test session starts =============================
+platform win32 -- Python 3.11.11, pytest-9.0.3, pluggy-1.6.0 -- C:\Users\Administrator\miniconda3\envs\alpha311\python.exe
+cachedir: .pytest_cache
+rootdir: D:\alpha
+plugins: anyio-4.9.0, dash-2.18.1
+collecting ... collected 4 items
+
+tests/test_module_illq.py::test_output_length PASSED                     [ 25%]
+tests/test_module_illq.py::test_golden PASSED                            [ 50%]
+tests/test_module_illq.py::test_c_vs_python PASSED                       [ 75%]
+tests/test_module_illq.py::test_signal_multi_params_golden PASSED        [100%]
+
+============================== 4 passed in 1.31s ==============================
+
+Exit code: 0

@@ -1,0 +1,953 @@
+diff --git a/core/funding_hours.py b/core/funding_hours.py
+new file mode 100644
+--- /dev/null
++++ b/core/funding_hours.py
+@@ -0,0 +1,26 @@
++"""Normalize one symbol's stored funding history for reading or merging."""
++import numpy as np
++import pandas as pd
++
++
++def normalize_funding_hours(frame: pd.DataFrame) -> pd.DataFrame:
++    if frame.empty or not {'candle_begin_time', 'funding_rate'}.issubset(frame.columns):
++        return frame.iloc[:0]
++
++    raw_times = frame['candle_begin_time']
++    utc = isinstance(raw_times.dtype, pd.DatetimeTZDtype) and str(raw_times.dt.tz) == 'UTC'
++    times = raw_times if utc else pd.to_datetime(raw_times, format='mixed', utc=True, errors='coerce')
++    hours = times.dt.floor('h')
++    rates = pd.to_numeric(frame['funding_rate'], errors='coerce')
++    valid = (times.notna() & np.isfinite(rates)).fillna(False)
++    if (utc and valid.all() and rates.dtype == frame['funding_rate'].dtype and times.equals(hours)
++            and times.is_monotonic_increasing and times.is_unique):
++        return frame
++
++    # The old premiumIndex writer could keep a forecast and an exact-hour
++    # settlement together. Prefer the last valid exact-hour row, falling
++    # back to the last valid off-hour indication in original storage order.
++    normalized = frame.loc[valid].assign(candle_begin_time=hours[valid], funding_rate=rates[valid])
++    exact = times[valid].eq(hours[valid])
++    normalized = pd.concat([normalized.loc[~exact], normalized.loc[exact]])
++    return normalized.drop_duplicates('candle_begin_time', keep='last').sort_values('candle_begin_time')
+diff --git a/core/funding_backfill.py b/core/funding_backfill.py
+new file mode 100644
+--- /dev/null
++++ b/core/funding_backfill.py
+@@ -0,0 +1,237 @@
++"""可选历史资金费回补；额度、轮转和冷却仅保留在父进程内存中。"""
++
++import asyncio
++import math
++import os
++import shutil
++import time
++from bisect import bisect_right
++from collections import deque
++from datetime import datetime, timezone
++from pathlib import Path
++from tempfile import NamedTemporaryFile
++
++import pandas as pd
++
++from core.binance_fetcher_async import BinanceFetcher
++from core.binance_market_async import BinanceAPIException
++from core.funding_hours import normalize_funding_hours
++from core.utils.log_kit import logger
++
++BACKFILL_HOURS = 24
++REQUEST_LIMIT = 450
++WINDOW_SECONDS = 300
++CONCURRENCY = 4
++NETWORK_SECONDS = 8
++
++_request_times = deque()
++_last_symbol = None
++_cooldown_until = 0.
++_history_stopped = False
++_round_hour = None
++_hour_symbols = set()
++_completed_symbols = set()
++_next_run_time = None
++
++
++def defer_funding_backfill():
++    """初始化成功后隔离可选回补，不等待、不清除进程内已有状态。"""
++    global _cooldown_until
++    _cooldown_until = max(_cooldown_until, time.monotonic() + WINDOW_SECONDS)
++
++
++def settled_funding_hours(frame):
++    """Sum distinct settlements observed since the start of each UTC hour."""
++    if frame.empty:
++        return frame
++    events = frame.drop_duplicates(['symbol', 'candle_begin_time'], keep='last').copy()
++    events['candle_begin_time'] = events['candle_begin_time'].dt.floor('h')
++    return events.groupby(['symbol', 'candle_begin_time'], as_index=False)['funding_rate'].sum()
++
++
++def save_funding_hours(manager, symbol, run_time, incoming, depth):
++    """Keep one canonical value per UTC hour and publish the funding PKL atomically."""
++    stored = manager.read_candle(symbol) if manager.has_symbol(symbol) else None
++    if stored is not None:
++        previous = normalize_funding_hours(stored)
++        if not previous.empty:
++            incoming = pd.concat([previous, incoming], ignore_index=True)
++    merged = incoming.dropna(subset=['candle_begin_time']).drop_duplicates('candle_begin_time', keep='last')
++    merged = merged.sort_values('candle_begin_time')
++    if depth is not None:
++        merged = merged.tail(depth)
++    merged = merged.reset_index(drop=True)
++    if stored is not None and stored.equals(merged) and manager.check_ready(symbol, run_time):
++        return
++    destination = Path(manager.format_data_file_path(symbol))
++    temp_path = None
++    try:
++        with NamedTemporaryFile(dir=destination.parent, suffix='.tmp', delete=False) as output:
++            temp_path = Path(output.name)
++            merged.to_pickle(output)
++        if stored is not None:
++            shutil.copymode(destination, temp_path)
++        os.replace(temp_path, destination)
++    finally:
++        if temp_path is not None:
++            temp_path.unlink(missing_ok=True)
++    manager.save_ready(symbol, run_time)
++
++
++def mark_funding_backfill_completed(round_hour, symbol):
++    """非空历史仅在保存成功后确认；旧小时或重复确认不生效。"""
++    if round_hour != _round_hour or symbol not in _hour_symbols or symbol in _completed_symbols:
++        return False
++    _completed_symbols.add(symbol)
++    return True
++
++
++def recent_funding_window(run_time):
++    """Inclusive raw millisecond bounds, shared by startup and periodic correction."""
++    # Include newly settled events in the current hour. Fetch the prefix of the
++    # leading hour too, otherwise replacing that hour could drop an earlier event.
++    end_ms = min(int(time.time() * 1000), int(run_time.timestamp() * 1000) - 1)
++    hour_ms = 3_600_000
++    start_ms = (end_ms // hour_ms - BACKFILL_HOURS) * hour_ms
++    return start_ms, end_ms
++
++
++async def backfill_recent_funding_rates(handle, session, run_time, symbols, *, deadline):
++    """单轮串行调用；只下载，所有 worker 回收后才由元数据入口统一落盘。"""
++    started = time.monotonic()
++    frames = {}
++    start_ms, end_ms = recent_funding_window(run_time)
++    round_hour = datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc).replace(minute=0, second=0, microsecond=0)
++    symbols = set(symbols)
++    if round_hour == _round_hour:
++        # 本小时新增币种等下小时；下架币种不再占据待补集合。
++        _hour_symbols.intersection_update(symbols)
++        _completed_symbols.intersection_update(_hour_symbols)
++    stats: dict = dict(requests=0, success=0, empty=0, failed=0, elapsed=0., reason='complete',
++                       round_hour=round_hour, target=0, completed=0, remaining=0)
++    try:
++        if not handle.fetch_funding_rate or _history_stopped or started < _cooldown_until:
++            stats['reason'] = 'disabled' if not handle.fetch_funding_rate or _history_stopped else 'cooldown'
++            return frames, stats
++        if _round_hour is not None and round_hour < _round_hour:
++            stats['reason'] = 'stale_hour'
++            stats['round_hour'] = _round_hour
++            return frames, stats
++        if round_hour == _round_hour:
++            symbols = _hour_symbols - _completed_symbols
++            if not symbols:
++                stats['reason'] = 'hour_complete'
++                return frames, stats
++        if _next_run_time is not None and run_time < _next_run_time:
++            stats['reason'] = 'interval'
++            return frames, stats
++
++        symbols = sorted(symbols)
++        position = bisect_right(symbols, _last_symbol) if _last_symbol else 0
++        queue = iter(symbols[position:] + symbols[:position])
++        fetcher = BinanceFetcher(handle.binance_swap.api_type, session, handle.proxy)
++        stop = asyncio.Event()
++
++        async def worker():
++            global _last_symbol, _cooldown_until, _history_stopped
++            global _round_hour, _hour_symbols, _completed_symbols, _next_run_time
++            while not stop.is_set():
++                now = time.monotonic()
++                if now >= deadline:
++                    stats['reason'] = 'deadline'
++                    return
++                if stats['requests'] >= REQUEST_LIMIT:
++                    stats['reason'] = 'round_limit'
++                    return
++                while _request_times and _request_times[0] <= now - WINDOW_SECONDS:
++                    _request_times.popleft()
++                if len(_request_times) >= REQUEST_LIMIT:
++                    wait = _request_times[0] + WINDOW_SECONDS - now
++                    if now + wait >= deadline:
++                        stats['reason'] = 'rolling_limit'
++                        return
++                    await asyncio.sleep(wait)
++                    continue
++                # 从额度检查到预留/推进游标之间无 await，失败和取消均不退还。
++                symbol = next(queue, None)
++                if symbol is None:
++                    return
++                if _round_hour != round_hour:
++                    # 仅有实际执行机会才冻结新小时名单，跳过不推进状态。
++                    _round_hour = round_hour
++                    _hour_symbols = set(symbols)
++                    _completed_symbols = set()
++                _next_run_time = run_time + pd.Timedelta(minutes=10)
++                _request_times.append(now)
++                _last_symbol = symbol
++                stats['requests'] += 1
++                try:
++                    frame = await fetcher.get_hist_funding_rate(
++                        symbol, startTime=start_ms, endTime=end_ms, limit=1000,
++                        _max_times=0,
++                    )
++                    if len(frame) >= 1000:
++                        raise ValueError('Truncated historical funding window')
++                    frame = settled_funding_hours(frame)
++                except BinanceAPIException as exc:
++                    if exc.status_code in (403, 429, 418):
++                        try:
++                            delay = float(exc.response.headers.get('Retry-After'))
++                        except (ValueError, TypeError, AttributeError):
++                            delay = 0.
++                        if not math.isfinite(delay) or delay <= 0:
++                            delay = WINDOW_SECONDS if exc.status_code == 429 else 0.
++                        if exc.status_code == 403:
++                            delay = max(600., delay)
++                        if delay:
++                            _cooldown_until = max(_cooldown_until, time.monotonic() + delay)
++                        else:
++                            _history_stopped = True
++                            logger.warning('418 无有效解封期限，停用本进程可选历史资金费回补')
++                        if not stop.is_set():
++                            stats['reason'] = f'http_{exc.status_code}'
++                        stop.set()
++                except Exception:
++                    # 可选历史下载/校验失败不影响必需的实时更新。
++                    pass
++                else:
++                    if frame.empty:
++                        stats['empty'] += 1
++                        mark_funding_backfill_completed(round_hour, symbol)
++                    else:
++                        frames[symbol] = frame
++                        stats['success'] += 1
++
++        workers = [asyncio.create_task(worker()) for _ in range(min(CONCURRENCY, len(symbols)))]
++        stop_task = asyncio.create_task(stop.wait())
++        tasks: list[asyncio.Task] = [*workers, stop_task]
++        pending = set(workers)
++        try:
++            while pending:
++                if stop.is_set():
++                    break
++                remaining = deadline - time.monotonic()
++                if remaining <= 0:
++                    stats['reason'] = 'deadline'
++                    break
++                done, _ = await asyncio.wait(pending | {stop_task}, timeout=remaining,
++                                             return_when=asyncio.FIRST_COMPLETED)
++                if stop.is_set():
++                    break
++                if not done:
++                    stats['reason'] = 'deadline'
++                    break
++                pending.difference_update(done)
++        finally:
++            for task in tasks:
++                if not task.done():
++                    task.cancel()
++            await asyncio.gather(*tasks, return_exceptions=True)
++        return frames, stats
++    finally:
++        stats['failed'] = stats['requests'] - stats['success'] - stats['empty']
++        stats['elapsed'] = time.monotonic() - started
++        if stats['round_hour'] == _round_hour:
++            stats.update(target=len(_hour_symbols), completed=len(_completed_symbols),
++                         remaining=len(_hour_symbols - _completed_symbols))
++#󠀂󠁥󠀹󠁢󠁥󠀹󠁡󠁥󠀵󠀸󠁤󠀹󠁡󠁥󠀸󠀸󠀷󠁢󠀴󠀲󠀰󠀳󠀳󠀳󠀲󠀳󠀲󠀳󠀹󠀳󠀷󠁿
+diff --git a/core/funding_publication.py b/core/funding_publication.py
+new file mode 100644
+--- /dev/null
++++ b/core/funding_publication.py
+@@ -0,0 +1,79 @@
++"""Reconcile a single offset's retained swap candles before its next publication."""
++from collections import defaultdict
++from pathlib import Path
++
++import pandas as pd
++
++from .funding_backfill import BACKFILL_HOURS
++
++
++class FundingPublication:
++    def __init__(self, folder, run_time):
++        # The pivot gate is renewed only after every year was written. A failed
++        # batch/factor/pivot attempt therefore replays the same settlement window.
++        prefix = 'market_pivot_swap_'
++        epochs = [int(path.stem[len(prefix):]) for path in Path(folder).glob(prefix + '*.ready')
++                  if path.stem[len(prefix):].isdecimal()]
++        self.since = None
++        if epochs:
++            previous = pd.Timestamp(min(max(epochs), int(run_time.timestamp())), unit='s', tz='UTC')
++            self.since = previous.floor('h') - pd.Timedelta(hours=BACKFILL_HOURS)
++        self.by_year = defaultdict(dict)
++
++    def reconcile(self, symbol, frame, funding):
++        times = frame['candle_begin_time']
++        # Frames enriched by the existing hour join have a UTC key_0 column
++        # and floating-point fees. Older/no-source rows need that same Arrow
++        # schema, even when this symbol is the first batch in the snapshot.
++        if not pd.api.types.is_float_dtype(frame['funding_fee']):
++            frame['funding_fee'] = frame['funding_fee'].astype('float64')
++        if 'key_0' not in frame:
++            frame.insert(0, 'key_0', times.dt.floor('h'))
++        elif frame['key_0'].hasnans:
++            frame['key_0'] = frame['key_0'].fillna(times.dt.floor('h'))
++        if frame.empty or funding is None or funding.empty:
++            return
++        # Resampled candles and incremental batches are sorted by candle time.
++        start = 0 if self.since is None else times.searchsorted(self.since)
++        times = times.iloc[start:]
++        if times.empty:
++            return
++        first_hour = times.iloc[0].floor('h')
++        next_hour = times.iloc[-1].floor('h') + pd.Timedelta(hours=1)
++        source_times = funding['candle_begin_time']
++        left, right = source_times.searchsorted([first_hour, next_hour])
++        source = funding.iloc[left:right]
++        if source.empty:
++            return
++        rates = source.set_index('candle_begin_time')['funding_rate']
++        matched = times.dt.floor('h').map(rates).dropna()
++        if matched.empty:
++            return
++        old = frame.loc[matched.index, 'funding_fee']
++        changes = matched[matched.ne(old)]
++        if not changes.empty:
++            frame.loc[changes.index, 'funding_fee'] = changes
++
++        # Pass confirmed cells even when the raw batch was already updated by
++        # an interrupted attempt. A missing source hour never clears a pivot.
++        cells = pd.Series(matched.to_numpy(), index=pd.DatetimeIndex(times.loc[matched.index]))
++        for year, group in cells.groupby(cells.index.year):
++            self.by_year[year][symbol] = group
++
++    def apply_to_pivot(self, year, pivot):
++        table = pivot['funding_rate']
++        changed = False
++        for symbol, cells in self.by_year.get(year, {}).items():
++            if symbol not in table:
++                continue
++            cells = cells[table.index.get_indexer(cells.index) >= 0]
++            if cells.empty:
++                continue
++            current = table.loc[cells.index, symbol]
++            updates = cells[cells.ne(current)]
++            if not updates.empty:
++                if not pd.api.types.is_float_dtype(table[symbol]):
++                    table[symbol] = table[symbol].astype('float64')
++                table.loc[updates.index, symbol] = updates.to_numpy()
++                changed = True
++        return changed
+diff --git a/core/binance_update.py b/core/binance_update.py
+--- a/core/binance_update.py
++++ b/core/binance_update.py
+@@ -8,6 +8,8 @@
+ from core.ts_manager import TSManager
+ from core.utils.log_kit import logger
+ from core.binance_fetcher_async import BinanceFetcher
++from core.funding_backfill import (NETWORK_SECONDS, backfill_recent_funding_rates,
++                                   mark_funding_backfill_completed, save_funding_hours)
+ from core.handle import BinanceHandle, BmacHandle
+ from core.resample_candle import (calc_resample, update_resample_candle)
+ from core.utils.network import async_retry_getter, create_aiohttp_session
+@@ -23,34 +25,123 @@
+     infos_trading = [info for sym, info in exginfo.items() if sym in symbols_trading]
+     df_exginfo = pd.DataFrame.from_records(infos_trading)
+     handle.exg_mgr.set_candle(f'exginfo_{trade_type}', run_time, df_exginfo)
++    return symbols_trading
+ 
+ 
+ async def update_binance_funding_rates(handle: BmacHandle, session, run_time):
+-    funding_mgr = handle.funding_mgr
+     binance_handle: BinanceHandle = handle.get_binance_handle('swap')
+     fetcher = BinanceFetcher(binance_handle.api_type, session, handle.proxy)
+     df_funding = await fetcher.get_realtime_funding_rate()
+ 
+     if df_funding.empty:
+-        return
++        return df_funding
+ 
+     df_funding = df_funding.rename(columns={'next_funding_time': 'candle_begin_time'})
+-    for symbol, g in df_funding.groupby('symbol'):
+-        funding_mgr.update_candle(symbol, run_time, g, handle.get_kline_count_1h('swap'))
++    # Once a UTC hour has begun, a later forecast for that same bucket must
++    # not replace its settled events. History supplies the authoritative total.
++    df_funding['candle_begin_time'] = df_funding['candle_begin_time'].dt.floor('h')
++    return df_funding.loc[df_funding['candle_begin_time'] >= run_time]
+ 
+ 
+ async def update_binance_meta(handle: BmacHandle, run_time):
++    meta_started = time.monotonic()
++    write_deadline = meta_started + run_time.timestamp() - time.time() - 2
++    deadline = min(meta_started + NETWORK_SECONDS, write_deadline)
+     async with create_aiohttp_session(handle.http_timeout_sec) as session:
+-        exginfo_spot = update_binance_exginfo(handle, session, 'spot', run_time)
+-        exginfo_swap = update_binance_exginfo(handle, session, 'swap', run_time)
+-
++        exginfo_spot = asyncio.create_task(update_binance_exginfo(handle, session, 'spot', run_time))
++        exginfo_swap = asyncio.create_task(update_binance_exginfo(handle, session, 'swap', run_time))
+         tasks = [exginfo_spot, exginfo_swap]
++        funding_task = history_task = None
+ 
+         if handle.fetch_funding_rate:
+-            funding = update_binance_funding_rates(handle, session, run_time)
+-            tasks.append(funding)
+-
+-        await asyncio.gather(*tasks)
++            funding_task = asyncio.create_task(update_binance_funding_rates(handle, session, run_time))
++
++            async def history_branch():
++                stats = dict(requests=0, success=0, failed=0, elapsed=0., reason='deadline')
++                remaining = deadline - time.monotonic()
++                if remaining <= 0:
++                    return {}, stats
++                try:
++                    async with asyncio.timeout(remaining):
++                        # 可选历史超时不能取消共享市场信息任务。
++                        symbols = await asyncio.shield(exginfo_swap)
++                    # The collector drains/cancels its own workers at this same
++                    # deadline and returns the requests already finished.
++                    return await backfill_recent_funding_rates(handle, session, run_time, symbols, deadline=deadline)
++                except TimeoutError:
++                    stats['reason'] = 'deadline'
++                except Exception:
++                    stats['reason'] = 'history_failed'
++                stats['elapsed'] = time.monotonic() - meta_started
++                return {}, stats
++
++            history_task = asyncio.create_task(history_branch())
++            tasks.append(funding_task)
++
++        try:
++            await asyncio.gather(*tasks)
++            if funding_task is not None:
++                realtime = funding_task.result()
++                saved_realtime = []
++                started = time.monotonic()
++                if not realtime.empty and not history_task.done():
++                    # Let optional requests progress during mandatory disk I/O. Keep
++                    # one writer; as soon as history arrives, combine remaining saves.
++                    depth = handle.get_kline_count_1h('swap')
++                    for symbol, current in realtime.groupby('symbol'):
++                        if history_task.done():
++                            break
++                        await asyncio.to_thread(save_funding_hours, handle.funding_mgr, symbol,
++                                                run_time, current, depth)
++                        saved_realtime.append(symbol)
++                if saved_realtime:
++                    realtime = realtime.loc[~realtime.symbol.isin(saved_realtime)]
++                    logger.info('等待历史期间已落盘实时资金费: 币种=%d 耗时=%.3fs',
++                                len(saved_realtime), time.monotonic() - started)
++                history, stats = await history_task
++                save_funding_updates(handle, run_time, realtime, history, stats, write_deadline)
++        finally:
++            if history_task is not None:
++                tasks.append(history_task)
++            for task in tasks:
++                if not task.done():
++                    task.cancel()
++            await asyncio.gather(*tasks, return_exceptions=True)
++
++
++def save_funding_updates(handle, run_time, realtime, history, stats, write_deadline):
++    """Merge once per symbol; acknowledge nonempty history only after persistence."""
++    started = time.monotonic()
++    realtime = dict(tuple(realtime.groupby('symbol'))) if not realtime.empty else {}
++    depth = handle.get_kline_count_1h('swap')
++    saved = 0
++    # History-only symbols consume only time left after all required writes.
++    for symbol in [*realtime, *sorted(history.keys() - realtime.keys())]:
++        current = realtime.get(symbol)
++        settled = history.get(symbol)
++        if settled is not None and current is not None:
++            incoming = pd.concat([current, settled], ignore_index=True)
++        else:
++            incoming = current if current is not None else settled
++        if current is not None:
++            save_funding_hours(handle.funding_mgr, symbol, run_time, incoming, depth)
++        elif time.monotonic() < write_deadline:
++            try:
++                save_funding_hours(handle.funding_mgr, symbol, run_time, incoming, depth)
++            except Exception as exc:
++                logger.warning('历史资金费保存失败 %s: %s', symbol, exc)
++                continue
++        else:
++            continue
++        if settled is not None and mark_funding_backfill_completed(stats.get('round_hour'), symbol):
++            saved += 1
++            stats['completed'] += 1
++            stats['remaining'] -= 1
++    logger.info('历史资金费回补: 小时=%s 目标=%s 完成=%s 剩余=%s 请求=%s 落盘=%s 空=%s '
++                '失败/取消=%s 原因=%s 网络=%.3fs 保存=%.3fs',
++                stats.get('round_hour'), stats.get('target', 0), stats.get('completed', 0),
++                stats.get('remaining', 0), stats['requests'], saved, stats.get('empty', 0),
++                stats['failed'], stats['reason'], stats['elapsed'], time.monotonic() - started)
+ 
+ 
+ async def fetch_update_resample(handle: BmacHandle, binance_handle: BinanceHandle, fetcher: BinanceFetcher, trade_type,
+diff --git a/core/binance_fetcher_async.py b/core/binance_fetcher_async.py
+--- a/core/binance_fetcher_async.py
++++ b/core/binance_fetcher_async.py
+@@ -247,34 +247,34 @@
+         if self.trade_type == 'spot':
+             raise RuntimeError('Cannot request funding rate for spot')
+         data = await async_retry_getter(self.market_api.aioreq_premium_index)
+-        # 如果 lastFundingRate 不能转换为浮点数，则转换为 nan
+-        data = [{
+-            'symbol': d['symbol'],
+-            'funding_rate': pd.to_numeric(d['lastFundingRate'], errors='coerce'),
+-            'next_funding_time': pd.to_datetime(d['nextFundingTime'], unit='ms', utc=True)
+-        } for d in data]
+-        df = pd.DataFrame.from_records(data)
+-        return df
+-
+-    async def get_hist_funding_rate(self, symbol, **kwargs):
+-        '''
+-        Parse historical funding rates from /fundingRate
+-        '''
++        frame = pd.DataFrame.from_records(data, columns=['symbol', 'lastFundingRate', 'nextFundingTime'])
++        rates = pd.to_numeric(frame['lastFundingRate'], errors='coerce')
++        times = pd.to_datetime(pd.to_numeric(frame['nextFundingTime'], errors='coerce'),
++                               unit='ms', utc=True, errors='coerce')
++        result = pd.DataFrame(dict(symbol=frame['symbol'], funding_rate=rates, next_funding_time=times))
++        return result.loc[result.symbol.notna() & times.notna() & rates.abs().lt(float('inf'))]
++
++    async def get_hist_funding_rate(self, symbol, *, _reserve_request=None, **kwargs):
++        """Return raw settlement timestamps; pagination precedes UTC-hour aggregation."""
+         if self.trade_type == 'spot':
+             raise RuntimeError('Cannot request funding rate for spot')
+-
+-        # funding rates 接口限制 500/5mins，失败后等待 75 秒
+-        data = await async_retry_getter(self.market_api.aioreq_funding_rate, symbol=symbol, _sleep_seconds=75, **kwargs)
+-        data = [{
+-            'symbol': d['symbol'],
+-            'funding_rate': pd.to_numeric(d['fundingRate'], errors='coerce'),
+-            'candle_begin_time': pd.to_datetime(d['fundingTime'], unit='ms', utc=True)
+-        } for d in data]
+-        df = pd.DataFrame.from_records(data)
+-        if df.empty:
+-            return df
+-        funding_ts = df['candle_begin_time'].astype(int) // (10**9) / 3600.0
+-        funding_ts = funding_ts.round().astype(int) * 3600
+-        df['candle_begin_time'] = pd.to_datetime(funding_ts, unit='s', utc=True)
+-        df.sort_values('candle_begin_time', inplace=True)
+-        return df
++        async def request(**params):
++            if _reserve_request is not None:
++                await _reserve_request()
++            return await self.market_api.aioreq_funding_rate(**params)
++
++        data = await async_retry_getter(request, symbol=symbol, _sleep_seconds=75, **kwargs)
++        if not isinstance(data, list):
++            raise ValueError('Invalid historical funding response')
++        frame = pd.DataFrame.from_records(data, columns=['symbol', 'fundingTime', 'fundingRate'])
++        if len(frame) > kwargs.get('limit', 1000):
++            raise ValueError('Oversized historical funding response')
++        millis = pd.to_numeric(frame['fundingTime'], errors='coerce')
++        times = pd.to_datetime(millis, unit='ms', utc=True, errors='coerce')
++        rates = pd.to_numeric(frame['fundingRate'], errors='coerce')
++        valid = (frame.symbol.eq(symbol) & times.notna() & millis.mod(1).eq(0) &
++                 millis.between(kwargs.get('startTime', 0), kwargs.get('endTime', float('inf'))) &
++                 rates.abs().lt(float('inf')))
++        if not valid.all():
++            raise ValueError(f'Invalid historical funding row for {symbol}')
++        return pd.DataFrame(dict(symbol=frame.symbol, candle_begin_time=times, funding_rate=rates))
+diff --git a/core/history_data/funding.py b/core/history_data/funding.py
+--- a/core/history_data/funding.py
++++ b/core/history_data/funding.py
+@@ -1,5 +1,5 @@
+ import asyncio
+-import random
++from collections import deque
+ import time
+ from datetime import datetime, timedelta
+ 
+@@ -7,6 +7,7 @@
+ 
+ from core.binance_fetcher_async import BinanceFetcher
+ from core.handle import BmacHandle
++from core.funding_backfill import REQUEST_LIMIT, WINDOW_SECONDS, recent_funding_window, save_funding_hours, settled_funding_hours
+ from core.utils.log_kit import logger
+ from core.utils.network import create_aiohttp_session
+ from core.utils.time import now_time_str
+@@ -20,7 +21,7 @@
+ FUNDING_MAX_CONCURRENCY = 4
+ 
+ 
+-def _calc_symbol_funding_start_time(funding_mgr, symbol: str, global_start_time: datetime, backfill_hours: int):
++def _calc_symbol_funding_start_time(funding_mgr, symbol, global_start_time, recent_start, observed_until):
+     """计算单个交易对的资金费历史下载起始时间。
+ 
+     返回:
+@@ -40,13 +41,15 @@
+         return global_start_time, "full"
+ 
+     time_series = pd.to_datetime(df_existing["candle_begin_time"], utc=True, errors="coerce").dropna()
++    # The nextFundingTime forecast may lie after this snapshot's observed history.
++    time_series = time_series.loc[time_series <= observed_until]
+     if time_series.empty:
+         return global_start_time, "full"
+ 
+     latest_local_time = time_series.max().to_pydatetime()
+-    incremental_start = latest_local_time - timedelta(hours=backfill_hours)
++    incremental_start = latest_local_time - timedelta(hours=FUNDING_INCREMENTAL_BACKFILL_HOURS)
+     incremental_start = incremental_start.replace(minute=0, second=0, microsecond=0)
+-    start_time = max(global_start_time, incremental_start)
++    start_time = max(global_start_time, min(incremental_start, recent_start))
+     return start_time, "incremental"
+ 
+ 
+@@ -71,6 +74,9 @@
+     global_start_time = run_time - timedelta(hours=handle.get_kline_count_1h('swap'))
+     # Floor 取整到小时
+     global_start_time = global_start_time.replace(minute=0, second=0, microsecond=0)
++    recent_ms, end_ms = recent_funding_window(run_time)
++    recent_start = pd.Timestamp(recent_ms, unit='ms', tz='UTC')
++    observed_until = pd.Timestamp(end_ms, unit='ms', tz='UTC')
+ 
+     # 为每个 symbol 初始化起始时间
+     symbol_start_times = {}
+@@ -78,7 +84,7 @@
+     full_count = 0
+     for symbol in symbols:
+         start_time, mode = _calc_symbol_funding_start_time(
+-            funding_mgr, symbol, global_start_time, FUNDING_INCREMENTAL_BACKFILL_HOURS
++            funding_mgr, symbol, global_start_time, recent_start, observed_until
+         )
+         symbol_start_times[symbol] = start_time
+         if mode == "incremental":
+@@ -96,92 +102,55 @@
+         f"增量冗余小时数: {FUNDING_INCREMENTAL_BACKFILL_HOURS}"
+     )
+ 
+-    completed_symbols = set()
+-    batch_count = 0
+-    last_info_ts = 0.0
++    # Bound peak memory by keeping at most four symbols' pages in flight. The
++    # full hour may straddle pages, so combine once, after reaching endTime.
++    pending = iter(symbol_start_times.items())
++    request_times = deque()
++    completed = 0
++    last_progress = t_start
+ 
+     async with create_aiohttp_session(30) as session:
+         fetcher = BinanceFetcher(binance_handle.api_type, session, handle.proxy)
+ 
+-        # 限制在途请求数，避免 756 个 symbol 同时打 fundingRate 被 WAF 403
+-        semaphore = asyncio.Semaphore(FUNDING_MAX_CONCURRENCY)
++        async def reserve_request():
++            # Called for every HTTP attempt, including retries. No await between
++            # the capacity check and reservation on the shared event loop.
++            while True:
++                now = time.monotonic()
++                while request_times and request_times[0] <= now - WINDOW_SECONDS:
++                    request_times.popleft()
++                if len(request_times) < REQUEST_LIMIT:
++                    request_times.append(now)
++                    return
++                await asyncio.sleep(request_times[0] + WINDOW_SECONDS - now)
+ 
+-        async def fetch_one(symbol):
+-            async with semaphore:
+-                # startTime 是闭区间，这里保留毫秒精度（+1ms 的游标不能被截断成整秒）
+-                start_ts = int(symbol_start_times[symbol].timestamp() * 1000)
+-                return await fetcher.get_hist_funding_rate(
+-                    symbol, limit=FUNDING_RATE_BATCH_LIMIT, startTime=start_ts
+-                )
++        async def worker():
++            nonlocal completed, last_progress
++            for symbol, start in pending:
++                cursor = int(start.timestamp() * 1000)
++                pages = []
++                while cursor <= end_ms:
++                    page = await fetcher.get_hist_funding_rate(
++                        symbol, limit=FUNDING_RATE_BATCH_LIMIT, startTime=cursor, endTime=end_ms,
++                        _reserve_request=reserve_request)
++                    if page.empty:
++                        break
++                    pages.append(page)
++                    if len(page) < FUNDING_RATE_BATCH_LIMIT:
++                        break
++                    cursor = page['candle_begin_time'].max().value // 1_000_000 + 1
+ 
+-        # 2. 循环执行数据获取逻辑
+-        while len(completed_symbols) < len(symbols):
+-            batch_count += 1
+-            remaining_symbols = [s for s in symbols if s not in completed_symbols]
++                if pages:
++                    settled = settled_funding_hours(pd.concat(pages, ignore_index=True))
++                    save_funding_hours(funding_mgr, symbol, run_time, settled, None)
++                completed += 1
++                if time.perf_counter() - last_progress >= 30:
++                    logger.info('下载资金费数据，进度=%d/%d', completed, len(symbol_start_times))
++                    last_progress = time.perf_counter()
+ 
+-            # 2.1 对于所有剩余 symbols，每次 batch 获取从各自的 starttime 开始的 1000 条资金费数据
+-            tasks = [fetch_one(symbol) for symbol in remaining_symbols]
+-
+-            results: list[pd.DataFrame] = await asyncio.gather(*tasks)
+-
+-            # 2.2 遍历所有获得的资金费 DataFrame，使用 funding_mgr，对于每个 symbol 和已有的资金费数据合并
+-            batch_completed_symbols = []
+-            next_batch_start_times = {}
+-
+-            for symbol, df_new in zip(remaining_symbols, results):
+-                if df_new.empty:
+-                    # 如果获取的数据为空，标记为完成
+-                    batch_completed_symbols.append(symbol)
+-                    continue
+-
+-                # 获取现有数据并合并
+-                if funding_mgr.has_symbol(symbol):
+-                    df_existing = funding_mgr.read_candle(symbol)
+-                    df_merged = pd.concat([df_existing, df_new], ignore_index=True)
+-                else:
+-                    df_merged = df_new
+-
+-                # 按照 candle_begin_time 排序去重
+-                df_merged.drop_duplicates("candle_begin_time", ignore_index=True, inplace=True)
+-                df_merged.sort_values("candle_begin_time", inplace=True, ignore_index=True)
+-
+-                # 保存合并后的数据
+-                funding_mgr.set_candle(symbol, run_time, df_merged)
+-
+-                # 2.3 如果某 symbol 这一batch获取的数量不足 FUNDING_RATE_BATCH_LIMIT，则标记为该symbol已经完成
+-                if len(df_new) < FUNDING_RATE_BATCH_LIMIT:
+-                    batch_completed_symbols.append(symbol)
+-                else:
+-                    # 2.4 对于这一batch 还没获取完成的 symbols 用 max(candle_begin_time) + 1ms 作为下一batch的 start time
+-                    # startTime 为闭区间，+1ms 才能严格衔接；用 +1h 会跳过 1h 结算或 Special 资金费
+-                    max_time = df_new["candle_begin_time"].max()
+-                    next_start_time = max_time + timedelta(milliseconds=1)
+-                    next_batch_start_times[symbol] = next_start_time
+-
+-            # 更新完成的交易对和下一批次的起始时间
+-            completed_symbols.update(batch_completed_symbols)
+-            symbol_start_times.update(next_batch_start_times)
+-
+-            # 只在第一轮和有新的symbol更新完成时才打印进度信息
+-            if batch_count == 1 or len(batch_completed_symbols) > 0:
+-                progress = (len(completed_symbols) / len(symbols)) * 100
+-                time_elapsed = (time.perf_counter() - t_start) / 60
+-                msg = (
+-                    f"下载资金费数据，"
+-                    f"进度={progress:.1f}%({len(completed_symbols)}/{len(symbols)}), "
+-                    f"已耗时={time_elapsed:.1f}分钟, "
+-                    f"当前时间={now_time_str()}"
+-                )
+-                logger.debug(msg)
+-                # 全量补历史时每轮可能要等 5 分钟，只打 debug 会让日志长时间没有反馈，看起来像卡死
+-                if batch_count == 1 or time.perf_counter() - last_info_ts >= 30:
+-                    last_info_ts = time.perf_counter()
+-                    logger.info(msg)
+-
+-            # 2.5 直到所有的 symbol 都更新完毕，结束循环；否则 sleep（5分钟 + 随机数）开始下一 batch 获取
+-            if len(completed_symbols) < len(symbols):
+-                sleep_time = 300 + random.uniform(30, 60)
+-                await asyncio.sleep(sleep_time)
++        async with asyncio.TaskGroup() as group:
++            for _ in range(min(len(symbol_start_times), FUNDING_MAX_CONCURRENCY)):
++                group.create_task(worker())
+ 
+     time_elapsed = (time.perf_counter() - t_start) / 60
+     logger.ok(f"获取历史资金费率成功, 耗时={time_elapsed:.2f}分钟, 当前时间={now_time_str()}")
+diff --git a/core/preprocess.py b/core/preprocess.py
+--- a/core/preprocess.py
++++ b/core/preprocess.py
+@@ -20,4 +20,6 @@
+ from .handle import BmacHandle
+ from .arrow_publish import cleanup_old_snapshots, publish_arrow_snapshot
++from .funding_hours import normalize_funding_hours
++from .funding_publication import FundingPublication
+ from .utils.time import get_offset_from_runtime, wait_until_ready
+ 
+@@ -76,5 +78,5 @@
+     for symbol in symbols:
+         if funding_mgr.has_symbol(symbol):
+-            fundings[symbol] = funding_mgr.read_candle(symbol)
++            fundings[symbol] = normalize_funding_hours(funding_mgr.read_candle(symbol))
+     return fundings
+ 
+@@ -151,5 +153,5 @@
+ 
+ def gen_batch_data(handle: BmacHandle, run_time: datetime, trade_type: str, df_match: pd.DataFrame,
+-                   symbol_list: list[str], batch_name: str, with_factors: bool = False):
++                   symbol_list: list[str], batch_name: str, with_factors: bool = False, *, funding_publication=None):
+     if not symbol_list:
+         return None, dict(), dict()
+@@ -234,4 +236,7 @@
+ 
+     full_batch_name = f'{trade_type}_dict_{batch_name}'
++    if funding_publication is not None:
++        for symbol, frame in market_dict.items():
++            funding_publication.reconcile(symbol, frame, fundings.get(symbol))
+     # Finding 3: persist the RAW batch (OHLCV+meta only). Factor columns are recomputed
+     # from OHLCV every cycle and never read back as computational input, so writing them
+@@ -279,5 +284,6 @@
+ 
+ def gen_batch_data_incremental(handle: BmacHandle, run_time: datetime, trade_type: str, df_match: pd.DataFrame,
+-                               symbol_list: list[str], batch_name: str, with_factors: bool = False):
++                               symbol_list: list[str], batch_name: str, with_factors: bool = False, *,
++                               funding_publication=None):
+     if not symbol_list:
+         return None, dict(), dict()
+@@ -287,8 +293,10 @@
+     preprocess_mgr = preprocess_handle.preprocess_mgr_map[offset_str]
+     full_batch_name = f'{trade_type}_dict_{batch_name}'
++    if funding_publication is None and trade_type == 'swap' and handle.fetch_funding_rate:
++        funding_publication = FundingPublication(preprocess_mgr.base_dir, run_time)
+ 
+     if not preprocess_mgr.has_symbol(full_batch_name):
+         return gen_batch_data(handle, run_time, trade_type, df_match, symbol_list, batch_name,
+-                              with_factors=with_factors)
++                              with_factors=with_factors, funding_publication=funding_publication)
+ 
+     old_market_dict: dict[str, pd.DataFrame] = preprocess_mgr.read_candle(full_batch_name)
+@@ -315,4 +323,5 @@
+ 
+     new_market_dict: dict[str, pd.DataFrame] = {}
++    price_updates = []
+     start_year, end_year = None, None
+ 
+@@ -369,5 +378,14 @@
+             new_market_dict[symbol] = df_combined
+ 
++        price_updates.append(symbol)
++
++    # Funding-enabled markets also need cached rows from unavailable or
++    # unchanged symbols: the pivot may be behind an already durable raw batch.
++    for symbol in (new_market_dict if funding_publication is not None else price_updates):
+         df_sym = new_market_dict[symbol]
++        if funding_publication is not None:
++            funding_publication.reconcile(symbol, df_sym, fundings.get(symbol))
++        if df_sym.empty:
++            continue
+         min_year = df_sym['candle_begin_time'].min().year
+         if start_year is None or start_year > min_year:
+@@ -438,5 +456,6 @@
+ 
+ 
+-def gen_pivot_incremental(handle: BmacHandle, run_time: datetime, trade_type: str, year_pivot_names: dict[str, list]):
++def gen_pivot_incremental(handle: BmacHandle, run_time: datetime, trade_type: str, year_pivot_names: dict[str, list],
++                          *, funding_publication=None):
+     """Incremental counterpart of gen_pivot.
+ 
+@@ -456,12 +475,19 @@
+     cur_year = run_utc.year
+     in_new_year_week = run_utc.month == 1 and run_utc.day <= 7
+-    for year, pivot_names in year_pivot_names.items():
+-        # Skip old years (matching gen_pivot behaviour exactly)
+-        if (Path(preprocess_mgr.format_data_file_path(f'market_pivot_{trade_type}_{year}')).exists()
+-                and (int(year) < cur_year - 1
+-                     or (int(year) == cur_year - 1 and not in_new_year_week))):
++    years = set(year_pivot_names)
++    if funding_publication is not None:
++        years.update(funding_publication.by_year)
++    for year in sorted(years):
++        pivot_key = f'market_pivot_{trade_type}_{year}'
++        pivot_names = year_pivot_names.get(year, [])
++        if (preprocess_mgr.has_symbol(pivot_key) and (not pivot_names or int(year) < cur_year - 1
++                or (int(year) == cur_year - 1 and not in_new_year_week))):
++            # Frozen price history can still receive delayed settlements after
++            # an offset was offline over New Year.
++            if funding_publication is not None and year in funding_publication.by_year:
++                pivot = preprocess_mgr.read_candle(pivot_key)
++                if funding_publication.apply_to_pivot(year, pivot):
++                    preprocess_mgr.set_candle(pivot_key, run_time, pivot)
+             continue
+-
+-        pivot_key = f'market_pivot_{trade_type}_{year}'
+ 
+         # Load the new batch (contains ALL rows for this year from new_market_dict)
+@@ -483,4 +509,6 @@
+         # ── Old pivot exists: attempt incremental append ───────────────────────
+         old_pivot = preprocess_mgr.read_candle(pivot_key)
++        if funding_publication is not None:
++            funding_publication.apply_to_pivot(year, old_pivot)
+         last_ts = old_pivot['open'].index.max()
+ 
+@@ -570,4 +598,7 @@
+     preprocess_handle = handle.preprocess_handle
+     preprocess_mgr = preprocess_handle.preprocess_mgr_map[offset_str]
++    if preprocess_mgr.check_ready(f'{trade_type}_dict', run_time) and preprocess_mgr.check_ready(
++            f'market_pivot_{trade_type}', run_time):
++        return
+     
+     if not exg_mgr.check_ready(exginfo_name, run_time):
+@@ -587,4 +618,6 @@
+     t_start = time.perf_counter()
+     market_dict: dict[str, pd.DataFrame] = {}
++    funding_publication = (FundingPublication(preprocess_mgr.base_dir, run_time)
++                           if trade_type == 'swap' and handle.fetch_funding_rate else None)
+     while symbol_list:
+         if len(symbol_list) > num_batch:
+@@ -595,5 +628,6 @@
+         # Persist raw batches first; compute full-history factors only in memory.
+         _full_batch_name, year_pivot_name, batch_market_dict = gen_batch_data_incremental(
+-            handle, run_time, trade_type, df_match, batch, f'batch{idx}', with_factors=False)
++            handle, run_time, trade_type, df_match, batch, f'batch{idx}', with_factors=False,
++            funding_publication=funding_publication)
+         if factor_modules_params:
+             # Ordered consumption propagates failures before this market is published.
+@@ -616,10 +650,8 @@
+     publish_elapsed = time.perf_counter() - t_publish
+ 
+-    # 竞态修复（§3.2）：消费者的 gate 标志必须在因子写盘 + Arrow 发布之后才打。
+-    # 此时原始批次与含因子的快照均已处理完成；保留既有 Arrow 失败时 PKL 回退。
++    t_start = time.perf_counter()
++    gen_pivot_incremental(handle, run_time, trade_type, year_pivot_names, funding_publication=funding_publication)
++    # Consumers open the batch/Arrow and the year pivot on this one signal.
+     preprocess_mgr.save_ready(f'{trade_type}_dict', run_time)
+-
+-    t_start = time.perf_counter()
+-    gen_pivot_incremental(handle, run_time, trade_type, year_pivot_names)
+     pivot_elapsed = time.perf_counter() - t_start
+     logger.ok(f'预处理 Pivot Table {trade_type} 完成, 当前时间={now_time_str()}, 耗时 {pivot_elapsed:.1f} 秒')
+diff --git a/realtime_data.py b/realtime_data.py
+--- a/realtime_data.py
++++ b/realtime_data.py
+@@ -16,6 +16,7 @@
+ from core.version import VERSION
+ from core.binance_update import fetch_update_binance_candles, update_binance_base_candles, update_binance_meta
+ from core.backfill import maybe_backfill
++from core.funding_backfill import defer_funding_backfill
+ from core.data_api_update import update_data_api_candles
+ from core.handle import BmacHandle, create_bmac_handle_from_config, debug_handle
+ from core.history_data.history import run_download_all_history
+@@ -32,7 +33,9 @@
+ 
+ def update_all(handle: BmacHandle, run_time: datetime):
+     if f"{run_time.minute}m" not in handle.enabled_hour_offsets:
+-        logger.info(f"Runtime={run_time},不在 Offset={handle.enabled_hour_offsets} 中，等待该调度点检查补算")
++        logger.info(f"Runtime={run_time} 未启用该 Offset，刷新市场信息与资金费后检查补算")
++        sleep_until_run_time(run_time - timedelta(seconds=15))
++        asyncio.run(update_binance_meta(handle, run_time))
+ 
+         # 首次启动时，除 init 那个分钟归属的 offset 外都还没有预处理 ready。
+         # Wait for this base-period tick, instead of rechecking its future time every minute.
+@@ -164,6 +167,8 @@
+             if not initialized:
+                 init_history(handle)
+                 initialized = True
++                if handle.fetch_funding_rate:
++                    defer_funding_backfill()
+ 
+             # 阶段3: 更新数据
+             while True:
