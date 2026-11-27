@@ -2,14 +2,14 @@
 
 * **建议分支**：`perf/single-proc-multichunk-ws-and-cache-index`
 * **目标仓库 / 基线**：`coin-realtime-data_v2.0.2`
-* **前置依赖**：建议在 PR-02 之后合入（本 PR 是 **PR-08 WAL 直通屏障** 的强前置依赖）
+* **前置依赖**：建议在 PR-02 之后合入（本 PR 是 **PR-08 WAL 判缺口与直通屏障** 的强前置依赖）
 * **参考源提交（`alpha`）**：`ecade69`、`ffd9db9`、`18dadf7`
 
 ---
 
 ## 1. 场景
 
-Binance 全市场约 520 spot + 767 swap（合计 ~1,287 币），按单连接上限 `max_streams_per_conn = 200` 切分需要 7 条 WS 连接（spot 3 条 + swap 4 条）；OKX 同样需要多条分片连接。在 4 核 8 GB 云服务器上长期运行 7×24 小时。
+Binance 全市场约 520 spot + 767 swap（合计 ~1,287 币），按单连接上限 `max_streams_per_conn = 200` 切分需要 7 条 WS 连接（spot 3 条 + swap 4 条）；OKX 同样需要多条分片连接。在 `2c4g` / `2c8g` / `4c8g` 云服务器上长期 7×24 小时运行。
 
 ## 2. 目标
 
@@ -36,9 +36,17 @@ Binance 全市场约 520 spot + 767 swap（合计 ~1,287 币），按单连接�
   * `alphaonline/docs/2026-11-27-prod-vs-test-and-resource-efficiency.md`（§7.1）：WS + Writer 采集子进程常驻内存仅 **`29–71 MB`/进程**。
   * `EXPLAIN QUERY PLAN` 回归测试（`18dadf7`）验证：升级已有 v1 数据库时零数据丢失自动创建 `idx_kline_tt_time`，状态查询 100% 走覆盖索引（零 `SCAN kline`），子集窗口查询 100% 走主键 `SEARCH kline USING`。
 
-## 5. 代码改动（面向 `coin-realtime-data_v2.0.2`）
+## 5. 硬件规格（`2c4g`/`2c8g`/`4c8g`）与消费端（PKL vs Arrow）局限评估
 
-### 5.1 `core/ws/ws_local_cache.py`
+* **对 `2c4g` 属于“救命级”正收益**：
+  * 原版 7 个 `ws_runner` 进程在 4 GB 机器上直接吃掉可用物理内存的 25%~35%。本 PR 砍掉 5 个常驻 Python 进程，直接腾出 **`400–800 MB` 物理内存**，并显著降低 2 核上的调度切换成本，是 `2c4g` 能否稳定运行 WS 模式的前提。
+* **对强依赖 PKL 消费端价值进一步放大**：
+  * PKL 消费端（`pd.read_pickle()`）无法像 Arrow mmap 那样零拷贝共享页缓存，会在消费进程私有堆膨胀 1.5–3 GB。生产端通过本 PR 压低常驻 RSS，能把更多物理内存留给 OS Page Cache 与消费端反序列化，直接降低同机 Swap/OOM 概率。
+* **兼容性提醒**：原版 `v2.0.2` 若已有历史 `ws_cache/{spot,swap}-0.sqlite` 等分片文件，本 PR 启用新路径 `ws_cache/{spot,swap}.sqlite` 后，历史分片文件仅做冗余残留（不再读写，可在维护窗口手动清理）。
+
+## 6. 代码改动（面向 `coin-realtime-data_v2.0.2`）
+
+### 6.1 `core/ws/ws_local_cache.py`
 1. `_init_schema()` 在建表后增加幂等覆盖索引（兼容已有 v1 库无缝升级）：
    ```sql
    CREATE INDEX IF NOT EXISTS idx_kline_tt_time
@@ -61,7 +69,7 @@ Binance 全市场约 520 spot + 767 swap（合计 ~1,287 币），按单连接�
    * `query_ws_cache_status(db_path, trade_type, target_begin_ms, base_delta_ms, check_bars=99)`：利用 `idx_kline_tt_time` 覆盖索引单次 SQL 返回 `(ready_contiguous, full_window_contiguous, gapped_at_target)`。
    * `read_ws_cache_market_windows(db_path, trade_type, symbols, window_start_ms, end_exclusive_ms)`：当传入 `symbols` 时按 450 个一组走主键 `WHERE symbol IN (...) AND trade_type = ? AND begin_time_ms >= ? AND begin_time_ms < ?`，并用 `zip(*rows)` + `np.asarray(..., dtype=...)` 批量构造 DataFrame。
 
-### 5.2 `core/ws/ws_runner.py`
+### 6.2 `core/ws/ws_runner.py`
 1. `WsRunner` 由管理单个 `WsKlineClient` 升级为管理 `self._chunks: list[tuple[int, Any, list[str]]]`（按 `self._protocol.max_streams_per_conn` 自动切片，兼容 Binance 与 OKX）。
 2. `start(symbols, replay_on_start=True)`：
    * 空 `symbols=[]` 安全返回不挂起；
@@ -70,10 +78,10 @@ Binance 全市场约 520 spot + 767 swap（合计 ~1,287 币），按单连接�
 3. `run()`：使用 `asyncio.gather()` 并发运行所有 chunk 的 `_run_chunk_loop()`（各自独立指数退避重连，上限 30s）与定时 `_prune_loop()`（默认每小时清理 48h 前过期行）。
 4. `stop()`：优雅关闭所有 chunk client 并关闭共享 SQLite。
 
-### 5.3 `core/pipeline/runtime_supervisor.py`
+### 6.3 `core/pipeline/runtime_supervisor.py`
 * `_build_ws_runner_specs(trade_type)` 由每 chunk 返回 1 个 `WsRunnerSpec` 改为每市场返回 **1 个**包含全量 `symbols` 的 `WsRunnerSpec`，`cache_path = self.ws_cache_dir / f"{trade_type}.sqlite"`，进程命名为 `bmac-{exchange}-ws-{trade_type}`。
 
-## 6. 测试与验收清单
+## 7. 测试与验收清单
 
 参考 `alpha/tests/test_2b_ws_supervisor.py` 与 `tests/test_compute_io_overlap_phase2.py`：
 1. `test_ws_local_cache_prune_before_deletes_old_rows_only`：验证 48h 清理精确删除旧行、保留新行。

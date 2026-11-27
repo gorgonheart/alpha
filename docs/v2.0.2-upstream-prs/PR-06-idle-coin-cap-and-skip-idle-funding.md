@@ -16,7 +16,7 @@
 ## 2. 目标
 
 1. **`coin_cap` 缓存进程内最新日期 + 移至空档按 30 分钟冷却检查**：启动首次扫描一次磁盘后缓存 `_LAST_COIN_CAP_DATE`，避免每轮全盘读几百个市值 pkl；仅当启用全部 12 个 offset（无空档）时才回退在周期内检查。
-2. **按需创建 `aux_exe` 子进程池**：`run_ws_cycle` 中仅在 `handle.data_api is not None` 时才 spawn `ProcessPoolExecutor(max_workers=1)`，消除关键发布期内无谓的 2-worker spawn 子进程内存占用。
+2. **按需创建 `aux_exe` 子进程池**：`run_ws_cycle` 中仅在 `handle.data_api is not None`（或无空档需内联市值更新）时才 spawn `ProcessPoolExecutor`，消除关键发布期内无谓的 2-worker spawn 子进程内存占用。
 3. **非启用 5m 空档跳过实时预测资金费写盘**：给 `ExchangeAdapter.update_meta` / `update_exchange_meta` 增加 `include_realtime_funding: bool = True` 参数（对 Binance 与 OKX 统一生效），非启用轮传 `False`，避免白白重写 767 个合约的预测资金费 pkl。
 4. **启用 offset 唤醒提前量由 `T-15s` 扩宽至 `T-22s`**（可配置 `enabled_meta_lead_sec`，默认 22s），为元数据拉取与计算池预热留足安全余量，防止跨过整点。
 
@@ -41,9 +41,16 @@
   * 非启用 5m 空档资金费写盘耗时降至 **`0.000s`**（0 次无谓 pkl 重写）；
   * `coin_cap` 移至空档并缓存最大日期后，`run_ws_cycle` 在 `data_api=None` 时不再 spawn 任何 `aux_exe` 子进程，节省关键发布窗内存与进程创建开销。
 
-## 5. 代码改动（面向 `coin-realtime-data_v2.0.2`）
+## 5. 硬件规格（`2c4g`/`2c8g`/`4c8g`）与消费端（PKL vs Arrow）局限评估
 
-### 5.1 `core/ingest/coin_cap.py`
+* **硬件规格**：**全规格强正收益，越低配收益越显著**。在 `2c4g` 机器上，省去 `run_ws_cycle` 关键发布期的无谓 `aux_exe` spawn 子进程、省去全盘反序列化几百个 `coin_cap` pkl 以及 767 币资金费 pkl 重写，可直接压低 CPU 峰值与 150~300 MiB 内存占用。
+* **强依赖 PKL 消费端与外部脚本边界**：
+  * 常规消费端（仅在 `enabled_hour_offsets` 触发读取 `funding/*.pkl` 与 `coin_cap/*.pkl`）：**完全成立**。
+  * **边界前提**：若存在第三方监控或自定义策略在**非启用 5m 边界**直接读取磁盘 `funding/{symbol}.pkl` 获取实时预测资金费率，跳过写盘会使其看到上一启用轮的资金费。可通过 `cfg.skip_idle_realtime_funding = True`（默认 `True`，允许用户设为 `False` 关闭跳过）保留兼容性。
+
+## 6. 代码改动（面向 `coin-realtime-data_v2.0.2`）
+
+### 6.1 `core/ingest/coin_cap.py`
 * 新增进程内日期缓存 `_LAST_COIN_CAP_DATE`、冷却状态 `_LAST_COIN_CAP_CHECK_MONO`、`reset_coin_cap_idle_state()` 与 `maybe_update_coin_cap_idle(handle, run_time, *, min_interval_sec=1800.0)`：
 
 ```python
@@ -97,7 +104,7 @@ def maybe_update_coin_cap_idle(
     return run_coin_cap_update_to_recent(handle, run_time)
 ```
 
-### 5.2 `core/exchange/adapter.py` & `core/pipeline/data_update.py`
+### 6.2 `core/exchange/adapter.py` & `core/pipeline/data_update.py`
 * 为 `ExchangeAdapter.update_meta`、`update_exchange_meta`、`update_meta` 增加向后兼容关键字参数 `include_realtime_funding: bool = True`：
 
 ```python
@@ -111,7 +118,7 @@ async def update_exchange_meta(handle: BmacHandle, run_time, *, include_realtime
         await asyncio.gather(*tasks)
 ```
 
-### 5.3 `core/pipeline/update_cycle.py`
+### 6.3 `core/pipeline/update_cycle.py`
 * 在 `run_ws_cycle` 中，仅在 `handle.data_api is not None`（或全 12 offset 无空档且开启 `coin_cap`）时创建 `aux_exe`，否则使用 `contextlib.nullcontext(None)` 零 spawn 开销：
 
 ```python
@@ -125,12 +132,12 @@ aux_ctx = (
 )
 ```
 
-### 5.4 `core/app.py`
+### 6.4 `core/app.py`
 * 新增常量 `ENABLED_META_LEAD_SEC = 22`（支持 `cfg.enabled_meta_lead_sec` 覆盖）。
 * 启用 offset 在 `run_time - timedelta(seconds=lead_sec)` 唤醒并传 `include_realtime_funding=True`。
-* 非启用 offset 在 `run_time - timedelta(seconds=15)` 唤醒，以 `include_realtime_funding=False` 刷新 `exginfo` + 维护 WS 动态订阅与健康检查，到达 `run_time` 后调用 `maybe_update_coin_cap_idle(handle, run_time)`。
+* 非启用 offset 在 `run_time - timedelta(seconds=15)` 唤醒，按 `not getattr(cfg, "skip_idle_realtime_funding", True)` 决定是否刷新实时预测资金费（默认 `False`），并维护 WS 动态订阅与健康检查；到达 `run_time` 后调用 `maybe_update_coin_cap_idle(handle, run_time)`。
 
-## 6. 测试与验收清单
+## 7. 测试与验收清单
 
 参考 `alpha/tests/test_producer_memory_hygiene.py` 与 `tests/test_producer_post1126_optimizations.py`：
 1. `test_coin_cap_caches_latest_date_and_skips_aux_exe_in_ws_cycle`：验证首次扫描后缓存日期、冷却期内跳过、冷却后复用缓存零重读盘，且 `data_api=None` 时 `run_ws_cycle` 绝不创建 `ProcessPoolExecutor`。
